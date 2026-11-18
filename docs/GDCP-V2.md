@@ -37,13 +37,19 @@ identity, leftovers and foreign-name collisions collectively before any payload
 write. Use a subdirectory of a mounted volume. Directory symlinks resolve to the
 real target, leaving the link untouched. Top-level layout names are unchanged.
 
-A successful overwrite replaces only files owned by the old checkpoint's recorded
-metadata and fixed format names. Foreign files, nested directories and symlinks
-retain their names, contents and inodes. A conflicting foreign name fails early.
+A successful overwrite replaces only files identified as old checkpoint files at
+preflight from recorded metadata and fixed format names. Foreign files, nested
+directories and symlinks keep their contents and inodes. A foreign name collision
+detected at preflight fails before payload writes. A collision found in the final
+publication scan fails before the new checkpoint is published.
 Caught failures and pre-accept interrupts restore the old checkpoint and foreign
-entries; interrupts propagate. Foreign entries move by rename just before
-publication, so a hard kill can temporarily leave some in the stage. The durable
-transaction journal lets retry return them to the verified old target. Linux
+entries. Interrupts propagate. Foreign entries found by the final scan move by
+rename just before publication, so a hard kill can temporarily leave some in the
+stage. The durable transaction journal lets retry return them to the verified old
+target. Entries created between that scan and the exchange or old-to-backup
+rename stay in the obsolete sibling until cleanup. Cleanup moves each such entry
+to its original relative name if it can do so without replacing anything. If it
+cannot, the save succeeds and logs a warning naming the retained sibling. Linux
 exchange retains checkpoint old-or-new visibility; the two-rename fallback has
 an absent-target window with the old checkpoint in backup. Unpublished pending
 stages are recovered automatically; complete stages and backups are retained for

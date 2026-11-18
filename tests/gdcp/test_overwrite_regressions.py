@@ -115,6 +115,137 @@ def test_unrecorded_entry_inside_component_is_foreign(tmp_path, fmt):
     assert foreign.stat().st_ino == inode
 
 
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("abort", [False, True])
+def test_foreign_entries_created_during_payload_are_journaled_and_carried(
+    tmp_path, monkeypatch, fmt, abort
+):
+    root = tmp_path / "checkpoint"
+    old, new = _fixture(world=1), _fixture(world=1, shift=7)
+    assert_ok(_run(fmt, root, old))
+    log = root / "train.log"
+    log.write_bytes(b"start\n")
+    relative = Path("late.log" if fmt == "hf" else "model/late.log")
+    original_write = FileIO.pwrite
+    original_publish = _transaction.DirectoryTransaction.publish
+    inodes = []
+    carried = []
+
+    def write(self, rank, path, offset, data):
+        if inodes:
+            return original_write(self, rank, path, offset, data)
+        with log.open("ab") as stream:
+            stream.write(b"update\n")
+        (root / relative).write_bytes(b"new log\n")
+        inodes.extend((log.stat().st_ino, (root / relative).stat().st_ino))
+        return original_write(self, rank, path, offset, data)
+
+    def publish(transaction):
+        original_publish(transaction)
+        journal = json.loads((root / _transaction.JOURNAL_NAME).read_bytes())
+        carried.append(
+            (root / relative).exists()
+            and any(item["path"] == str(relative) for item in journal["foreign"])
+        )
+        if abort:
+            raise KeyboardInterrupt("abort after publication")
+
+    monkeypatch.setattr(FileIO, "pwrite", write)
+    monkeypatch.setattr(_transaction.DirectoryTransaction, "publish", publish)
+    if abort:
+        with pytest.raises(KeyboardInterrupt, match="abort after publication"):
+            _run(fmt, root, new)
+    else:
+        assert_ok(_run(fmt, root, new))
+    assert carried == [True]
+    assert log.read_bytes() == b"start\nupdate\n"
+    assert (root / relative).read_bytes() == b"new log\n"
+    assert [log.stat().st_ino, (root / relative).stat().st_ino] == inodes
+    _assert_generation(fmt, root, old if abort else new, world=1)
+    _assert_only_target(tmp_path)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("after_scan", [False, True])
+def test_late_foreign_collision_preserves_both_generations_entries(
+    tmp_path, monkeypatch, caplog, fmt, after_scan
+):
+    root = tmp_path / "checkpoint"
+    old, new = _fixture(world=1), _fixture(shift=7)
+    assert_ok(_run(fmt, root, old))
+    transaction = _transaction.DirectoryTransaction(root, 0)
+    name = Path("extra_state/extra_state_rank_1.pt")
+    before = _files(root)
+
+    def create_entries():
+        (root / name).write_bytes(b"foreign collision")
+        (root / "free.log").write_bytes(b"foreign without collision")
+
+    def before_publish(tx):
+        if tx.rank == 0:
+            create_entries()
+        return publish(tx)
+
+    def at_exchange(_left, _right):
+        create_entries()
+        return False
+
+    if after_scan:
+        monkeypatch.setattr(_transaction, "_exchange", at_exchange)
+    else:
+        publish = _transaction.DirectoryTransaction.publish
+        monkeypatch.setattr(
+            _transaction.DirectoryTransaction, "publish", before_publish
+        )
+    results = _run(fmt, root, new)
+    assert (root / "free.log").read_bytes() == b"foreign without collision"
+    if after_scan:
+        assert_ok(results)
+        assert (transaction.backup / name).read_bytes() == b"foreign collision"
+        assert str(transaction.backup) in caplog.text
+        assert str(name) in caplog.text
+        _assert_generation(fmt, root, new)
+    else:
+        _assert_errors(results, name.name)
+        assert _files(root) == before | {
+            str(name): b"foreign collision",
+            "free.log": b"foreign without collision",
+        }
+        _assert_generation(fmt, root, old, world=1)
+        _assert_only_target(tmp_path)
+
+
+def test_entry_created_after_obsolete_scan_is_retained_on_retry(
+    tmp_path, monkeypatch, caplog
+):
+    root = tmp_path / "checkpoint"
+    old, new = _fixture(world=1), _fixture(world=1, shift=7)
+    assert_ok(_run("safetensors", root, old))
+    transaction = _transaction.DirectoryTransaction(root, 0)
+    temporary = tmp_path / "exchange-temp"
+    original_rmdir = Path.rmdir
+
+    def exchange(left, right):
+        right.rename(temporary)
+        left.rename(right)
+        temporary.rename(left)
+        return True
+
+    def create_before_rmdir(path):
+        if path == transaction.stage:
+            (path / desc.PENDING_NAME).write_bytes(b"foreign data")
+        return original_rmdir(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_transaction, "_exchange", exchange)
+        patch.setattr(Path, "rmdir", create_before_rmdir)
+        assert_ok(_run("safetensors", root, new))
+    assert str(transaction.stage) in caplog.text
+    _assert_errors(_run("safetensors", root, old), str(transaction.stage))
+    assert (transaction.stage / desc.PENDING_NAME).read_bytes() == b"foreign data"
+    _assert_generation("safetensors", root, new, world=1)
+
+
 @pytest.mark.parametrize(
     ("fmt", "name"),
     [

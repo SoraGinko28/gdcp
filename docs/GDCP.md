@@ -48,10 +48,10 @@ rank-state files), native HF index/recorded shard names, or native DCP metadata,
 plus the format's fixed metadata/configuration names. Arbitrary filename patterns
 never establish ownership. With no recognizable checkpoint, every existing entry
 is foreign. Foreign files, directories (including nested checkpoints) and symlinks
-are retained at the same relative names with their original inodes and contents.
-Foreign descendants of checkpoint component directories are retained too. A
-foreign entry conflicting with a planned checkpoint file or directory causes an
-early error naming the entry; no payload is written. Old owned files that the new
+are carried to the same relative names with their original inodes and contents.
+This includes foreign descendants of checkpoint component directories. Preflight
+rejects an existing foreign name that conflicts with a planned checkpoint file or
+directory before any payload write. Old owned files that the new
 checkpoint omits disappear on success. Legacy HF exports that did not record rank
 state cannot establish ownership of those files: they are preserved as foreign,
 and an attempt to rewrite their names is rejected. New HF completion markers
@@ -66,10 +66,12 @@ manifest. Explicit DCP loads use pickle for native metadata, as PyTorch does.
 Only load DCP checkpoints you trust.
 
 The old checkpoint receives no payload writes. After every rank completes the
-new generation, rank 0 syncs its directories, moves foreign entries by rename
-into the stage, and publishes. Foreign directory trees are neither copied nor
-walked. A temporary `.gdcp_transaction` journal records directory/entry device and
-inode identities and is synced before any foreign rename. Linux filesystems
+new generation, rank 0 syncs its directories and rescans the old target against
+the entries it identified as owned at preflight. A foreign name that now
+conflicts with the new checkpoint aborts publication and leaves the old target
+intact. Rank 0 updates and syncs `.gdcp_transaction` with the directory and entry
+device and inode identities, then moves the foreign entries into the stage by
+rename and publishes. Foreign directories move as whole trees. Linux filesystems
 supporting `renameat2(RENAME_EXCHANGE)` atomically exchange complete checkpoint
 directories; otherwise GDCP uses old-to-backup, then stage-to-target renames.
 Publication is followed by parent-directory fsync and a collective success vote.
@@ -79,17 +81,29 @@ interrupts propagate after cleanup. A failed first save leaves the target absent
 or leaves its original foreign entries intact when the directory already existed.
 An overwrite needs space for old and new generations together.
 
+An entry created in the old directory between the final publication scan and
+the exchange (or the old-to-backup rename on the portable path) stays with the
+old directory through publication. After acceptance, cleanup scans the old
+sibling and moves the entry to the new target when an exclusive rename is
+available and the name is free. A collision, a reserved transaction name, or a
+failed move leaves the entry in the sibling and logs a warning naming the sibling
+and entry. The save returns success with the complete new checkpoint. Cleanup
+deletes only verified checkpoint files and uses empty-directory removal. An
+entry added to the obsolete directory after the cleanup scan can therefore also
+keep the sibling in place with a warning. The published journal stays until the
+obsolete sibling is removed so a retry can recognize retained content.
+
 Hard termination has these exact namespace windows:
 
 | Step | Checkpoint and foreign entries |
 | --- | --- |
 | Stage initialization and payload writes | Target retains old checkpoint and all foreign entries; stage is pending/incomplete. |
 | New generation complete, before foreign moves | Target retains old checkpoint and all foreign entries; stage is complete. |
-| During foreign moves, before exchange/first portable rename | Old checkpoint remains complete at target; each foreign entry is either at its original target name or the same relative name in stage. The durable journal identifies both. |
-| After Linux exchange | Target contains complete new checkpoint and all foreign entries; stage contains old checkpoint without those entries. |
-| Portable old-to-backup, before stage-to-target | Target is absent; backup contains complete old checkpoint without foreign entries; stage contains complete new checkpoint and all foreign entries. |
-| After stage-to-target, before/after acceptance | Target contains complete new checkpoint and all foreign entries; backup contains old checkpoint without those entries. |
-| Accepted obsolete-generation cleanup | New checkpoint and foreign entries remain at target; journal is removed, then obsolete sibling is removed. An interrupted/failed cleanup can retain a partially removed sibling. |
+| During foreign moves, before exchange/first portable rename | Old checkpoint remains complete at target. Each entry recorded by the final scan is at its original target name or the same relative name in stage, as recorded in the durable journal. Later arrivals can still be in the target. |
+| After Linux exchange | Target contains the complete new checkpoint and the carried entries. Stage contains the old checkpoint and any arrivals missed by the final scan. |
+| Portable old-to-backup, before stage-to-target | Target is absent. Backup contains the complete old checkpoint and any arrivals missed by the final scan. Stage contains the complete new checkpoint and the carried entries. |
+| After stage-to-target, before acceptance | Target contains the complete new checkpoint and the carried entries. Backup contains the old checkpoint and any arrivals missed by the final scan. |
+| Accepted obsolete-generation cleanup | Uncontested late entries move to the new target. An interrupted or blocked cleanup can retain the obsolete sibling with remaining entries. After successful sibling removal, cleanup removes the journal. |
 
 A first save has no old-generation rename: before stage-to-target the target is
 absent; afterwards it contains the new checkpoint. Recovery does not infer a
@@ -105,8 +119,9 @@ path is running**. Concurrent saves and loads during overwrite remain unsupporte
 | Target present, backup present | Refuse and describe all three paths. Never automatically delete a backup. |
 | Target absent, complete backup present | Rename backup back to target and log a warning, then apply the stage rules. This restores the old checkpoint; a valid stage journal restores its foreign entries too. |
 | Target absent, incomplete/unrecognized backup | Refuse; retain everything for inspection. |
-| Empty stage, or only the initializing pending-marker temporary file | With no published journal at target, remove the provably unpublished initialization with a warning and proceed; otherwise retain/refuse the old stage. |
-| Pending stage without a journal (legacy attempt) | Remove with a warning, then proceed; legacy pending stages never carried foreign entries. |
+| Stage without its own journal while a journal exists at target | Retain the stage and refuse recovery because it may be the old generation. |
+| Empty stage, or only the initializing pending-marker temporary file | Remove the provably unpublished initialization with a warning and proceed. |
+| Pending stage without a journal (legacy attempt) | Remove with a warning and proceed. Legacy pending stages could only contain unpublished checkpoint output. |
 | Valid journal, target still has its recorded pre-save identity, stage pending or provably incomplete | Return each moved foreign entry to target, remove stage with a warning, then proceed. A journal created before the pending marker is also recoverable. |
 | Stage looks complete without pending marker | Retain and refuse. A valid journal first returns any carried foreign entries to the verified old target; checkpoint payload files are left untouched. |
 | Stage without pending marker/provenance, mismatched identity, symlink sibling, or invalid journal | Refuse; inspect the states named in the error. |

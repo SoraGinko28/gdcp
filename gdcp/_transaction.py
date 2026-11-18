@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from . import _ownership, desc
 
 _LOG = logging.getLogger(__name__)
 JOURNAL_NAME = ".gdcp_transaction"
+_RESERVED = {Path(JOURNAL_NAME), Path(desc.PENDING_NAME)}
 PREFLIGHT = (
     "initialize save (check foreign-name collisions, mount point and same filesystem; "
     "pass a subdirectory of the mount)"
@@ -25,8 +27,8 @@ PREFLIGHT = (
 
 
 def _entry_identity(path):
-    stat = path.lstat()
-    return stat.st_dev, stat.st_ino
+    entry = path.lstat()
+    return entry.st_dev, entry.st_ino
 
 
 def _identity(path):
@@ -80,13 +82,10 @@ def _check_filesystem(root, stage):
         )
 
 
-def _exchange(left, right):
-    """Return False only when the OS/filesystem lacks directory exchange."""
-    if sys.platform != "linux":
-        return False
+def _linux_rename(source, target, flags):
     library = ctypes.CDLL(None, use_errno=True)
     if not hasattr(library, "renameat2"):
-        return False
+        return errno.ENOSYS
     rename = library.renameat2
     rename.argtypes = [
         ctypes.c_int,
@@ -96,25 +95,109 @@ def _exchange(left, right):
         ctypes.c_uint,
     ]
     rename.restype = ctypes.c_int
-    if rename(-100, os.fsencode(left), -100, os.fsencode(right), 2) == 0:
+    if rename(-100, os.fsencode(source), -100, os.fsencode(target), flags) == 0:
+        return 0
+    return ctypes.get_errno()
+
+
+def _exchange(left, right):
+    """Return False only when the OS/filesystem lacks directory exchange."""
+    if sys.platform != "linux":
+        return False
+    code = _linux_rename(left, right, 2)  # RENAME_EXCHANGE
+    if not code:
         return True
-    code = ctypes.get_errno()
     if code in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
         return False
     raise OSError(code, os.strerror(code), str(right))
 
 
-def _foreign_entries(root, owned, directories, relative=Path()):
-    foreign = []
+def _rename_exclusive(source, target):
+    code = errno.ENOSYS
+    if sys.platform == "linux":
+        code = _linux_rename(source, target, 1)  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        rename = getattr(ctypes.CDLL(None, use_errno=True), "renamex_np", None)
+        if rename is not None:
+            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            result = rename(os.fsencode(source), os.fsencode(target), 4)  # RENAME_EXCL
+            code = ctypes.get_errno() if result else 0
+    if code:
+        raise OSError(code, os.strerror(code), str(target))
+
+
+def _snapshot_owned(root):
+    files = _ownership.owned_files(root)
+    directories = _ownership.owned_directories(root)
+    owned = {}
+    for name in files | directories:
+        try:
+            entry = (root / name).lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if (name in directories and stat.S_ISDIR(entry.st_mode)) or (
+            name in files
+            and (stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode))
+        ):
+            owned[name] = (entry.st_dev, entry.st_ino)
+    return owned
+
+
+def _entries(root, owned, relative=Path()):
     for path in (root / relative).iterdir():
         name = relative / path.name
-        if name in owned:
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
             continue
-        if name in directories and path.is_dir() and not path.is_symlink():
-            foreign.extend(_foreign_entries(root, owned, directories, name))
+        if owned.get(name) != (entry.st_dev, entry.st_ino):
+            yield name, "foreign"
+        elif stat.S_ISDIR(entry.st_mode):
+            yield from _entries(root, owned, name)
+            yield name, "directory"
         else:
-            foreign.append(name)
-    return foreign
+            yield name, "file"
+
+
+def _foreign_entries(root, owned):
+    return [name for name, kind in _entries(root, owned) if kind == "foreign"]
+
+
+def _salvage_entry(old, root, name):
+    if name in _RESERVED:
+        raise FileExistsError("reserved transaction name")
+    for parent in reversed(name.parents[:-1]):
+        directory = root / parent
+        directory.mkdir(exist_ok=True)
+        _identity(directory)
+    source, target = old / name, root / name
+    _rename_exclusive(source, target)
+    _sync_directory(target.parent)
+    _sync_directory(source.parent)
+
+
+def _clean_old(old, root, owned):
+    blocked = []
+    for name in _foreign_entries(old, owned):
+        try:
+            _salvage_entry(old, root, name)
+        except (OSError, ValueError) as exc:
+            blocked.append(f"{name}: {exc}")
+    if blocked:
+        raise OSError(f"could not move foreign entries: {', '.join(blocked)}")
+
+    # Delete only verified checkpoint files and empty directories. New entries
+    # can still arrive in the old directory through an open directory handle.
+    for name, kind in _entries(old, owned):
+        entry = old / name
+        if kind == "foreign" or _entry_identity(entry) != owned[name]:
+            raise OSError(f"foreign entry appeared during cleanup: {name}")
+        if kind == "directory":
+            entry.rmdir()
+        else:
+            entry.unlink()
+    old.rmdir()
 
 
 def _collisions(root, foreign, planned):
@@ -159,7 +242,8 @@ class DirectoryTransaction:
         self.rank = rank
         self.new_identity = None
         self.old_identity = None
-        self.foreign = []
+        self.old_owned = {}
+        self.planned = set()
         self.published = False
         self.exchanged = False
         self.backed_up = False
@@ -170,19 +254,13 @@ class DirectoryTransaction:
             return
         self._validate_target()
         self._recover()
+        self.planned = {Path(name) for name in planned} | _RESERVED
+        foreign = []
         if os.path.lexists(self.root):
             self.old_identity = _identity(self.root)
-            self.foreign = _foreign_entries(
-                self.root,
-                _ownership.owned_files(self.root),
-                _ownership.owned_directories(self.root),
-            )
-        _collisions(
-            self.root,
-            self.foreign,
-            {Path(name) for name in planned}
-            | {Path(JOURNAL_NAME), Path(desc.PENDING_NAME)},
-        )
+            self.old_owned = _snapshot_owned(self.root)
+            foreign = _foreign_entries(self.root, self.old_owned)
+        _collisions(self.root, foreign, self.planned)
         self.root.parent.mkdir(parents=True, exist_ok=True)
         _check_filesystem(self.root, self.stage)
         self.stage.mkdir()
@@ -190,7 +268,7 @@ class DirectoryTransaction:
         desc.atomic_write(
             self.stage / desc.PENDING_NAME, b"GDCP transaction initializing\n"
         )
-        self._write_journal()
+        self._write_journal(())
 
     def _validate_target(self):
         if self.requested.is_symlink() and not self.requested.exists():
@@ -201,14 +279,14 @@ class DirectoryTransaction:
         if self.root.parent.exists():
             _check_filesystem(self.root, self.stage)
 
-    def _write_journal(self):
+    def _write_journal(self, foreign):
         record = {
             "version": 1,
             "old_identity": self.old_identity,
             "new_identity": self.new_identity,
             "foreign": [
                 {"path": str(name), "identity": _entry_identity(self.root / name)}
-                for name in self.foreign
+                for name in foreign
             ],
         }
         desc.atomic_write(self.stage / JOURNAL_NAME, desc.json_bytes(record))
@@ -252,6 +330,8 @@ class DirectoryTransaction:
         if self.stage.is_symlink() or not self.stage.is_dir():
             self._refuse_recovery()
         journal = self.stage / JOURNAL_NAME
+        if not journal.is_file() and os.path.lexists(self.root / JOURNAL_NAME):
+            self._refuse_recovery()
         try:
             proven = self._recover_foreign(journal) if journal.is_file() else False
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -260,8 +340,6 @@ class DirectoryTransaction:
         initializing = {entry.name for entry in self.stage.iterdir()} <= {
             desc.PENDING_NAME + ".tmp"
         }
-        if initializing and (self.root / JOURNAL_NAME).exists():
-            self._refuse_recovery()
         if _ownership.complete(self.stage) or not (proven or pending or initializing):
             self._refuse_recovery()
         shutil.rmtree(self.stage)
@@ -321,7 +399,10 @@ class DirectoryTransaction:
         _sync_directory(target.parent)
 
     def _carry_foreign(self):
-        for name in self.foreign:
+        foreign = _foreign_entries(self.root, self.old_owned)
+        _collisions(self.root, foreign, self.planned)
+        self._write_journal(foreign)
+        for name in foreign:
             self._move_foreign(name)
 
     def _move_foreign(self, name):
@@ -419,11 +500,11 @@ class DirectoryTransaction:
             return
         if not self.accepted:
             self.rollback()
-        else:
-            self._finish_accepted()
+            self._remove_obsolete(self.stage, self.new_identity)
+            return
         obsolete = self.backup if self.backed_up else self.stage
-        expected = self.old_identity if self.accepted else self.new_identity
-        self._remove_obsolete(obsolete, expected)
+        if self._remove_obsolete(obsolete, self.old_identity):
+            self._finish_accepted()
 
     def _finish_accepted(self):
         try:
@@ -439,15 +520,24 @@ class DirectoryTransaction:
 
     def _remove_obsolete(self, path, expected):
         if expected is None or not os.path.lexists(path):
-            return
+            return True
         try:
             self._check(path, expected)
-            shutil.rmtree(path)
+            self._delete_obsolete(path)
             _sync_directory(path.parent)
         except Exception as exc:
             _LOG.warning(
                 "checkpoint committed/aborted but retained sibling %s: %s", path, exc
             )
+            return False
+        return True
+
+    def _delete_obsolete(self, path):
+        if self.accepted:
+            self._check(self.root, self.new_identity)
+            _clean_old(path, self.root, self.old_owned)
+        else:
+            shutil.rmtree(path)
 
     @staticmethod
     def _check(path, expected):
