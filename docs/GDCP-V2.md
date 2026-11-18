@@ -34,9 +34,10 @@ CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:ncc
 HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys, and a typed JSON `optimizer.json` sidecar preserving param groups and aliases. Native HF loading builds storage from headers and an optional standard index. The header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and packed floats. If a requested tensor uses a dtype that the load path cannot represent, the error names the dtype and key.
 
 Native PyTorch DCP loads accept uneven `Shard(0)` chunks and ignore empty
-shards at any row offset. The nonempty chunks must cover the tensor along
-dimension 0. GDCP reports a chunk geometry error for overlaps, gaps, and
-sharding along another dimension.
+shards at any row offset. GDCP reads each chunk in logical element order using
+its serialized strides, including for transposed local tensors. The nonempty
+chunks must cover the tensor along dimension 0. GDCP reports a chunk geometry
+error for overlaps, gaps, and sharding along another dimension.
 
 All three formats require the same rank-state keys and ordered component list on
 every rank before staging a save. Names that resolve to the same directory on the

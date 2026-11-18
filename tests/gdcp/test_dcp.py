@@ -323,6 +323,21 @@ def test_native_dcp_load_torch_shard_sweep(tmp_path, world, rows):
         _check_native_shard_load(tmp_path, values.numpy(), target_world)
 
 
+@pytest.mark.parametrize("world,rows,target_world", [(4, 5, 4), (4, 5, 3), (6, 13, 4)])
+def test_native_dcp_load_transposed_torch_shards(tmp_path, world, rows, target_world):
+    torch = pytest.importorskip("torch")
+    from torch.distributed.checkpoint import load as native_load
+
+    values = torch.arange(rows * 3, dtype=torch.float32).reshape(3, rows).t()
+    root = tmp_path / "model"
+    chunks = _torch_write_shards(root, values, world)
+    assert (chunks[-1].offsets[0], chunks[-1].sizes[0]) == (rows, 0)
+    restored = torch.full(values.shape, -1, dtype=values.dtype)
+    native_load({"weight": restored}, checkpoint_id=root, no_dist=True)
+    torch.testing.assert_close(restored, values, rtol=0, atol=0)
+    _check_native_shard_load(tmp_path, values.numpy(), target_world)
+
+
 @pytest.mark.parametrize("world,rows", _SHARD_SWEEP)
 def test_torch_load_gdcp_dcp_shard_sweep(tmp_path, world, rows):
     torch = pytest.importorskip("torch")

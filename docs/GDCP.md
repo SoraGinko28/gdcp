@@ -24,8 +24,9 @@ The loading world size may differ from the saving world size. GDTensor moves
 the intersections of saved storage shards and live compute shards directly;
 GDCP never assembles full tensors during save or load. Supported placements
 are `Shard(0)` and `Replicate` on a one-dimensional mesh containing all ranks.
-Native PyTorch DCP loads also support uneven `Shard(0)` chunks and empty shards
-when restoring at the same or a different world size.
+Native PyTorch DCP loads support uneven `Shard(0)` chunks and empty shards. GDCP
+honors the saved local strides, including transposed shards, when restoring at
+the same or a different world size.
 
 Model-only save and load, model-only load from a full checkpoint, extra-only
 save, and `load_common_state_only=True` are supported. Optimizer state needs

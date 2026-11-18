@@ -6,6 +6,7 @@ record. Fake tensors avoid allocating either the local or global tensor here.
 """
 
 import io
+import mmap
 import os
 import pickle
 import struct
@@ -18,6 +19,7 @@ from math import prod
 from pathlib import Path
 from typing import IO, cast
 
+import numpy as np
 import torch
 from torch.distributed.checkpoint._nested_dict import (
     flatten_state_dict,
@@ -511,13 +513,72 @@ class _NativePayload:
     end: int
     path: str
     offset: int
+    shape: tuple[int, ...]
+    itemsize: int
+    strides: tuple[int, ...] | None
+    span: int
 
 
-def _native_payload(root, tensor_id, start, size, record):
-    offset = _record_payload(root, record, size, tensor_id)
+def _native_payload(root, tensor_id, start, shape, dtype, record):
+    path = os.path.join(root, record.relative_path)
+    with open(path, "rb") as handle:
+        window = _Window(handle, record.offset, record.length)
+        offset, nbytes = _payload_record(window)
+        window.seek(0)
+        # DCP metadata describes the chunk geometry; torch.save stores its strides.
+        with FakeTensorMode():
+            tensor = torch.load(
+                cast(IO[bytes], window), map_location="cpu", weights_only=True
+            )
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or tensor.layout != torch.strided
+        or tensor.shape != shape
+        or tensor.dtype != dtype
+    ):
+        raise ValueError(f"{tensor_id}: DCP tensor record does not match its metadata")
+    itemsize = dtype.itemsize
+    storage_offset = tensor.storage_offset() * itemsize
+    strides = tuple(stride * itemsize for stride in tensor.stride())
+    span = itemsize + sum((dim - 1) * stride for dim, stride in zip(shape, strides))
+    if (
+        storage_offset < 0
+        or any(s < 0 for s in strides)
+        or storage_offset + span > nbytes
+    ):
+        raise ValueError(f"{tensor_id}: DCP tensor view exceeds its serialized storage")
     return _NativePayload(
-        start, start + size, os.path.join(root, record.relative_path), offset
+        start,
+        start + prod(shape) * itemsize,
+        path,
+        record.offset + offset + storage_offset,
+        tuple(shape),
+        itemsize,
+        None if tensor.is_contiguous() else strides,
+        span,
     )
+
+
+def _read_strided(chunk, start, end):
+    prefix = chunk.offset % mmap.ALLOCATIONGRANULARITY
+    with (
+        open(chunk.path, "rb") as handle,
+        mmap.mmap(
+            handle.fileno(),
+            prefix + chunk.span,
+            access=mmap.ACCESS_READ,
+            offset=chunk.offset - prefix,
+        ) as storage,
+    ):
+        # Treat each element as opaque bytes, including dtypes NumPy cannot represent.
+        view = np.ndarray(
+            chunk.shape,
+            dtype=f"V{chunk.itemsize}",
+            buffer=storage,
+            offset=prefix,
+            strides=chunk.strides,
+        )
+        return view.flat[start // chunk.itemsize : end // chunk.itemsize].view(np.uint8)
 
 
 class _NativeAccessor(DTensorDataAccessor):
@@ -543,15 +604,19 @@ class _NativeAccessor(DTensorDataAccessor):
 
     def _read_chunk(self, chunk, start, end, callback):
         try:
-            data = self.session.io.pread(
-                self.session.rank,
-                chunk.path,
-                chunk.offset + start - chunk.start,
-                end - start,
-            )
+            data = self._read_payload(chunk, start - chunk.start, end - chunk.start)
         except OSError as exc:
             raise io_error("read", str(exc), chunk.path) from None
-        call_buffer_callback(callback, bytearray(data))
+        call_buffer_callback(callback, data)
+
+    def _read_payload(self, chunk, start, end):
+        if chunk.strides is not None:
+            return _read_strided(chunk, start, end)
+        return bytearray(
+            self.session.io.pread(
+                self.session.rank, chunk.path, chunk.offset + start, end - start
+            )
+        )
 
     def write_from_buffer(self, global_range, write_from_buffer):
         raise NotImplementedError("native DCP load accessor is read-only")
@@ -824,8 +889,9 @@ def _native_records(metadata, key, item, chunks):
         record = metadata.storage_data[MetadataIndex(key, chunk.offsets)]
         desc._safe_relative(record.relative_path)
         start = chunk.offsets[0] if item.size else 0
-        rows = chunk.sizes[0] if item.size else 1
-        records.append((key, start * row_bytes, rows * row_bytes, record))
+        records.append(
+            (key, start * row_bytes, chunk.sizes, item.properties.dtype, record)
+        )
     return records
 
 
