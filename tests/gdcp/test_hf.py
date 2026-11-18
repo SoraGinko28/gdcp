@@ -1,13 +1,15 @@
 """HF headers, deterministic shared-file output, and native-file resharding."""
 
 import json
+import struct
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from safetensors.numpy import save_file
 
 from gdcp.hf import load_state, read_headers, save_state, shard_size_bytes
-from gdcp.state import RankContext
+from gdcp.state import CheckpointState, Component, RankContext
+from gdtensor.builder import DTensorTable, Err
 from gdtensor_conn.coord import ThreadCoordinator
 from tests.support.gdcp import assert_ok, assert_values, numpy_checkpoint
 
@@ -73,8 +75,6 @@ def test_native_safetensors_output_loads_without_private_metadata(tmp_path, worl
     filename = tmp_path / "model.safetensors"
     data = filename.read_bytes().replace(b'"dtype":"U16"', b'"dtype":"BF16"')
     # U16 and BF16 differ by one character, so reserialize a valid padded header.
-    import struct
-
     length = struct.unpack("<Q", filename.read_bytes()[:8])[0]
     header = json.loads(filename.read_bytes()[8 : 8 + length])
     header["bf16"]["dtype"] = "BF16"
@@ -86,6 +86,60 @@ def test_native_safetensors_output_loads_without_private_metadata(tmp_path, worl
     assert data  # the native payload itself was not converted or gathered
     assert_ok(_collective(load_state, tmp_path, fixture))
     fixture.fabrics["model"].assert_values(fixture.values["model"])
+
+
+@pytest.mark.parametrize(
+    "dtype, count, nbytes",
+    [
+        ("F4", 2, 1),
+        ("F6_E2M3", 4, 3),
+        ("F6_E3M2", 4, 3),
+        ("F8_E4M3", 1, 1),
+        ("F8_E4M3FNUZ", 1, 1),
+        ("F8_E5M2", 1, 1),
+        ("F8_E5M2FNUZ", 1, 1),
+        ("F8_E8M0", 1, 1),
+        ("C64", 1, 8),
+        ("U16", 1, 2),
+        ("U32", 1, 4),
+        ("U64", 1, 8),
+    ],
+)
+def test_read_headers_accepts_native_safetensors_dtypes(tmp_path, dtype, count, nbytes):
+    header = {"extra": {"dtype": dtype, "shape": [count], "data_offsets": [0, nbytes]}}
+    offset = _write_native_file(tmp_path, header, bytes(nbytes))
+    entry = read_headers(tmp_path)["extra"]
+    assert entry["dtype"] == dtype
+    assert entry["shape"] == [count]
+    assert entry["offset"] == offset
+    assert entry["itemsize"] == (nbytes // count if nbytes % count == 0 else None)
+
+
+def _write_native_file(path, header, payload):
+    raw = json.dumps(header).encode()
+    raw += b" " * (-len(raw) % 8)
+    (path / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(raw)) + raw + payload
+    )
+    return 8 + len(raw)
+
+
+def test_load_state_rejects_requested_packed_dtype(tmp_path):
+    fixture = numpy_checkpoint(1, initialized=False)
+    model = fixture.states[0].components[0]
+    table = DTensorTable(
+        [
+            named
+            for named in model.table.named_d_tensors
+            if named.global_tensor_id == "weight"
+        ]
+    )
+    target = CheckpointState([Component("model", table, model.accessor)])
+    header = {"weight": {"dtype": "F4", "shape": [10, 4], "data_offsets": [0, 20]}}
+    _write_native_file(tmp_path, header, bytes(20))
+    result = load_state(tmp_path, target, RankContext(0, 1))
+    assert type(result) is Err
+    assert "unsupported dtype F4 for weight" in result.value.msg
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,10 @@ exports weights only or full state. Per-rank safetensors and DCP loads require
 the same ordered component list on every rank. Saves also require that agreement
 before staging begins.
 
+Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
+Integer and boolean buffers round-trip bit for bit into targets of the same dtype.
+See [GDCP v2 formats](GDCP-V2.md) for `save_hf` and `load_hf` options.
+
 `gdcp_manifest.json` is the checkpoint commit marker. GDCP writes it last,
 after every rank commits every requested component and extra-state file.
 Nonempty component directories also contain the connector's

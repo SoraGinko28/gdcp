@@ -43,17 +43,29 @@ from ._transaction import PREFLIGHT
 from .policy import PerRankPolicy, storage_mesh
 from .state import Component
 
-_DTYPES = {
-    "BOOL": 1,
-    "U8": 1,
-    "I8": 1,
-    "I16": 2,
-    "I32": 4,
-    "I64": 8,
-    "F16": 2,
-    "BF16": 2,
-    "F32": 4,
-    "F64": 8,
+_SAFETENSORS_DTYPE_BITS = {
+    "BOOL": 8,
+    "F4": 4,
+    "F6_E2M3": 6,
+    "F6_E3M2": 6,
+    "U8": 8,
+    "I8": 8,
+    "F8_E4M3": 8,
+    "F8_E4M3FNUZ": 8,
+    "F8_E5M2": 8,
+    "F8_E5M2FNUZ": 8,
+    "F8_E8M0": 8,
+    "I16": 16,
+    "U16": 16,
+    "F16": 16,
+    "BF16": 16,
+    "I32": 32,
+    "U32": 32,
+    "F32": 32,
+    "C64": 64,
+    "F64": 64,
+    "I64": 64,
+    "U64": 64,
 }
 _OBJECTS = "optimizer.json"
 
@@ -445,7 +457,7 @@ def _read_header_file(path):
 def _header_entry(filename, name, entry, length):
     shape, dtype, offsets = entry["shape"], entry["dtype"], entry["data_offsets"]
     if (
-        dtype not in _DTYPES
+        dtype not in _SAFETENSORS_DTYPE_BITS
         or not isinstance(shape, list)
         or any(type(dim) is not int or dim < 0 for dim in shape)
     ):
@@ -456,13 +468,14 @@ def _header_entry(filename, name, entry, length):
         or any(type(value) is not int for value in offsets)
     ):
         raise ValueError(f"{filename}: invalid offsets for {name}")
-    nbytes = prod(shape) * _DTYPES[dtype]
-    if offsets[0] < 0 or offsets[1] - offsets[0] != nbytes:
+    bits = _SAFETENSORS_DTYPE_BITS[dtype]
+    nbytes, remainder = divmod(prod(shape) * bits, 8)
+    if remainder or offsets[0] < 0 or offsets[1] - offsets[0] != nbytes:
         raise ValueError(f"{filename}: tensor size mismatch for {name}")
     return {
         "shape": shape,
         "dtype": dtype,
-        "itemsize": _DTYPES[dtype],
+        "itemsize": bits // 8 if bits % 8 == 0 else None,
         "file": filename,
         "offset": 8 + length + offsets[0],
     }, (offsets[0], offsets[1], name)
@@ -491,7 +504,7 @@ def _add_header_file(root, filename, weight_map, headers):
 
 
 def read_headers(path):
-    """Validate a native HF single file/index and describe all tensor byte ranges."""
+    """Describe native HF tensor byte ranges, with itemsize=None for packed dtypes."""
     root = Path(path)
     if (root / desc.PENDING_NAME).exists():
         raise ValueError("HF checkpoint has an incomplete save (.gdcp_pending)")
@@ -579,6 +592,8 @@ def _load_prepare(path, state, ctx):
     for named in combined.table.named_d_tensors:
         key, meta = named.global_tensor_id, named.d_tensor.global_tensor_meta
         saved = headers[key]
+        if saved["itemsize"] is None:
+            raise ValueError(f"unsupported dtype {saved['dtype']} for {key}")
         logical = combined.logical_shapes.get(key, list(meta.global_shape))
         if (
             logical != saved["shape"]
@@ -682,7 +697,9 @@ def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
 
     ``model_or_state`` is a module, a tensor mapping, or a checkpoint mapping
     containing ``model`` and optionally ``optimizer``. ``dtype`` accepts
-    ``'fp32'`` or ``'bf16'``. ``max_shard_size=None`` emits one file; otherwise
+    ``'fp32'`` or ``'bf16'`` and applies only to floating-point tensors.
+    Integer and boolean tensors retain their dtypes and values.
+    ``max_shard_size=None`` emits one file; otherwise
     a positive byte count or an HF-style limit such as ``'5GB'`` is accepted.
     """
     from .adapters.hf import save_hf as save
@@ -695,7 +712,8 @@ def load_hf(path, model_or_state, dtype=None):
 
     ``dtype`` optionally selects ``'fp32'`` optimizer master tensors or
     ``'bf16'`` model parameters in a checkpoint mapping. With ``None`` it is
-    inferred from the file. Shapes and dtypes must match exactly.
+    inferred from the file's requested floating-point tensors when needed.
+    Saved and target shapes and dtypes must match exactly.
     """
     from .adapters.hf import load_hf as load
 

@@ -14,6 +14,7 @@ from gdtensor.builder import DTensorTable, GlobalTensorMeta, NamedDTensor
 from ..hf import load_state, read_headers, save_state
 from ..state import CheckpointState
 from .fsdp2 import (
+    _DTYPES as _TORCH_DTYPE_CODES,
     _collective,
     _component,
     _context,
@@ -24,6 +25,7 @@ from .torch_access import TorchAccessor
 
 _DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 _FORMAT_DTYPES = {"fp32": ("F32", 4), "bf16": ("BF16", 2)}
+_SUPPORTED_CODES = set(_TORCH_DTYPE_CODES.values())
 
 
 class _CastAccessor(DTensorDataAccessor):
@@ -37,7 +39,9 @@ class _CastAccessor(DTensorDataAccessor):
     def _get(self, key):
         if key != self.current:
             self.finish()
-            tensor = self.tensors[key].to(dtype=self.dtype)
+            tensor = self.tensors[key]
+            if tensor.is_floating_point():
+                tensor = tensor.to(dtype=self.dtype)
             self.current = key
             self.accessor = TorchAccessor(
                 {key: tensor}, self.ctx.rank, self.ctx.world_size
@@ -72,16 +76,20 @@ def _master_values(model, optimizer, tensors):
         for fqn, fields in state["state"].items()
         if "master_param" in fields
     }
-    parameter_names = {name for name, _parameter in model.named_parameters()}
+    parameter_names = {
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.is_floating_point()
+    }
     missing = parameter_names - masters.keys()
     if missing:
         raise ValueError(
             f"fp32 HF export is missing master_param for {sorted(missing)[0]}"
         )
-    return {name: masters.get(name, tensor) for name, tensor in tensors.items()}
+    return tensors | {name: masters[name] for name in parameter_names & tensors.keys()}
 
 
-def _inputs(model_or_state, dtype):
+def _inputs(model_or_state):
     model, optimizer = None, None
     if (
         isinstance(model_or_state, Mapping)
@@ -96,16 +104,14 @@ def _inputs(model_or_state, dtype):
         tensors = _model_values(model)
         if isinstance(tensors, tuple):
             tensors = tensors[0]
-        if dtype == "fp32" and optimizer is not None:
-            tensors = _master_values(model, optimizer, tensors)
-        return model, tensors
+        return model, optimizer, tensors
     if not isinstance(model_or_state, Mapping) or any(
         not isinstance(value, torch.Tensor) for value in model_or_state.values()
     ):
         raise TypeError(
             "model_or_state must be a module, tensor mapping, or {'model': module, 'optimizer': optimizer}"
         )
-    return None, dict(model_or_state)
+    return None, None, dict(model_or_state)
 
 
 def _aliases(model):
@@ -120,25 +126,30 @@ def _aliases(model):
     return aliases
 
 
-def _weights(model_or_state, dtype, ctx, *, loading):
-    target_dtype = _dtype(dtype)
-    model, tensors = _inputs(model_or_state, dtype)
+def _weights(model_or_state, dtype, ctx, *, headers=None):
+    loading = headers is not None
+    model, optimizer, tensors = _inputs(model_or_state)
     aliases = _aliases(model)
     tensors = {name: tensor for name, tensor in tensors.items() if name not in aliases}
+    if loading:
+        dtype = _load_dtype(headers, tensors, aliases, dtype)
+    target_dtype = None if loading and dtype is None else _dtype(dtype)
+    if dtype == "fp32" and optimizer is not None:
+        tensors = _master_values(model, optimizer, tensors)
     component = _component("model", tensors, {}, ctx)
     entries = []
     for named in component.table.named_d_tensors:
+        key = named.global_tensor_id
         alias_names = [
-            alias
-            for alias, canonical in aliases.items()
-            if canonical == named.global_tensor_id
+            alias for alias, canonical in aliases.items() if canonical == key
         ]
         described = named.d_tensor
-        if loading and tensors[named.global_tensor_id].dtype != target_dtype:
+        tensor = tensors[key]
+        if loading and tensor.is_floating_point() and tensor.dtype != target_dtype:
             raise ValueError(
-                f"HF target dtype mismatch for {named.global_tensor_id}: expected {target_dtype}"
+                f"HF target dtype mismatch for {key}: expected {target_dtype}"
             )
-        if not loading:
+        if not loading and tensor.is_floating_point():
             code, itemsize = _FORMAT_DTYPES[dtype]
             meta = described.global_tensor_meta
             described = replace(
@@ -147,7 +158,7 @@ def _weights(model_or_state, dtype, ctx, *, loading):
                     list(meta.global_shape), code, itemsize
                 ),
             )
-        entries.append(NamedDTensor(named.global_tensor_id, described, alias_names))
+        entries.append(NamedDTensor(key, described, alias_names))
     component.table = DTensorTable(entries)
     if not loading:
         component.accessor = _CastAccessor(tensors, target_dtype, ctx)
@@ -174,9 +185,7 @@ def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
 
 
 def _save_hf(path, model_or_state, dtype, max_shard_size, ctx):
-    model, state = _collective(
-        ctx, lambda: _weights(model_or_state, dtype, ctx, loading=False)
-    )
+    model, state = _collective(ctx, lambda: _weights(model_or_state, dtype, ctx))
     _unwrap(
         save_state(
             path,
@@ -188,11 +197,24 @@ def _save_hf(path, model_or_state, dtype, max_shard_size, ctx):
     )
 
 
-def _infer_dtype(path):
+def _load_dtype(headers, tensors, aliases, dtype):
+    requested = {key: key for key in tensors if key in headers}
+    for alias, key in aliases.items():
+        if key in tensors and alias in headers:
+            requested.setdefault(key, alias)
+    for name in requested.values():
+        code = headers[name]["dtype"]
+        if code not in _SUPPORTED_CODES:
+            raise ValueError(f"unsupported dtype {code} for {name}")
+    if dtype is not None or not any(
+        tensor.is_floating_point() for tensor in tensors.values()
+    ):
+        return dtype
     floating = {
-        entry["dtype"]
-        for entry in read_headers(path).values()
-        if entry["dtype"] in ("F32", "BF16")
+        headers[name]["dtype"]
+        for key, name in requested.items()
+        if tensors[key].is_floating_point()
+        and headers[name]["dtype"] in ("F32", "BF16")
     }
     if len(floating) != 1:
         raise ValueError("cannot infer HF dtype; pass dtype='fp32' or 'bf16'")
@@ -203,11 +225,6 @@ def load_hf(path, model_or_state, dtype=None):
     ctx = _context()
     _model, state = _collective(
         ctx,
-        lambda: _weights(
-            model_or_state,
-            _infer_dtype(path) if dtype is None else dtype,
-            ctx,
-            loading=True,
-        ),
+        lambda: _weights(model_or_state, dtype, ctx, headers=read_headers(path)),
     )
     _unwrap(load_state(path, state, ctx))

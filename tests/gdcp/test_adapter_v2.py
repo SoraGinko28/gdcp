@@ -16,10 +16,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
-from gdcp import FSDP2Checkpointer, desc
+from gdcp import FSDP2Checkpointer, desc, load_hf, save_hf
 from gdcp.adapters import fsdp2, torch_access
 from gdcp.adapters import hf as hf_adapter
 from gdcp.adapters.torch_access import TorchAccessor
+from gdcp.hf import read_headers
 from gdcp.state import CheckpointState, RankContext
 from gdtensor.builder import Err, Ok
 from gdtensor_conn.coord import ThreadCoordinator
@@ -42,10 +43,123 @@ def test_hf_dtype_inference_failure_votes_on_every_rank(tmp_path, monkeypatch):
         context.value = RankContext(rank, 2, coordinator)
         expected = "another rank failed" if rank else "cannot infer HF dtype"
         with pytest.raises((ValueError, RuntimeError), match=expected):
-            hf_adapter.load_hf(tmp_path, {})
+            hf_adapter.load_hf(tmp_path, {"weight": torch.zeros(1)})
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(load, range(2)))
+
+
+def _batch_norm(dtype, *, initialized):
+    model = torch.nn.BatchNorm1d(3, dtype=dtype)
+    model.register_buffer("mask", torch.tensor([initialized, False, initialized]))
+    if initialized:
+        model.num_batches_tracked.fill_(16777217)
+        model.running_mean.copy_(torch.tensor([1.125, -2.25, 3.5]))
+    return model
+
+
+def _assert_tensor_bits(actual, expected):
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    assert torch.equal(
+        actual.reshape(-1).view(torch.uint8), expected.reshape(-1).view(torch.uint8)
+    )
+
+
+def _assert_hf_weights(checkpoint, headers, source, target, dtype):
+    from safetensors import safe_open
+
+    for name, value in source.items():
+        expected = value.to(dtype) if value.is_floating_point() else value
+        with safe_open(checkpoint / headers[name]["file"], framework="pt") as file:
+            saved = file.get_tensor(name)
+        _assert_tensor_bits(saved, expected)
+        _assert_tensor_bits(target[name], expected)
+
+
+@pytest.mark.parametrize("world", [1, 2])
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+def test_hf_weights_round_trip_integer_and_bool_buffers(
+    tmp_path, monkeypatch, world, dtype
+):
+    checkpoint = tmp_path / "weights"
+    torch_dtype, code = {
+        "fp32": (torch.float32, "F32"),
+        "bf16": (torch.bfloat16, "BF16"),
+    }[dtype]
+    source_dtype = torch.bfloat16 if dtype == "fp32" else torch.float32
+    context = local()
+    coordinator = ThreadCoordinator(world, timeout=5) if world > 1 else None
+    monkeypatch.setattr(hf_adapter, "_context", lambda: context.value)
+
+    def round_trip(rank):
+        context.value = RankContext(rank, world, coordinator)
+        source = _batch_norm(source_dtype, initialized=True)
+        target = _batch_norm(torch_dtype, initialized=False)
+        save_hf(
+            checkpoint, source, dtype=dtype, max_shard_size=16 if world > 1 else None
+        )
+        headers = read_headers(checkpoint)
+        assert headers["num_batches_tracked"]["dtype"] == "I64"
+        assert headers["mask"]["dtype"] == "BOOL"
+        assert headers["running_mean"]["dtype"] == code
+        load_hf(checkpoint, target)
+        _assert_hf_weights(
+            checkpoint, headers, source.state_dict(), target.state_dict(), torch_dtype
+        )
+
+    with ThreadPoolExecutor(max_workers=world) as pool:
+        list(pool.map(round_trip, range(world)))
+
+
+def test_hf_weights_load_integer_and_bool_without_float_dtype(tmp_path):
+    from safetensors.torch import save_file
+
+    tensors = {"counter": torch.tensor(16777217), "mask": torch.tensor([True, False])}
+    save_file(tensors, tmp_path / "model.safetensors")
+    for dtype in (None, "bf16"):
+        target = {name: torch.zeros_like(value) for name, value in tensors.items()}
+        load_hf(tmp_path, target, dtype=dtype)
+        for name, value in tensors.items():
+            _assert_tensor_bits(target[name], value)
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "dcp"])
+def test_full_state_round_trip_integer_and_bool_buffers(tmp_path, monkeypatch, fmt):
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    source = _batch_norm(torch.float32, initialized=True)
+    target = _batch_norm(torch.float32, initialized=False)
+    checkpoint = tmp_path / "checkpoint"
+    FSDP2Checkpointer.save(checkpoint, {"model": source}, checkpoint_format=fmt)
+    FSDP2Checkpointer.load(checkpoint, {"model": target})
+    restored = target.state_dict()
+    for name, value in source.state_dict().items():
+        _assert_tensor_bits(restored[name], value)
+
+
+@pytest.mark.parametrize("bits", [16, 32, 64])
+def test_hf_weights_only_checks_dtype_of_requested_keys(tmp_path, bits):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    key = "optimizer.ids"
+    save_file(
+        {"weight": np.ones(2, dtype=np.float32), key: np.ones(2, dtype=f"uint{bits}")},
+        tmp_path / "model.safetensors",
+    )
+    weight = torch.zeros(2)
+    load_hf(tmp_path, {"weight": weight})
+    _assert_tensor_bits(weight, torch.ones(2))
+    for target_dtype in (torch.int64, getattr(torch, f"uint{bits}")):
+        weight.zero_()
+        with pytest.raises(
+            (ValueError, RuntimeError),
+            match=rf"unsupported dtype U{bits} for optimizer\.ids",
+        ):
+            load_hf(
+                tmp_path, {"weight": weight, key: torch.zeros(2, dtype=target_dtype)}
+            )
+        _assert_tensor_bits(weight, torch.zeros(2))
 
 
 def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
