@@ -32,11 +32,12 @@ from gdtensor.builder import (
 from gdtensor.tag import WorldSize
 from gdtensor_conn.coord import GlooCoordinator
 
-from .. import core
+from .. import core, desc, hf
 from ..checkpointer import _SAVE_FORMATS, _save_route
 from ..state import CheckpointState, Component, RankContext
 from .torch_access import TorchAccessor
 
+_NO_EXTRA_STATE = object()
 _DTYPES = {
     torch.bool: "BOOL",
     torch.uint8: "U8",
@@ -88,7 +89,7 @@ def _collective[T](ctx, action: Callable[[], T]) -> T:
     return cast(T, value)
 
 
-def _validate_state(state, *, loading, common_only):
+def _validate_state(state, *, common_only):
     if not isinstance(state, dict):
         raise TypeError("checkpoint_state must be a dict")
     unknown = state.keys() - {"model", "optimizer", "extra_state"}
@@ -97,8 +98,6 @@ def _validate_state(state, *, loading, common_only):
     extra = state.get("extra_state")
     if isinstance(extra, dict) and "loader_ckpt" in extra:
         raise NotImplementedError("loader_ckpt")
-    if loading and not common_only and "model" not in state:
-        raise ValueError("model is required unless load_common_state_only is set")
     if common_only:
         return
     if "optimizer" in state and "model" not in state:
@@ -398,12 +397,10 @@ class FSDP2Adapter:
         self.model_aliases = {}
         self.loaded_optimizer = None
         self.loaded_model = None
-        self.loaded_extra = None
+        self.loaded_extra = _NO_EXTRA_STATE
 
     def describe(self, checkpoint_state, ctx):
-        _validate_state(
-            checkpoint_state, loading=self.loading, common_only=self.common_only
-        )
+        _validate_state(checkpoint_state, common_only=self.common_only)
         state = CheckpointState()
         if not self.common_only:
             self._components(checkpoint_state, state, ctx)
@@ -477,12 +474,12 @@ class FSDP2Adapter:
         complete.update({alias: complete[name] for alias, name in aliases.items()})
         self.loaded_model = complete
 
-    def restore(self, checkpoint_state, loaded):
+    def restore(self, checkpoint_state, _loaded):
         if self.loaded_optimizer is not None:
             checkpoint_state["optimizer"].__setstate__(self.loaded_optimizer)
         if self.loaded_model is not None:
             checkpoint_state["model"].load_state_dict(self.loaded_model, strict=True)
-        if "extra_state" in loaded.rank_state:
+        if self.loaded_extra is not _NO_EXTRA_STATE:
             checkpoint_state["extra_state"] = self.loaded_extra
 
 
@@ -528,22 +525,33 @@ def save_checkpoint(
 
         result = dcp.save(root, state, ctx)
     else:
-        from .. import hf
-
         result = hf.save_state(root, state, ctx, max_shard_size=max_shard_size)
     _unwrap(result)
     _collective(ctx, lambda: _finish(state))
 
 
-def _load_format(path):
+def _load_format(path, state):
     root = Path(path)
-    if (root / "model.safetensors").exists() or (
-        root / "model.safetensors.index.json"
-    ).exists():
+    core._require_not_pending(root)
+    if (root / desc.MANIFEST_NAME).is_file():
+        if not state.components:
+            return "safetensors"
+        saved = desc.read_manifest(root, _validate_components=False)
+        formats = {item["format"] for item in saved.components.values()}
+        return "dcp" if "distcp" in formats else "safetensors"
+    if (root / hf._COMMITTED).is_file():
         return "hf"
-    if (root / "model" / ".metadata").exists():
+    native_hf = hf._has_native_files(root)
+    native_dcp = any(
+        (root / name / ".metadata").is_file() for name in ("model", "optimizer")
+    )
+    if native_hf and native_dcp:
+        raise ValueError("ambiguous checkpoint format: native HF and DCP files")
+    if native_hf:
+        return "hf"
+    if native_dcp:
         return "dcp"
-    return "safetensors"
+    raise ValueError("missing checkpoint completion marker or native format files")
 
 
 def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=None):
@@ -565,14 +573,14 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
         core._collective_choice(
             ctx,
             "checkpoint load format",
-            lambda: _load_format(path),
+            lambda: _load_format(path, state),
             ("safetensors", "dcp", "hf"),
         )
     )
     if fmt == "hf":
-        from .. import hf
-
-        result = hf.load_state(path, state, ctx, _preflight=preflight)
+        result = hf.load_state(
+            path, state, ctx, _preflight=preflight, _optional_rank_state=common_only
+        )
     elif fmt == "dcp":
         from . import dcp
 
@@ -586,7 +594,9 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
             path, state, ctx, _preflight=preflight, _validate_groups=validate_groups
         )
     else:
-        result = core.load(path, state, ctx, _preflight=preflight)
+        result = core.load(
+            path, state, ctx, _preflight=preflight, _optional_rank_state=common_only
+        )
     if type(result) is Err and isinstance(result.value, core._LoadValidationError):
         raise result.value.cause
     _unwrap(result)

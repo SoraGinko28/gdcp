@@ -8,7 +8,14 @@ The synchronous `FSDP2Checkpointer` retains every positional parameter and defau
 | `hf_dtype` | `None` | `None` preserves full state. `"fp32"` or `"bf16"` selects weights-only HF export, equivalent to `gdcp.save_hf` below. |
 | `max_shard_size` | `None` | HF file size limit in bytes or a string such as `"5GB"`; `None` writes one file. Tensors never cross files; an oversized tensor occupies its own file. Applies only to HF saves. |
 
-`load(path, checkpoint_state, ...)` detects HF files/indexes at the root, native DCP `.metadata` in component directories, and the GDCP per-rank safetensors manifest. It does not take a format option.
+`load(path, checkpoint_state, ...)` detects GDCP checkpoints from regular
+completion files at the root. `gdcp_manifest.json` identifies per-rank
+safetensors or DCP and records the component formats. A root
+`.gdtensor_committed` identifies a committed HF checkpoint, including older
+saves with no tensor files. For native checkpoints without GDCP completion
+files, load recognizes regular HF tensor files or an HF index at the root, or
+regular DCP `.metadata` in a component directory. If both native layouts are
+present, load reports an ambiguous format.
 
 ```python
 FSDP2Checkpointer.save(
@@ -40,7 +47,13 @@ separately stored group options.
 
 CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:nccl,cpu:gloo"`, so FSDP2 can use NCCL while votes and CPU state use Gloo. The GPU accessor stages one local tensor at a time, copies each save tensor to the host once, and writes back a load tensor once after all its ranges.
 
-HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys, and a typed JSON `optimizer.json` sidecar preserving param groups and aliases. Native HF loading builds storage from headers and an optional standard index. The header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and packed floats. If a requested tensor uses a dtype that the load path cannot represent, the error names the dtype and key.
+HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys,
+and a typed JSON `optimizer.json` sidecar preserving param groups and aliases.
+An HF save with zero tensors writes a valid empty `model.safetensors`. Native
+HF loading builds storage from headers and an optional standard index. The
+header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and
+packed floats. If a requested tensor uses a dtype that the load path cannot
+represent, the error names the dtype and key.
 
 Native PyTorch DCP loads accept uneven `Shard(0)` chunks and ignore empty
 shards at any row offset. GDCP reads each chunk in logical element order using
@@ -62,9 +75,13 @@ ranks outside the saved world warn and use rank 0's file. Older HF checkpoints
 without a rank-state inventory still use the rank filenames to look up state.
 Requesting rank state from native DCP without a GDCP manifest fails collectively.
 
-Per-rank safetensors and DCP loads require every rank to request the same
-components in the same order. Per-rank safetensors, DCP, and HF loads validate
-all requested tensor keys, shapes, dtypes, storage metadata, available
+All three formats require every rank to request the same components in the same
+order. With `load_common_state_only=True`, all three GDCP formats read only rank
+state, even when the checkpoint contains model or optimizer components. An
+absent `extra_state` leaves the caller's checkpoint dict unchanged. The
+low-level `gdcp.hf.load_state` also supports loading an optimizer component
+without loading the model component. Tensor loads validate all requested
+tensor keys, shapes, dtypes, storage metadata, available
 tied-parameter alias information, optimizer objects and parameter groups, and
 requested rank state before writing into live targets. If any rank fails
 validation, the model, optimizer, and caller's checkpoint dict stay unchanged

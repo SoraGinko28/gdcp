@@ -68,6 +68,8 @@ _SAFETENSORS_DTYPE_BITS = {
     "U64": 64,
 }
 _OBJECTS = "optimizer.json"
+_COMMITTED = ".gdtensor_committed"
+_SINGLE_FILE = "model.safetensors"
 
 
 def shard_size_bytes(value):
@@ -111,16 +113,20 @@ def _file_assignment(table, max_shard_size):
         if limit is not None and size > limit:
             groups.append(current)
             current, size = [], 0
-    if current or not groups:
+    if current:
         groups.append(current)
     count = len(groups)
     return {
-        key: "model.safetensors"
+        key: _SINGLE_FILE
         if count == 1
         else f"model-{i + 1:05d}-of-{count:05d}.safetensors"
         for i, group in enumerate(groups)
         for key in group
     }
+
+
+def _tensor_files(assignment):
+    return set(assignment.values()) or {_SINGLE_FILE}
 
 
 class _CombinedAccessor(DTensorDataAccessor):
@@ -187,7 +193,7 @@ class _HFSaveSession(_CoordinatedSaveSession):
     def my_files(self):
         paths = set(super().my_files())
         if self.rank == 0:
-            paths.update(self.assignment.values())
+            paths.update(_tensor_files(self.assignment))
         return sorted(paths)
 
     def _header(self, path):
@@ -232,13 +238,14 @@ class _HFSaveSession(_CoordinatedSaveSession):
             and self.index.files[path].leader.rank == self.rank
         ]
         if self.rank == 0:
-            files += sorted(set(self.assignment.values()) - self.index.files.keys())
+            files += sorted(_tensor_files(self.assignment) - self.index.files.keys())
         return files
 
     def _after_barrier(self):
         if self.rank != 0:
             return
-        if len(set(self.assignment.values())) > 1:
+        files = _tensor_files(self.assignment)
+        if len(files) > 1:
             total = sum(
                 prod(named.d_tensor.global_tensor_meta.global_shape)
                 * named.d_tensor.global_tensor_meta.itemsize
@@ -253,11 +260,11 @@ class _HFSaveSession(_CoordinatedSaveSession):
         # This optional connector marker is for atomic publication only. HF
         # reading itself depends solely on the standard headers and index.
         desc.atomic_write(
-            Path(self.root) / ".gdtensor_committed",
+            Path(self.root) / _COMMITTED,
             desc.json_bytes(
                 {
                     "format": "safetensors",
-                    "files": sorted(set(self.assignment.values())),
+                    "files": sorted(files),
                 }
             ),
         )
@@ -351,9 +358,9 @@ def _save_io(ctx, combined, compute, storage):
 
 
 def _initialize(transaction, state, ctx, objects, assignment, write_metadata):
-    planned = {Path(name) for name in assignment.values()}
+    planned = {Path(name) for name in _tensor_files(assignment)}
     planned.update(core._planned_rank_files(state, ctx))
-    planned.update({Path(_OBJECTS), Path(".gdtensor_committed")})
+    planned.update({Path(_OBJECTS), Path(_COMMITTED)})
     # A foreign index would take precedence over the newly written single file.
     planned.add(Path(HF_INDEX_NAME))
     if write_metadata is not None:
@@ -421,7 +428,7 @@ def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
 def _finalize(path, state, ctx):
     if ctx.rank != 0:
         return
-    marker = Path(path) / ".gdtensor_committed"
+    marker = Path(path) / _COMMITTED
     saved = json.loads(marker.read_bytes())
     saved["rank_state"] = core._rank_state_inventory(state, ctx)
     desc.atomic_write(marker, desc.json_bytes(saved))
@@ -503,6 +510,20 @@ def _add_header_file(root, filename, weight_map, headers):
         raise ValueError(f"{filename}: payload size does not match header")
 
 
+def _has_native_files(root):
+    return (root / HF_INDEX_NAME).is_file() or (root / _SINGLE_FILE).is_file()
+
+
+def _read_completion_marker(root):
+    marker = root / _COMMITTED
+    if not marker.is_file():
+        return {}
+    saved = json.loads(marker.read_bytes())
+    if saved["format"] != "safetensors" or not isinstance(saved["files"], list):
+        raise ValueError("invalid HF completion marker")
+    return saved
+
+
 def read_headers(path):
     """Describe native HF tensor byte ranges, with itemsize=None for packed dtypes."""
     root = Path(path)
@@ -516,10 +537,12 @@ def read_headers(path):
     )
     if weight_map is not None and (not isinstance(weight_map, dict) or not weight_map):
         raise ValueError("HF weight_map must be a nonempty mapping")
+    if weight_map is None and not (root / _SINGLE_FILE).is_file():
+        # Older GDCP saves with zero tensors only wrote the completion marker.
+        if _read_completion_marker(root).get("files") == []:
+            return {}
     files = (
-        sorted(set(weight_map.values()))
-        if weight_map is not None
-        else ["model.safetensors"]
+        sorted(set(weight_map.values())) if weight_map is not None else [_SINGLE_FILE]
     )
     headers = {}
     for filename in files:
@@ -548,7 +571,7 @@ def _payload_digest(path, entry):
     return digest.hexdigest()
 
 
-def _validate_keys(combined, headers):
+def _validate_keys(combined, headers, components):
     expected = {named.global_tensor_id for named in combined.table.named_d_tensors}
     missing = expected - headers.keys()
     if missing:
@@ -567,7 +590,10 @@ def _validate_keys(combined, headers):
             raise ValueError(f"HF tied alias {alias} differs from {canonical}")
         duplicates.append((alias, canonical))
     unexpected -= aliases.keys()
-    if not any(key.startswith("optimizer.") for key in expected):
+    if "model" not in components:
+        prefixes = tuple(name + "." for name in components)
+        unexpected = {key for key in unexpected if key.startswith(prefixes)}
+    elif "optimizer" not in components:
         unexpected = {key for key in unexpected if not key.startswith("optimizer.")}
     if unexpected:
         raise ValueError(f"HF unexpected key {sorted(unexpected)[0]}")
@@ -587,7 +613,7 @@ def _load_prepare(path, state, ctx):
     core._validate_state(state)
     headers = read_headers(path)
     combined, _objects = _combined(state, headers)
-    duplicates = _validate_keys(combined, headers)
+    duplicates = _validate_keys(combined, headers, {c.name for c in state.components})
     entries = []
     for named in combined.table.named_d_tensors:
         key, meta = named.global_tensor_id, named.d_tensor.global_tensor_meta
@@ -639,24 +665,47 @@ def _load_prepare(path, state, ctx):
     return combined, compute, storage, objects, headers, duplicates
 
 
-def _load_rank_state(path, state, ctx):
-    marker = Path(path) / ".gdtensor_committed"
-    if marker.is_file():
-        saved = json.loads(marker.read_bytes())
-        if "rank_state" in saved:
-            return core._load_rank_state(path, state, saved["rank_state"], ctx)
+def _load_rank_state(path, state, ctx, *, optional):
+    root = Path(path)
+    saved = _read_completion_marker(root)
+    if "rank_state" in saved:
+        return core._load_rank_state(
+            root, state, saved["rank_state"], ctx, optional=optional
+        )
     # Older HF saves did not record the rank files in their completion marker.
     blobs = {}
     for name in state.rank_state:
-        filename = Path(path) / name / f"{name}_rank_{ctx.rank}.pt"
+        filename = root / name / f"{name}_rank_{ctx.rank}.pt"
         if not filename.is_file():
             filename = filename.with_name(f"{name}_rank_0.pt")
-        blobs[name] = filename.read_bytes()
+        if not optional or filename.is_file():
+            blobs[name] = filename.read_bytes()
     return blobs
 
 
-def load_state(path, state, ctx, *, _preflight=None):
+def _load_rank_only(path, state, ctx, *, optional):
+    core._validate_context(ctx)
+    core._validate_state(state)
+    core._require_not_pending(path)
+    root = Path(path)
+    if not (root / _COMMITTED).is_file() and not _has_native_files(root):
+        raise ValueError("missing HF completion marker or native safetensors files")
+    return _load_rank_state(root, state, ctx, optional=optional)
+
+
+def load_state(path, state, ctx, *, _preflight=None, _optional_rank_state=False):
     """Load native HF headers directly, including an optional optimizer sidecar."""
+    agreed = core._agree_components(state, ctx)
+    if type(agreed) is Err:
+        return agreed
+    if not state.components:
+        return core._load_components(
+            [],
+            ctx,
+            state,
+            lambda: _load_rank_only(path, state, ctx, optional=_optional_rank_state),
+            _preflight,
+        )
     prepared = core._collective(
         ctx, "HF prepare load", lambda: _load_prepare(path, state, ctx)
     )
@@ -677,7 +726,7 @@ def load_state(path, state, ctx, *, _preflight=None):
     result = core._load_payloads(
         [(combined.name, compute, storage)],
         ctx,
-        lambda: _load_rank_state(path, state, ctx),
+        lambda: _load_rank_state(path, state, ctx, optional=_optional_rank_state),
         preflight=validate_objects,
         validate=lambda: _validate_alias_payloads(path, headers, duplicates),
     )

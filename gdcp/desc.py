@@ -238,15 +238,16 @@ def write_manifest(path, desc):
     atomic_write(Path(path) / MANIFEST_NAME, json_bytes(manifest))
 
 
-def read_manifest(path):
+def read_manifest(path, *, _validate_components=True):
     manifest = json.loads((Path(path) / MANIFEST_NAME).read_bytes())
     if manifest["gdcp_version"] != 1:
         raise ValueError(f"unsupported gdcp_version {manifest['gdcp_version']!r}")
     if type(manifest["world_size"]) is not int or manifest["world_size"] < 1:
         raise ValueError("invalid saved world_size")
-    for name, component in manifest["components"].items():
-        _safe_relative(name)
-        rebuild_component(component, manifest["world_size"])
+    if _validate_components:
+        for name, component in manifest["components"].items():
+            _safe_relative(name)
+            rebuild_component(component, manifest["world_size"])
     for name in manifest["rank_state"]:
         _safe_relative(name)
     return CheckpointDesc(manifest)

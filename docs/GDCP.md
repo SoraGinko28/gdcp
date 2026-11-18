@@ -28,14 +28,15 @@ Native PyTorch DCP loads support uneven `Shard(0)` chunks and empty shards. GDCP
 honors the saved local strides, including transposed shards, when restoring at
 the same or a different world size.
 
-Model-only save and load, model-only load from a full checkpoint, extra-only
-save, and `load_common_state_only=True` are supported. Optimizer state needs
-the accompanying model to establish parameter names, including when loading.
-The normal load requires a model. Common-only load restores extra state.
+All three formats support empty checkpoints, extra-state-only checkpoints,
+and model checkpoints with or without optimizer or extra state. Pass the keys
+you want to restore to `load`. Optimizer state needs the accompanying model to
+establish parameter names. With `load_common_state_only=True`, `load` reads
+only rank state and adds `extra_state` to the caller's dict if the checkpoint
+contains it. A declared rank-state file that is missing still causes an error.
 All ranks must use the same FSDP2 save format and agree on whether an HF save
-exports weights only or full state. Per-rank safetensors and DCP loads require
-the same ordered component list on every rank. Saves also require that agreement
-before staging begins.
+exports weights only or full state. All three formats require the same ordered
+component list on every rank during load and before staging a save.
 
 Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
 Integer and boolean buffers round-trip bit for bit into targets of the same dtype.
@@ -43,11 +44,11 @@ This includes `uint16`, `uint32`, and `uint64` buffers and `int16` buffers shard
 with `Shard(0)`.
 See [GDCP v2 formats](GDCP-V2.md) for `save_hf` and `load_hf` options.
 
-`gdcp_manifest.json` is the checkpoint commit marker. GDCP writes it last,
-after every rank commits every requested component and extra-state file.
-Nonempty component directories also contain the connector's
-`.gdtensor_committed` completion files, which its loader checks. These are
-component markers; GDCP's manifest determines whole-checkpoint visibility.
+GDCP writes `gdcp_manifest.json` as the checkpoint commit marker for per-rank
+safetensors and DCP after every rank commits its components and extra-state
+files. Per-rank safetensors component directories also have their own
+`.gdtensor_committed` files. HF uses a root `.gdtensor_committed` file as its
+checkpoint commit marker.
 Every save is built in `.NAME.gdcp-stage` beside the resolved real target.
 A symlink to a directory keeps its original link text and inode; dangling links
 and links to files are errors. The filesystem root and mount-point targets

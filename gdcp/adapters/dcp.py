@@ -971,7 +971,7 @@ def _prepare_native(path, state, ctx, optimizer):
 
 def _has_manifest(path):
     core._require_not_pending(path)
-    return (Path(path) / desc.MANIFEST_NAME).exists()
+    return (Path(path) / desc.MANIFEST_NAME).is_file()
 
 
 def load(path, state, ctx, *, _preflight=None, _validate_groups=None):

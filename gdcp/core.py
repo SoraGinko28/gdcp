@@ -532,7 +532,7 @@ def _prepare_load(path, state, ctx, backend, strict):
             "strict=False is not supported; v1 requires strict=True"
         )
     _require_not_pending(path)
-    description = desc.read_manifest(path)
+    description = desc.read_manifest(path, _validate_components=bool(state.components))
     prepared = []
     for component in state.components:
         item = _prepare_load_component(
@@ -564,15 +564,17 @@ def _prepare_load_component(path, component, description, ctx, backend, strict):
     return component, compute, storage, objects
 
 
-def _load_rank_state(path, state, inventory, ctx, *, saved_world=None):
+def _load_rank_state(path, state, inventory, ctx, *, saved_world=None, optional=False):
     files = {
         name: _declared_rank_files(path, name, info) for name, info in inventory.items()
     }
     loaded = {}
     for name in state.rank_state:
-        if name not in files:
+        ranks = files.get(name)
+        if ranks is None and optional:
+            continue
+        if ranks is None:
             raise ValueError(f"missing rank state {name}")
-        ranks = files[name]
         world = saved_world if saved_world is not None else max(ranks, default=-1) + 1
         loaded[name] = _load_rank_blob(name, ranks, ctx.rank, world)
     return loaded
@@ -731,7 +733,14 @@ def _restore_objects(prepared):
 
 
 def load(
-    path, state, ctx, *, backend=None, strict=True, _preflight=None
+    path,
+    state,
+    ctx,
+    *,
+    backend=None,
+    strict=True,
+    _preflight=None,
+    _optional_rank_state=False,
 ) -> Result[None]:
     """Restore requested components after all strict metadata checks pass."""
     agreed = _agree_components(state, ctx)
@@ -748,7 +757,12 @@ def load(
 
     def load_rank_state():
         return _load_rank_state(
-            path, state, description.rank_state, ctx, saved_world=description.world_size
+            path,
+            state,
+            description.rank_state,
+            ctx,
+            saved_world=description.world_size,
+            optional=_optional_rank_state,
         )
 
     return _load_components(components, ctx, state, load_rank_state, _preflight)

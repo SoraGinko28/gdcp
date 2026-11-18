@@ -136,19 +136,19 @@ def test_native_dcp_preflight_failure_votes_on_every_rank(
     manifest.unlink()
     target = numpy_checkpoint(2, initialized=False)
     rank_context = local()
-    exists = Path.exists
+    is_file = Path.is_file
 
-    def rank_local_exists(path):
+    def rank_local_is_file(path):
         if path == manifest and rank_context.rank == 0:
             if failure == "lookup":
                 raise OSError("injected manifest lookup failure")
             return failure == "mixed_formats"
-        return exists(path)
+        return is_file(path)
 
     if failure == "rank_state":
         target.states[0].rank_state["extra_state"] = b""
     coordinator = ThreadCoordinator(2, timeout=2)
-    monkeypatch.setattr(Path, "exists", rank_local_exists)
+    monkeypatch.setattr(Path, "is_file", rank_local_is_file)
 
     def load_rank(rank):
         rank_context.rank = rank

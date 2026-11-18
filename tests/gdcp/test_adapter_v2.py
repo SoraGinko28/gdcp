@@ -1,6 +1,7 @@
 """Focused adapter invariants independent of model size and rank launcher."""
 
 import ctypes
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import local
@@ -18,7 +19,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Shard
 
-from gdcp import FSDP2Checkpointer, desc, load_hf, save_hf
+from gdcp import FSDP2Checkpointer, desc, hf, load_hf, save_hf
 from gdcp.adapters import dcp, fsdp2, torch_access
 from gdcp.adapters import hf as hf_adapter
 from gdcp.adapters.torch_access import TorchAccessor
@@ -243,17 +244,18 @@ def test_sharded_int16_buffer_round_trip(tmp_path, sharded_world, mode):
 
 
 def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
+    FSDP2Checkpointer.save(tmp_path, {})
     coordinator = ThreadCoordinator(2, timeout=2)
     context = local()
-    exists = Path.exists
+    is_file = Path.is_file
     monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
 
-    def rank_local_exists(path):
-        if path == tmp_path / "model.safetensors" and context.value.rank == 0:
+    def rank_local_is_file(path):
+        if path == tmp_path / desc.MANIFEST_NAME and context.value.rank == 0:
             raise OSError("injected checkpoint lookup failure")
-        return exists(path)
+        return is_file(path)
 
-    monkeypatch.setattr(Path, "exists", rank_local_exists)
+    monkeypatch.setattr(Path, "is_file", rank_local_is_file)
 
     def load(rank):
         context.value = RankContext(rank, 2, coordinator)
@@ -263,6 +265,115 @@ def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(load, range(2)))
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize(
+    "parts",
+    [
+        (),
+        ("extra_state",),
+        ("model",),
+        ("model", "extra_state"),
+        ("model", "optimizer"),
+        ("model", "optimizer", "extra_state"),
+    ],
+    ids=["empty", "extra", "model", "model-extra", "model-optimizer", "all"],
+)
+def test_fsdp2_checkpoint_subsets_round_trip(mesh, tmp_path, monkeypatch, fmt, parts):
+    source = _checkpoint_subset(mesh, parts, 1.0, 0.01, {"step": 7})
+    target = _checkpoint_subset(mesh, parts, 9.0, 0.25, None)
+    options = {"max_shard_size": 1} if fmt == "hf" else {}
+    FSDP2Checkpointer.save(tmp_path, source, checkpoint_format=fmt, **options)
+    FSDP2Checkpointer.load(tmp_path, target)
+    if "model" in parts:
+        assert _values(target["model"], target.get("optimizer")) == _values(
+            source["model"], source.get("optimizer")
+        )
+    expected = {key: source[key] for key in ("extra_state",) if key in source}
+    assert {key: target[key] for key in expected} == expected
+
+    def reject_tensor_open(path, *args, **kwargs):
+        if path.is_relative_to(tmp_path):
+            allowed = {desc.MANIFEST_NAME, ".gdtensor_committed", "extra_state"}
+            assert path.relative_to(tmp_path).parts[0] in allowed, path
+        return original_open(path, *args, **kwargs)
+
+    original_open = Path.open
+    monkeypatch.setattr(Path, "open", reject_tensor_open)
+    common = {}
+    FSDP2Checkpointer.load(tmp_path, common, load_common_state_only=True)
+    assert common == expected
+    if "extra_state" in parts:
+        (tmp_path / "extra_state" / "extra_state_rank_0.pt").unlink()
+        with pytest.raises(RuntimeError, match="missing declared rank state file"):
+            FSDP2Checkpointer.load(tmp_path, common, load_common_state_only=True)
+
+
+def _checkpoint_subset(mesh, parts, value, lr, extra):
+    state = {}
+    if "model" in parts:
+        state["model"] = fully_shard(_model(value, "a"), mesh=mesh)
+    if "optimizer" in parts:
+        state["optimizer"] = _optimizer(state["model"], lr)
+    if "extra_state" in parts:
+        state["extra_state"] = extra
+    return state
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "dcp"])
+@pytest.mark.parametrize("directory", [True, False])
+def test_fsdp2_manifest_wins_over_uncommitted_hf_names(tmp_path, fmt, directory):
+    FSDP2Checkpointer.save(tmp_path, {"extra_state": 7}, checkpoint_format=fmt)
+    for name in ("model.safetensors", "model.safetensors.index.json"):
+        path = tmp_path / name
+        if directory:
+            path.mkdir()
+        else:
+            path.write_bytes(b"foreign file")
+    common = {}
+    FSDP2Checkpointer.load(tmp_path, common, load_common_state_only=True)
+    assert common == {"extra_state": 7}
+
+
+def test_safetensors_manifest_wins_over_foreign_dcp_metadata(mesh, tmp_path):
+    source = _checkpoint_subset(mesh, ("model",), 1.0, 0.01, None)
+    target = _checkpoint_subset(mesh, ("model",), 9.0, 0.25, None)
+    FSDP2Checkpointer.save(tmp_path, source)
+    (tmp_path / "model" / ".metadata").write_bytes(b"foreign file")
+    FSDP2Checkpointer.load(tmp_path, target)
+    assert _values(target["model"]) == _values(source["model"])
+
+
+def test_fsdp2_loads_legacy_hf_with_rank_state_only(tmp_path):
+    FSDP2Checkpointer.save(tmp_path, {"extra_state": 7}, checkpoint_format="hf")
+    (tmp_path / "model.safetensors").unlink(missing_ok=True)
+    marker = tmp_path / ".gdtensor_committed"
+    saved = json.loads(marker.read_bytes())
+    saved["files"] = []
+    marker.write_bytes(desc.json_bytes(saved))
+    common = {}
+    FSDP2Checkpointer.load(tmp_path, common, load_common_state_only=True)
+    assert common == {"extra_state": 7}
+
+
+def test_fsdp2_common_only_detects_hf_without_tensor_files(mesh, tmp_path):
+    source = _checkpoint_subset(mesh, ("model", "extra_state"), 1.0, 0.01, 7)
+    FSDP2Checkpointer.save(tmp_path, source, checkpoint_format="hf")
+    (tmp_path / "model.safetensors").unlink()
+    (tmp_path / "optimizer.json").unlink()
+    (tmp_path / desc.MANIFEST_NAME).mkdir()
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / ".metadata").write_bytes(b"foreign file")
+    common = {}
+    FSDP2Checkpointer.load(tmp_path, common, load_common_state_only=True)
+    assert common == {"extra_state": 7}
+
+
+def test_empty_hf_weights_round_trip(tmp_path):
+    save_hf(tmp_path, {})
+    assert hf.read_headers(tmp_path) == {}
+    load_hf(tmp_path, {}, dtype="fp32")
 
 
 @pytest.mark.parametrize(
@@ -509,13 +620,10 @@ def test_optimizer_adamw_subclass_is_supported(monkeypatch):
     monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
     model = torch.nn.Linear(2, 3)
     optimizer = MixedAdamW(model.parameters())
-    fsdp2._validate_state(
-        {"model": model, "optimizer": optimizer}, loading=False, common_only=False
-    )
+    fsdp2._validate_state({"model": model, "optimizer": optimizer}, common_only=False)
     with pytest.raises(NotImplementedError, match="AdamW or a subclass"):
         fsdp2._validate_state(
             {"model": model, "optimizer": torch.optim.SGD(model.parameters())},
-            loading=False,
             common_only=False,
         )
 

@@ -3,8 +3,10 @@
 import json
 import struct
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
+from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from gdcp.hf import load_state, read_headers, save_state, shard_size_bytes
@@ -86,6 +88,24 @@ def test_native_safetensors_output_loads_without_private_metadata(tmp_path, worl
     assert data  # the native payload itself was not converted or gathered
     assert_ok(_collective(load_state, tmp_path, fixture))
     fixture.fabrics["model"].assert_values(fixture.values["model"])
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_empty_hf_state_round_trips(tmp_path, world):
+    fixture = SimpleNamespace(states=[CheckpointState() for _ in range(world)])
+    assert_ok(_collective(save_state, tmp_path, fixture))
+    assert_ok(_collective(load_state, tmp_path, fixture))
+    assert read_headers(tmp_path) == {}
+    with safe_open(tmp_path / "model.safetensors", framework="numpy") as file:
+        assert list(file.keys()) == []
+
+
+def test_hf_loads_optimizer_without_requesting_model(tmp_path):
+    source = numpy_checkpoint(1, initialized=True, names=("model", "optimizer"))
+    target = numpy_checkpoint(1, initialized=False, names=("optimizer",))
+    assert_ok(_collective(save_state, tmp_path, source))
+    assert_ok(_collective(load_state, tmp_path, target))
+    assert_values(target, source)
 
 
 @pytest.mark.parametrize(
