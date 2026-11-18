@@ -1,12 +1,13 @@
-"""Foreign entries survive pathname replacement and blocked rollback."""
+"""Regression tests for collective checkpoint I/O and directory transactions."""
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-from gdcp import _transaction, hf
+from gdcp import _transaction, desc, hf
 from gdcp.state import RankContext
 from gdtensor.builder import Err
 from gdtensor_conn.coord import ThreadCoordinator
@@ -19,6 +20,88 @@ _PAYLOADS = [
     ("dcp", "model/__0_0.distcp"),
     ("hf", "model.safetensors"),
 ]
+
+
+@pytest.mark.parametrize("fmt", [fmt for fmt, _ in _PAYLOADS])
+@pytest.mark.parametrize("owner", [0, 1])
+def test_rank_state_key_mismatch_fails_before_writing(
+    tmp_path, monkeypatch, fmt, owner
+):
+    root = tmp_path / "checkpoint"
+    source = _fixture()
+    source.states[owner].rank_state["extraé"] = b"opaque"
+    writes = []
+    begin = _transaction.DirectoryTransaction.begin
+
+    def track_begin(transaction, planned):
+        writes.append(transaction.rank)
+        return begin(transaction, planned)
+
+    monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
+    results = _run(fmt, root, source)
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "extraé" in results[0].value.msg
+    assert not writes
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", [fmt for fmt, _ in _PAYLOADS])
+def test_rank_state_inventory_and_larger_world_fallback(tmp_path, caplog, fmt):
+    root = tmp_path / "checkpoint"
+    source = _fixture()
+    source.states[0].rank_state = {"second": b"zero", **source.states[0].rank_state}
+    source.states[1].rank_state["second"] = b"one"
+    assert_ok(_run(fmt, root, source))
+    metadata = ".gdtensor_committed" if fmt == "hf" else desc.MANIFEST_NAME
+    recorded = json.loads((root / metadata).read_bytes())["rank_state"]
+    assert recorded.keys() == source.states[0].rank_state.keys()
+    for name, info in recorded.items():
+        assert info["ranks"] == [0, 1]
+        files = {info["pattern"].format(rank=rank) for rank in info["ranks"]}
+        assert {file.name for file in (root / name).iterdir()} == files
+    target = _fixture(world=3, shift=7)
+    for state in target.states:
+        state.rank_state["second"] = b""
+    assert_ok(_run(fmt, root, target, loading=True))
+    assert [state.rank_state for state in target.states] == [
+        source.states[rank].rank_state for rank in (0, 1, 0)
+    ]
+    assert "extra_state rank 2" in caplog.text
+
+
+@pytest.mark.parametrize("fmt", [fmt for fmt, _ in _PAYLOADS])
+@pytest.mark.parametrize("world", [1, 2])
+def test_load_rejects_missing_declared_rank_file(tmp_path, fmt, world):
+    root = tmp_path / "checkpoint"
+    assert_ok(_run(fmt, root, _fixture()))
+    filename = "extra_state_rank_1.pt"
+    (root / "extra_state" / filename).unlink()
+    target = _fixture(world=world, shift=7)
+    results = _run(fmt, root, target, loading=True)
+    assert all(type(result) is Err for result in results), results
+    assert all(filename in result.value.msg for result in results)
+    for rank, state in enumerate(target.states):
+        assert state.rank_state == {"extra_state": f"7-{rank}".encode()}
+    for name, fabric in target.fabrics.items():
+        fabric.assert_values(target.values[name])
+
+
+def test_hf_metadata_hook_uses_the_same_vote_on_every_rank(tmp_path):
+    source = _fixture()
+    root = tmp_path / "checkpoint"
+    coordinator = ThreadCoordinator(2, timeout=2)
+
+    def save(rank):
+        return hf.save_state(
+            root,
+            source.states[rank],
+            RankContext(rank, 2, coordinator),
+            _write_metadata=None if rank else lambda path: None,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert_ok(list(pool.map(save, range(2))))
 
 
 @pytest.mark.parametrize(("fmt", "name"), _PAYLOADS)

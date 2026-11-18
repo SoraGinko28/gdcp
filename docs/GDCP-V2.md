@@ -31,6 +31,14 @@ CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:ncc
 
 HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys, and a typed JSON `optimizer.json` sidecar preserving param groups and aliases. Native HF loading builds storage from headers and an optional standard index; no GDCP manifest is needed. DCP loading accepts native per-rank chunks only if their geometry is representable by GDTensor and rejects unsupported layouts explicitly.
 
+All three formats require the same rank-state keys on every rank before any
+checkpoint writes. GDCP records the saved rank files in its manifest for
+per-rank safetensors and DCP, and in the completion marker for HF. A missing
+declared file fails validation on all ranks. When the loading world is larger,
+ranks outside the saved world warn and use rank 0's file. Older HF checkpoints
+without a rank-state inventory still use the rank filenames to look up state.
+Requesting rank state from native DCP without a GDCP manifest fails collectively.
+
 Per-rank safetensors, DCP, and HF loads validate all requested tensor keys,
 shapes, dtypes, storage metadata, available tied-parameter alias information,
 optimizer objects and parameter groups, and requested rank state before writing

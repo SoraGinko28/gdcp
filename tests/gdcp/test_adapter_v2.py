@@ -2,6 +2,7 @@
 
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import local
 from types import SimpleNamespace
 from typing import Any, cast
@@ -17,6 +18,7 @@ from torch.distributed.tensor import DTensor
 
 from gdcp import FSDP2Checkpointer, desc
 from gdcp.adapters import fsdp2, torch_access
+from gdcp.adapters import hf as hf_adapter
 from gdcp.adapters.torch_access import TorchAccessor
 from gdcp.state import CheckpointState, RankContext
 from gdtensor.builder import Err, Ok
@@ -24,6 +26,49 @@ from gdtensor_conn.coord import ThreadCoordinator
 from gdtensor_conn.iobackend import FileIO
 
 _FORMATS = ("safetensors", "dcp", "hf")
+
+
+def test_hf_dtype_inference_failure_votes_on_every_rank(tmp_path, monkeypatch):
+    coordinator = ThreadCoordinator(2, timeout=2)
+    context = local()
+    monkeypatch.setattr(hf_adapter, "_context", lambda: context.value)
+    monkeypatch.setattr(
+        hf_adapter,
+        "read_headers",
+        lambda path: {"weight": {"dtype": "F32"}} if context.value.rank else {},
+    )
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        expected = "another rank failed" if rank else "cannot infer HF dtype"
+        with pytest.raises((ValueError, RuntimeError), match=expected):
+            hf_adapter.load_hf(tmp_path, {})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+
+
+def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
+    coordinator = ThreadCoordinator(2, timeout=2)
+    context = local()
+    exists = Path.exists
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+
+    def rank_local_exists(path):
+        if path == tmp_path / "model.safetensors" and context.value.rank == 0:
+            raise OSError("injected checkpoint lookup failure")
+        return exists(path)
+
+    monkeypatch.setattr(Path, "exists", rank_local_exists)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        expected = "another rank failed" if rank else "checkpoint lookup failure"
+        with pytest.raises(RuntimeError, match=expected):
+            fsdp2.load_checkpoint(tmp_path, {}, common_only=True)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
 
 
 def _range(key, offset, size):
@@ -210,7 +255,9 @@ def test_invalid_accessor_range_returns_result_error():
 def mesh(monkeypatch):
     pytest.importorskip("torch.testing._internal.distributed.fake_pg")
     init_process_group("fake", store=HashStore(), rank=0, world_size=1)
-    monkeypatch.setattr(fsdp2, "_context", lambda: RankContext(0, 1))
+    context = RankContext(0, 1)
+    monkeypatch.setattr(fsdp2, "_context", lambda: context)
+    monkeypatch.setattr(hf_adapter, "_context", lambda: context)
     try:
         yield DeviceMesh("cpu", [0])
     finally:

@@ -323,8 +323,6 @@ def _group_storage_rows(combined, table):
 
 
 def _save_prepare(path, state, ctx, max_shard_size):
-    core._validate_context(ctx)
-    core._validate_state(state)
     combined, objects = _combined(state)
     table, _layout = PerRankPolicy().plan(combined, ctx.world_size)
     combined, table = _group_storage_rows(combined, table)
@@ -398,10 +396,13 @@ def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
     )
     if type(result) is Err:
         return result
-    if write_metadata is not None:
-        result = core._collective(ctx, "HF metadata", lambda: write_metadata(path))
-        if type(result) is Err:
-            return result
+    result = core._collective(
+        ctx,
+        "HF metadata",
+        lambda: write_metadata(path) if write_metadata is not None else None,
+    )
+    if type(result) is Err:
+        return result
     result = core._collective(
         ctx, "HF rank state", lambda: core._save_rank_state(path, state, ctx)
     )
@@ -424,13 +425,7 @@ def _finalize(path, state, ctx):
         return
     marker = Path(path) / ".gdtensor_committed"
     saved = json.loads(marker.read_bytes())
-    saved["rank_state"] = {
-        name: {
-            "ranks": list(range(ctx.world_size)),
-            "pattern": f"{name}_rank_{{rank}}.pt",
-        }
-        for name in state.rank_state
-    }
+    saved["rank_state"] = core._rank_state_inventory(state, ctx)
     desc.atomic_write(marker, desc.json_bytes(saved))
     (Path(path) / desc.PENDING_NAME).unlink()
 
@@ -439,6 +434,7 @@ def save_state(path, state, ctx, *, max_shard_size=None, _write_metadata=None):
     """Save HF files in a sibling, preserving the old checkpoint on failure."""
     return core._transactional_save(
         path,
+        state,
         ctx,
         lambda transaction: _save_staged(
             transaction, state, ctx, max_shard_size, _write_metadata
@@ -639,13 +635,24 @@ def _load_prepare(path, state, ctx):
         and "optimizer" not in objects
     ):
         raise ValueError("HF full-state checkpoint is missing optimizer.json")
+    blobs = _load_rank_state(path, state, ctx)
+    return combined, compute, storage, objects, blobs, headers, duplicates
+
+
+def _load_rank_state(path, state, ctx):
+    marker = Path(path) / ".gdtensor_committed"
+    if marker.is_file():
+        saved = json.loads(marker.read_bytes())
+        if "rank_state" in saved:
+            return core._load_rank_state(path, state, saved["rank_state"], ctx)
+    # Older HF saves did not record the rank files in their completion marker.
     blobs = {}
     for name in state.rank_state:
         filename = Path(path) / name / f"{name}_rank_{ctx.rank}.pt"
         if not filename.is_file():
             filename = filename.with_name(f"{name}_rank_0.pt")
         blobs[name] = filename.read_bytes()
-    return combined, compute, storage, objects, blobs, headers, duplicates
+    return blobs
 
 
 def load_state(path, state, ctx, *, _preflight=None):
@@ -671,12 +678,17 @@ def load_state(path, state, ctx, *, _preflight=None):
     result = core._load_payloads([(combined.name, compute, storage)], ctx, validate)
     if type(result) is Err:
         return result
+    return core._collective(
+        ctx, "HF load complete", lambda: _restore_state(state, objects, blobs)
+    )
+
+
+def _restore_state(state, objects, blobs):
     for component in state.components:
         if component.name in objects:
             component.objects.clear()
             component.objects.update(objects[component.name])
     state.rank_state.update(blobs)
-    return core._collective(ctx, "HF load complete", lambda: None)
 
 
 def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):

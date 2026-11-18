@@ -1,12 +1,18 @@
 """Genuine per-rank DCP records, deterministic bytes and native interchange."""
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import local
 
 import numpy as np
 import pytest
 
-from gdcp import core
+from gdcp import core, desc
+from gdcp.state import RankContext
+from gdtensor.builder import Err
+from gdtensor_conn.coord import ThreadCoordinator
+from gdtensor_conn.iobackend import FileIO
 from tests.support.gdcp import assert_ok, assert_values, collective, numpy_checkpoint
 
 pytestmark = pytest.mark.skipif(
@@ -114,6 +120,71 @@ def test_native_dcp_load_without_manifest(tmp_path):
 
     assert_ok(collective(_load, tmp_path, restored))
     assert_values(restored, source)
+
+
+@pytest.mark.parametrize("failure", ["rank_state", "lookup", "mixed_formats"])
+def test_native_dcp_preflight_failure_votes_on_every_rank(
+    tmp_path, monkeypatch, failure
+):
+    from gdcp.adapters.dcp import load
+
+    assert_ok(_dcp_save(tmp_path, numpy_checkpoint(2, initialized=True)))
+    manifest = tmp_path / desc.MANIFEST_NAME
+    manifest.unlink()
+    target = numpy_checkpoint(2, initialized=False)
+    rank_context = local()
+    exists = Path.exists
+
+    def rank_local_exists(path):
+        if path == manifest and rank_context.rank == 0:
+            if failure == "lookup":
+                raise OSError("injected manifest lookup failure")
+            return failure == "mixed_formats"
+        return exists(path)
+
+    if failure == "rank_state":
+        target.states[0].rank_state["extra_state"] = b""
+    coordinator = ThreadCoordinator(2, timeout=2)
+    monkeypatch.setattr(Path, "exists", rank_local_exists)
+
+    def load_rank(rank):
+        rank_context.rank = rank
+        return load(tmp_path, target.states[rank], RankContext(rank, 2, coordinator))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(load_rank, range(2)))
+    assert all(type(result) is Err for result in results), results
+    expected = {
+        "rank_state": "native DCP has no GDCP per-rank extra_state",
+        "lookup": "injected manifest lookup failure",
+        "mixed_formats": "disagree on DCP load format",
+    }
+    assert expected[failure] in results[0].value.msg
+
+
+def test_dcp_save_close_failure_votes_on_every_rank(tmp_path, monkeypatch):
+    from gdcp.adapters.dcp import save
+
+    root = tmp_path / "checkpoint"
+    fixture = numpy_checkpoint(2, initialized=True)
+    coordinator = ThreadCoordinator(2, timeout=2)
+    close = FileIO.close_rank
+
+    def close_rank(io, rank, prefix=None):
+        close(io, rank, prefix)
+        if rank == 0:
+            raise OSError("injected DCP close failure")
+
+    monkeypatch.setattr(FileIO, "close_rank", close_rank)
+
+    def save_rank(rank):
+        return save(root, fixture.states[rank], RankContext(rank, 2, coordinator))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(save_rank, range(2)))
+    assert all(type(result) is Err for result in results), results
+    assert "injected DCP close failure" in results[0].value.msg
+    assert not root.exists()
 
 
 def test_noncanonical_native_chunk_geometry_is_rejected(tmp_path):

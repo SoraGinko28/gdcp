@@ -1,5 +1,6 @@
 """Collective, framework-neutral checkpoint save, load, and inspection."""
 
+import json
 import logging
 from contextlib import ExitStack
 from dataclasses import replace
@@ -69,6 +70,16 @@ def _collective(ctx, operation, action: Callable[[], Any]) -> Result[Any]:
     return result
 
 
+def _collective_choice(ctx, operation, action, choices):
+    selected = _collective(ctx, operation, action)
+    if type(selected) is Err or ctx.coordinator is None:
+        return selected
+    for choice in choices:
+        if ctx.coordinator.vote(selected.value == choice):
+            return selected
+    return _error(operation, ValueError(f"ranks disagree on {operation}"))
+
+
 def _validate_context(ctx):
     if ctx.world_size < 1 or not 0 <= ctx.rank < ctx.world_size:
         raise ValueError("invalid rank or world_size")
@@ -87,6 +98,43 @@ def _validate_state(state):
             raise TypeError(f"rank_state {name} must contain bytes")
 
 
+def _broadcast_names(ctx, source, names):
+    coordinator = ctx.coordinator
+    assert coordinator is not None
+    data = json.dumps(sorted(names)).encode() if ctx.rank == source else b""
+    received = bytearray()
+    # The coordinator's boolean AND can broadcast one bit at a time from source.
+    while coordinator.vote(ctx.rank != source or len(received) < len(data)):
+        byte = data[len(received)] if ctx.rank == source else 0
+        received.append(
+            sum(
+                1 << bit
+                for bit in range(8)
+                if not coordinator.vote(not (byte >> bit & 1))
+            )
+        )
+    return set(json.loads(received))
+
+
+def _agree_rank_state(state, ctx):
+    coordinator = ctx.coordinator
+    if ctx.world_size == 1 or coordinator is None:
+        return
+    names = set(state.rank_state)
+    if coordinator.vote(not names):
+        return
+    reference = _broadcast_names(ctx, 0, names)
+    difference = names ^ reference
+    if coordinator.vote(not difference):
+        return
+    for source in range(1, ctx.world_size):
+        if not coordinator.vote(ctx.rank != source or not difference):
+            (key,) = _broadcast_names(ctx, source, [min(difference, default="")])
+            raise ValueError(
+                f"rank_state keys disagree for {key!r} (ranks 0 and {source})"
+            )
+
+
 def _compute_view(component):
     return ComputeDTensorsView(
         [named.global_tensor_id for named in component.table.named_d_tensors],
@@ -96,8 +144,6 @@ def _compute_view(component):
 
 
 def _prepare_save(path, state, ctx, policy, backend):
-    _validate_context(ctx)
-    _validate_state(state)
     prepared = []
     for component in state.components:
         compute = _compute_view(component)
@@ -168,6 +214,16 @@ def _save_rank_state(path, state, ctx):
         desc.atomic_write(_rank_state_path(path, name, ctx.rank), data)
 
 
+def _rank_state_inventory(state, ctx):
+    return {
+        name: {
+            "ranks": list(range(ctx.world_size)),
+            "pattern": name.replace("{", "{{").replace("}", "}}") + "_rank_{rank}.pt",
+        }
+        for name in state.rank_state
+    }
+
+
 def _publish(path, state, prepared, ctx):
     if ctx.rank != 0:
         return
@@ -187,13 +243,7 @@ def _publish(path, state, prepared, ctx):
         "world_size": ctx.world_size,
         "global_steps": state.global_steps,
         "components": components,
-        "rank_state": {
-            name: {
-                "ranks": list(range(ctx.world_size)),
-                "pattern": f"{name}_rank_{{rank}}.pt",
-            }
-            for name in state.rank_state
-        },
+        "rank_state": _rank_state_inventory(state, ctx),
     }
     desc.write_manifest(path, manifest)
     (Path(path) / desc.PENDING_NAME).unlink()
@@ -262,7 +312,20 @@ def _save_staged(transaction, state, ctx, policy, backend):
     )
 
 
-def _transactional_save(path, ctx, action):
+def _validate_save(state, ctx):
+    _validate_context(ctx)
+    _validate_state(state)
+
+
+def _transactional_save(path, state, ctx, action):
+    validated = _collective(ctx, "validate save", lambda: _validate_save(state, ctx))
+    if type(validated) is Err:
+        return validated
+    agreed = _collective(
+        ctx, "agree on rank state", lambda: _agree_rank_state(state, ctx)
+    )
+    if type(agreed) is Err:
+        return agreed
     created = _collective(
         ctx, "prepare transaction", lambda: DirectoryTransaction(path, ctx.rank)
     )
@@ -300,6 +363,7 @@ def save(path, state, ctx, *, policy=None, backend=None) -> Result[None]:
     backend = backend or SafeTensorsBackend()
     return _transactional_save(
         path,
+        state,
         ctx,
         lambda transaction: _save_staged(transaction, state, ctx, policy, backend),
     )
@@ -381,7 +445,9 @@ def _prepare_load(path, state, ctx, backend, strict):
             path, component, description, ctx, backend, strict
         )
         prepared.append(item)
-    rank_state = _load_rank_state(path, state, description, ctx)
+    rank_state = _load_rank_state(
+        path, state, description.rank_state, ctx, saved_world=description.world_size
+    )
     return prepared, rank_state
 
 
@@ -404,32 +470,40 @@ def _prepare_load_component(path, component, description, ctx, backend, strict):
     return component, compute, storage, objects
 
 
-def _load_rank_state(path, state, description, ctx):
+def _load_rank_state(path, state, inventory, ctx, *, saved_world=None):
+    files = {
+        name: _declared_rank_files(path, name, info) for name, info in inventory.items()
+    }
     loaded = {}
     for name in state.rank_state:
-        if name not in description.rank_state:
+        if name not in files:
             raise ValueError(f"missing rank state {name}")
-        info = description.rank_state[name]
-        loaded[name] = _load_rank_blob(path, name, info, ctx.rank)
+        ranks = files[name]
+        world = saved_world if saved_world is not None else max(ranks, default=-1) + 1
+        loaded[name] = _load_rank_blob(name, ranks, ctx.rank, world)
     return loaded
 
 
-def _read_rank_blob(path, name, info, rank):
-    filename = info["pattern"].format(rank=rank)
-    desc._safe_relative(filename)
-    return (Path(path) / name / filename).read_bytes()
+def _declared_rank_files(path, name, info):
+    desc._safe_relative(name)
+    files = {}
+    for rank in info["ranks"]:
+        filename = info["pattern"].format(rank=rank)
+        desc._safe_relative(filename)
+        file = Path(path) / name / filename
+        if not file.is_file():
+            raise FileNotFoundError(f"missing declared rank state file {file}")
+        files[rank] = file
+    return files
 
 
-def _load_rank_blob(path, name, info, rank):
-    if rank == 0:
-        return _read_rank_blob(path, name, info, 0)
-    if rank in info["ranks"]:
-        try:
-            return _read_rank_blob(path, name, info, rank)
-        except FileNotFoundError:
-            pass
+def _load_rank_blob(name, files, rank, saved_world):
+    if rank in files:
+        return files[rank].read_bytes()
+    if rank < saved_world or 0 not in files:
+        raise ValueError(f"rank state {name} has no declaration for rank {rank}")
     _LOG.warning("%s rank %d is absent; loading rank 0's state", name, rank)
-    return _read_rank_blob(path, name, info, 0)
+    return files[0].read_bytes()
 
 
 def _load_one(ctx, compute, storage):
@@ -459,7 +533,7 @@ def _prepare_load_view(ctx, compute, storage, stack):
 
     def close_unused():
         if unused is not None:
-            unused.finish()
+            _require(unused.finish())
 
     def begin_load(view, rank):
         nonlocal unused
@@ -473,13 +547,17 @@ def _prepare_load_view(ctx, compute, storage, stack):
 
 
 def _load_payloads(views, ctx, validate):
-    with ExitStack() as stack:
+    stack = ExitStack()
+    try:
         checked = _collective(
             ctx, "validate load", lambda: _validate_load(views, ctx, validate, stack)
         )
-        if type(checked) is Err:
-            return checked
-        return _copy_load_payloads(checked.value, ctx)
+        result = (
+            checked if type(checked) is Err else _copy_load_payloads(checked.value, ctx)
+        )
+    finally:
+        closed = _collective(ctx, "close load", stack.close)
+    return closed if type(result) is Ok else result
 
 
 def _validate_load(views, ctx, validate, stack):
@@ -517,10 +595,13 @@ def _load_components(prepared, ctx, rank_state, preflight):
     result = _load_payloads(views, ctx, validate)
     if type(result) is Err:
         return result
+    return _collective(ctx, "restore objects", lambda: _restore_objects(prepared))
+
+
+def _restore_objects(prepared):
     for component, _, _, objects in prepared:
         component.objects.clear()
         component.objects.update(objects)
-    return Ok(None)
 
 
 def load(
@@ -538,5 +619,6 @@ def load(
     result = _load_components(components, ctx, rank_state, _preflight)
     if type(result) is Err:
         return result
-    state.rank_state.update(rank_state)
-    return _collective(ctx, "load complete", lambda: None)
+    return _collective(
+        ctx, "load complete", lambda: state.rank_state.update(rank_state)
+    )

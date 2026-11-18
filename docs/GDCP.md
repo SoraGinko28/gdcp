@@ -162,8 +162,13 @@ depend on rerunning the current storage policy.
 Optimizer non-tensor values live in `optimizer/objects.json`. JSON container
 tags preserve tuple/list distinctions. Extra state is stored with `torch.save`
 in `extra_state/extra_state_rank_{rank}.pt` and loaded with pickle enabled;
-only load trusted checkpoints. If a rank's file is absent, GDCP warns and
-loads rank 0's file. Values inside that fallback object are not resharded.
+only load trusted checkpoints. All ranks must supply the same set of rank-state
+keys when saving. If the keys differ, every rank reports the same error naming a
+differing key before GDCP creates a staging directory or writes checkpoint files.
+The manifest lists the files saved for each key. A missing declared file fails
+the load on every rank. When loading with a larger world size, only ranks outside
+the saved world warn and load rank 0's file. Values inside that fallback object
+are not resharded.
 
 Before writing into the target model, optimizer, or caller's checkpoint dict,
 all ranks must pass validation of the requested tensor keys, shapes, dtypes,

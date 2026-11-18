@@ -71,7 +71,7 @@ def _collective[T](ctx, action: Callable[[], T]) -> T:
     value, error = None, None
     try:
         value = action()
-    except Exception as exc:
+    except BaseException as exc:
         error = exc
     ok = error is None
     if ctx.coordinator is not None:
@@ -487,6 +487,17 @@ def save_checkpoint(
     _finish(state)
 
 
+def _load_format(path):
+    root = Path(path)
+    if (root / "model.safetensors").exists() or (
+        root / "model.safetensors.index.json"
+    ).exists():
+        return "hf"
+    if (root / "model" / ".metadata").exists():
+        return "dcp"
+    return "safetensors"
+
+
 def load_checkpoint(path, checkpoint_state, common_only=False):
     ctx = _context()
     adapter = FSDP2Adapter(loading=True, common_only=common_only)
@@ -495,21 +506,26 @@ def load_checkpoint(path, checkpoint_state, common_only=False):
     def preflight(objects, blobs):
         adapter.prepare_restore(checkpoint_state, objects, blobs)
 
-    root = Path(path)
-    if (root / "model.safetensors").exists() or (
-        root / "model.safetensors.index.json"
-    ).exists():
+    fmt = _unwrap(
+        core._collective_choice(
+            ctx,
+            "checkpoint load format",
+            lambda: _load_format(path),
+            ("safetensors", "dcp", "hf"),
+        )
+    )
+    if fmt == "hf":
         from .. import hf
 
-        result = hf.load_state(root, state, ctx, _preflight=preflight)
-    elif (root / "model" / ".metadata").exists():
+        result = hf.load_state(path, state, ctx, _preflight=preflight)
+    elif fmt == "dcp":
         from . import dcp
 
-        result = dcp.load(root, state, ctx, _preflight=preflight)
+        result = dcp.load(path, state, ctx, _preflight=preflight)
     else:
-        result = core.load(root, state, ctx, _preflight=preflight)
+        result = core.load(path, state, ctx, _preflight=preflight)
     if type(result) is Err and isinstance(result.value, core._LoadValidationError):
         raise result.value.cause
     _unwrap(result)
-    _finish(state)
+    _collective(ctx, lambda: _finish(state))
     _collective(ctx, lambda: adapter.restore(checkpoint_state, state))

@@ -185,19 +185,26 @@ def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
     )
 
 
+def _infer_dtype(path):
+    floating = {
+        entry["dtype"]
+        for entry in read_headers(path).values()
+        if entry["dtype"] in ("F32", "BF16")
+    }
+    if len(floating) != 1:
+        raise ValueError("cannot infer HF dtype; pass dtype='fp32' or 'bf16'")
+    return "fp32" if floating == {"F32"} else "bf16"
+
+
 def load_hf(path, model_or_state, dtype=None):
     ctx = _context()
-    if dtype is None:
-        headers = _collective(ctx, lambda: read_headers(path))
-        floating = {
-            entry["dtype"]
-            for entry in headers.values()
-            if entry["dtype"] in ("F32", "BF16")
-        }
-        if len(floating) != 1:
-            raise ValueError("cannot infer HF dtype; pass dtype='fp32' or 'bf16'")
-        dtype = "fp32" if floating == {"F32"} else "bf16"
     _model, state = _collective(
-        ctx, lambda: _weights(model_or_state, dtype, ctx, loading=True)
+        ctx,
+        lambda: _weights(
+            model_or_state,
+            _infer_dtype(path) if dtype is None else dtype,
+            ctx,
+            loading=True,
+        ),
     )
     _unwrap(load_state(path, state, ctx))

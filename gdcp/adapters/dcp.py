@@ -367,9 +367,9 @@ class _SaveSession(_Session, StorageSaveSession):
 
     @catch
     def commit(self):
-        self.io.close_rank(self.rank, self.root)
-        if not self._vote(True):
-            raise ValueError("another rank aborted DCP payload writes")
+        error = self._close_checked()
+        if not self._vote(error is None):
+            _commit_failure(error, "DCP payload writes aborted")
         error = self._publish_checked()
         if not self._vote(error is None):
             self.state = "unknown"
@@ -379,6 +379,13 @@ class _SaveSession(_Session, StorageSaveSession):
             self.state = "unknown"
             _commit_failure(error, "DCP metadata publication failed")
         self.state = "committed"
+
+    def _close_checked(self):
+        try:
+            self.io.close_rank(self.rank, self.root)
+        except BaseException as exc:
+            return exc
+        return None
 
     def _publish_checked(self):
         try:
@@ -401,8 +408,8 @@ class _SaveSession(_Session, StorageSaveSession):
 
     @catch
     def abort(self):
-        self.io.close_rank(self.rank, self.root)
         self._vote(False)
+        self.io.close_rank(self.rank, self.root)
         for path in self.my_files():
             self.io.discard(self.abspath(path))
         self.state = "aborted"
@@ -710,7 +717,10 @@ def _prepare_native(path, state, ctx):
     core._validate_context(ctx)
     core._validate_state(state)
     if state.rank_state:
-        raise ValueError("native DCP has no GDCP per-rank extra_state")
+        key = min(state.rank_state)
+        raise ValueError(
+            f"native DCP has no GDCP per-rank extra_state (requested {key!r})"
+        )
     prepared = []
     for component in state.components:
         root = Path(path) / component.name
@@ -729,13 +739,18 @@ def _prepare_native(path, state, ctx):
     return prepared
 
 
+def _has_manifest(path):
+    core._require_not_pending(path)
+    return (Path(path) / desc.MANIFEST_NAME).exists()
+
+
 def load(path, state, ctx, *, _preflight=None):
-    pending = core._collective(
-        ctx, "prepare DCP load", lambda: core._require_not_pending(path)
+    manifest = core._collective_choice(
+        ctx, "DCP load format", lambda: _has_manifest(path), (True, False)
     )
-    if type(pending) is Err:
-        return pending
-    if (Path(path) / desc.MANIFEST_NAME).exists():
+    if type(manifest) is Err:
+        return manifest
+    if manifest.value:
         return core.load(path, state, ctx, backend=DcpBackend(), _preflight=_preflight)
     prepared = core._collective(
         ctx, "prepare native DCP load", lambda: _prepare_native(path, state, ctx)

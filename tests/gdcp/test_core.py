@@ -195,9 +195,7 @@ def test_opaque_rank_state_files_and_rank_zero_fallback(tmp_path, caplog):
 
 
 @pytest.mark.parametrize("missing_rank", [0, 1])
-def test_missing_rank_state_file_falls_back_or_fails_collectively(
-    tmp_path, caplog, missing_rank
-):
+def test_missing_declared_rank_state_file_fails_collectively(tmp_path, missing_rank):
     source = numpy_checkpoint(2, initialized=True)
     for rank, state in enumerate(source.states):
         state.rank_state["extra_state"] = f"rank-{rank}".encode()
@@ -208,14 +206,9 @@ def test_missing_rank_state_file_falls_back_or_fails_collectively(
         state.rank_state["extra_state"] = b""
     before = _buffers(target)
     results = collective(core.load, tmp_path, target)
-    if missing_rank == 1:
-        assert_ok(results)
-        assert all(
-            state.rank_state["extra_state"] == b"rank-0" for state in target.states
-        )
-        assert "rank 1" in caplog.text and "rank 0" in caplog.text
-        return
     assert all(type(result) is gb.Err for result in results), results
+    assert all(f"extra_state_rank_{missing_rank}.pt" in r.value.msg for r in results)
+    assert all(state.rank_state == {"extra_state": b""} for state in target.states)
     after = _buffers(target)
     for key in before:
         np.testing.assert_array_equal(after[key], before[key])
