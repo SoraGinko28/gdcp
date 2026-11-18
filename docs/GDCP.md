@@ -194,6 +194,14 @@ unchanged. Missing and unexpected keys in requested components are errors.
 Unrequested components in a full checkpoint are allowed. Optimizer restoration
 precedes model restoration.
 
+Optimizer groups are matched by their model parameter names. The target may
+reorder groups or parameters within a group. Load restores the saved group
+options and order, and fills each group's `param_names` with the corresponding
+fully qualified model names in `params` order. This also applies to unnamed
+optimizers, and a subsequent save records the restored names. AdamW moments
+and steps follow their parameters. Incompatible or ambiguous group membership
+fails on all ranks before tensor or extra-state payload reads.
+
 Tensor payloads are streamed into the target. An I/O error during those reads
 can leave tensors partially updated, and copied bytes are retained if a
 framework load hook fails during installation.

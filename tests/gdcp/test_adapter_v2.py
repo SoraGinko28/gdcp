@@ -491,7 +491,7 @@ def test_optimizer_restore_preserves_fp32_master_and_extra_fields():
     adapter.optimizer_state = values
     _tensors, objects, adapter.optimizer_paths = fsdp2._optimizer_values(values)
     target = {"model": model, "optimizer": optimizer}
-    adapter.prepare_restore(target, {"optimizer": objects}, {})
+    adapter.prepare_restore(target, {"optimizer": objects})
     adapter.restore(target, CheckpointState())
     restored = optimizer.state[model.weight]
     assert restored["master_param"] is fields["master_param"]
@@ -612,6 +612,124 @@ def test_optimizer_group_validation_preserves_live_state(mesh, tmp_path, fmt, fr
     _load_rejected(tmp_path, state, "optimizer parameter group count")
     assert _values(target, optimizer) == before
     assert optimizer.param_groups[0]["lr"] == 0.25
+    assert state["extra_state"] is extra_state
+
+
+def _grouped_model(mesh, value):
+    return fully_shard(
+        torch.nn.ParameterDict(
+            {name: torch.nn.Parameter(torch.full((4,), value)) for name in "abcd"}
+        ),
+        mesh=mesh,
+    )
+
+
+def _grouped_optimizer(model, orders, *, named=False, initialized=True):
+    parameters = dict(model.named_parameters())
+    groups = [
+        {
+            "params": [
+                (name, parameters[name]) if named else parameters[name]
+                for name in order
+            ],
+            "lr": (index + 1) / 100,
+        }
+        for index, order in enumerate(orders)
+    ]
+    optimizer = torch.optim.AdamW(groups, foreach=False)
+    if initialized:
+        for index, parameter in enumerate(parameters.values(), start=1):
+            optimizer.state[parameter] = {
+                "step": torch.tensor(float(index)),
+                "exp_avg": torch.full_like(parameter, 2 * index),
+                "exp_avg_sq": torch.full_like(parameter, 3 * index),
+            }
+    return optimizer
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize(
+    "saved_named,target_named",
+    [(False, True), (True, False), (True, True), (False, False)],
+)
+@pytest.mark.parametrize("reorder_groups", [False, True])
+def test_optimizer_group_names_and_slots_follow_saved_parameters(
+    mesh, tmp_path, fmt, saved_named, target_named, reorder_groups
+):
+    source, target = _grouped_model(mesh, 1.0), _grouped_model(mesh, 9.0)
+    saved = _grouped_optimizer(source, ("ab", "cd"), named=saved_named)
+    target_orders = ("dc", "ba") if reorder_groups else ("ba", "dc")
+    optimizer = _grouped_optimizer(
+        target, target_orders, named=target_named, initialized=False
+    )
+    parameters = dict(target.named_parameters())
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source, "optimizer": saved}, checkpoint_format=fmt
+    )
+    FSDP2Checkpointer.load(tmp_path, {"model": target, "optimizer": optimizer})
+    for group, order, saved_group in zip(
+        optimizer.param_groups, ("ab", "cd"), saved.param_groups, strict=True
+    ):
+        assert group["param_names"] == list(order)
+        assert all(
+            param is parameters[name]
+            for name, param in zip(order, group["params"], strict=True)
+        )
+        assert group["lr"] == saved_group["lr"]
+    assert _values(target) == _values(source)
+    _assert_optimizer_slots(source, saved, parameters, optimizer)
+
+
+def _assert_optimizer_slots(source, saved, parameters, optimizer):
+    assert optimizer.state.keys() == set(parameters.values())
+    for name, param in source.named_parameters():
+        for field, value in saved.state[param].items():
+            actual = optimizer.state[parameters[name]][field]
+            torch.testing.assert_close(
+                actual.to_local() if isinstance(actual, DTensor) else actual,
+                value.to_local() if isinstance(value, DTensor) else value,
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize(
+    "saved_orders,target_orders,error",
+    [
+        (("ab", "cd"), ("ac", "bd"), "members do not match"),
+        (("abcd", "", ""), ("", "abcd", ""), "ambiguous"),
+    ],
+)
+def test_unreconcilable_optimizer_groups_fail_before_payload_reads(
+    mesh, tmp_path, monkeypatch, fmt, saved_orders, target_orders, error
+):
+    source, target = _grouped_model(mesh, 1.0), _grouped_model(mesh, 9.0)
+    saved = _grouped_optimizer(source, saved_orders)
+    optimizer = _grouped_optimizer(target, target_orders)
+    extra_state = {"step": -1}
+    state = {"model": target, "optimizer": optimizer, "extra_state": extra_state}
+    FSDP2Checkpointer.save(
+        tmp_path,
+        {"model": source, "optimizer": saved, "extra_state": {"step": 1}},
+        checkpoint_format=fmt,
+    )
+    before = _values(target, optimizer)
+    groups_before = optimizer.param_groups
+    read_bytes = Path.read_bytes
+
+    def read_metadata_only(path):
+        assert path.suffix != ".pt", f"read rank-state payload {path.name}"
+        return read_bytes(path)
+
+    def unexpected_read(*args):
+        pytest.fail("read tensor payload before validating optimizer groups")
+
+    monkeypatch.setattr(Path, "read_bytes", read_metadata_only)
+    monkeypatch.setattr(FileIO, "pread", unexpected_read)
+    _load_rejected(tmp_path, state, f"optimizer parameter group.*{error}")
+    assert _values(target, optimizer) == before
+    assert optimizer.param_groups is groups_before
     assert state["extra_state"] is extra_state
 
 

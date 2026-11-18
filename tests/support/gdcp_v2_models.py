@@ -73,7 +73,7 @@ class MasterAdamW(torch.optim.AdamW):
 
     def __init__(self, model, rank, world, *, poison=False):
         super().__init__(
-            model.parameters(),
+            model.named_parameters(),
             lr=0.03125,
             betas=(0.5, 0.75),
             eps=0.125,

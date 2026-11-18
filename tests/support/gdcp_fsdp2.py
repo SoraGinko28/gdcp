@@ -26,7 +26,7 @@ class AcceptanceModel(torch.nn.Module):
 
 def optimizer_for(model, *, target=False):
     return torch.optim.AdamW(
-        model.parameters(),
+        model.named_parameters(),
         lr=0.25 if target else 0.03125,
         betas=(0.5, 0.75),
         eps=0.125,

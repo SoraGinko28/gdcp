@@ -636,8 +636,7 @@ def _load_prepare(path, state, ctx):
         and "optimizer" not in objects
     ):
         raise ValueError("HF full-state checkpoint is missing optimizer.json")
-    blobs = _load_rank_state(path, state, ctx)
-    return combined, compute, storage, objects, blobs, headers, duplicates
+    return combined, compute, storage, objects, headers, duplicates
 
 
 def _load_rank_state(path, state, ctx):
@@ -664,23 +663,28 @@ def load_state(path, state, ctx, *, _preflight=None):
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    combined, compute, storage, objects, blobs, headers, duplicates = prepared.value
+    combined, compute, storage, objects, headers, duplicates = prepared.value
 
-    def validate():
+    def validate_objects():
         for component in state.components:
             if not isinstance(objects.get(component.name, {}), dict):
                 raise ValueError(
                     f"HF objects for {component.name} must contain a mapping"
                 )
         if _preflight is not None:
-            _preflight(objects, blobs)
-        _validate_alias_payloads(path, headers, duplicates)
+            return _preflight(objects)
 
-    result = core._load_payloads([(combined.name, compute, storage)], ctx, validate)
+    result = core._load_payloads(
+        [(combined.name, compute, storage)],
+        ctx,
+        lambda: _load_rank_state(path, state, ctx),
+        preflight=validate_objects,
+        validate=lambda: _validate_alias_payloads(path, headers, duplicates),
+    )
     if type(result) is Err:
         return result
     return core._collective(
-        ctx, "HF load complete", lambda: _restore_state(state, objects, blobs)
+        ctx, "HF load complete", lambda: _restore_state(state, objects, result.value)
     )
 
 

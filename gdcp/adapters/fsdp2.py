@@ -1,7 +1,7 @@
 """Real FSDP2 state dictionaries and per-rank torch serialization."""
 
 import io
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -281,17 +281,14 @@ def _prepare_optimizer_state(model, optimizer, state, objects, paths):
             raise ValueError(f"optimizer: unsupported non-tensor object {key}")
 
     parameters = dict(model.named_parameters())
-    saved_groups = objects["param_groups"]
-    current_groups = state["param_groups"]
-    if not isinstance(saved_groups, list):
-        raise ValueError("optimizer param_groups must be a list")
-    if len(saved_groups) != len(current_groups):
-        raise ValueError("optimizer parameter group count does not match")
-    groups = [
-        _optimizer_group(saved, current, parameters)
-        for saved, current in zip(saved_groups, current_groups, strict=True)
-    ]
+    groups = _optimizer_groups(
+        objects["param_groups"], state["param_groups"], parameters
+    )
     _restore_objects(state, paths, objects)
+    return _optimizer_installation(optimizer, state, groups, parameters)
+
+
+def _optimizer_installation(optimizer, state, groups, parameters):
     if type(optimizer).__setstate__ is torch.optim.AdamW.__setstate__:
         for fqn, fields in state["state"].items():
             _validate_adamw_step(fqn, fields)
@@ -302,29 +299,61 @@ def _prepare_optimizer_state(model, optimizer, state, objects, paths):
     return {"state": slots, "param_groups": groups}
 
 
-def _optimizer_group(saved, current, parameters):
-    if not isinstance(saved, dict) or not isinstance(saved.get("params"), list):
+def _optimizer_group_key(group):
+    if not isinstance(group, dict) or not isinstance(group.get("params"), list):
         raise ValueError("optimizer parameter group must contain a params list")
-    if len(saved["params"]) != len(current["params"]):
-        raise ValueError("optimizer parameter group size does not match")
-    if any(not isinstance(name, str) for name in saved["params"]) or Counter(
-        saved["params"]
-    ) != Counter(current["params"]):
+    names = group["params"]
+    if any(not isinstance(name, str) for name in names):
+        raise ValueError("optimizer parameter group must contain parameter names")
+    return tuple(sorted(names))
+
+
+def _optimizer_groups(saved, current, parameters):
+    if not isinstance(saved, list):
+        raise ValueError("optimizer param_groups must be a list")
+    if len(saved) != len(current):
+        raise ValueError("optimizer parameter group count does not match")
+    saved_keys = {_optimizer_group_key(group) for group in saved}
+    current_keys = {_optimizer_group_key(group) for group in current}
+    if len(saved_keys) != len(saved) or len(current_keys) != len(current):
+        raise ValueError(
+            "optimizer parameter group matching is ambiguous: duplicate membership"
+        )
+    if saved_keys != current_keys:
         raise ValueError("optimizer parameter group members do not match")
-    group = dict(saved, params=[parameters[name] for name in saved["params"]])
-    if "param_names" in current and "param_names" not in group:
-        group["param_names"] = current["param_names"]
-    return group
+    return [
+        dict(
+            group,
+            params=[parameters[name] for name in group["params"]],
+            param_names=list(group["params"]),
+        )
+        for group in saved
+    ]
+
+
+def _named_optimizer_groups(optimizer, names):
+    return [
+        dict(group, params=[names[parameter] for parameter in group["params"]])
+        for group in optimizer.param_groups
+    ]
+
+
+def _install_optimizer_state(model, optimizer, state):
+    """Install a state dictionary read by PyTorch's native DCP loader."""
+    parameters = dict(model.named_parameters())
+    names = {parameter: name for name, parameter in parameters.items()}
+    current = _named_optimizer_groups(optimizer, names)
+    groups = _optimizer_groups(state["param_groups"], current, parameters)
+    optimizer.__setstate__(
+        _optimizer_installation(optimizer, state, groups, parameters)
+    )
 
 
 def _fresh_optimizer_state(model, optimizer):
     # PyTorch's state-dict helper calls optimizer.step() on an empty optimizer.
     # Use private destination buffers for AdamW's lazy slots during load.
     names = {parameter: name for name, parameter in model.named_parameters()}
-    groups = [
-        dict(group, params=[names[parameter] for parameter in group["params"]])
-        for group in optimizer.param_groups
-    ]
+    groups = _named_optimizer_groups(optimizer, names)
     state = {}
     if not any(
         parameter.grad is not None
@@ -412,7 +441,7 @@ class FSDP2Adapter:
         torch.save(checkpoint_state["extra_state"], buffer)
         return buffer.getvalue()
 
-    def prepare_restore(self, checkpoint_state, objects, blobs):
+    def prepare_restore(self, checkpoint_state, objects):
         if self.model_state is not None:
             self._prepare_model(objects.get("model", {}))
         if self.optimizer_state is not None:
@@ -423,6 +452,8 @@ class FSDP2Adapter:
                 objects.get("optimizer", {}),
                 self.optimizer_paths,
             )
+
+    def prepare_rank_state(self, blobs):
         if "extra_state" in blobs:
             self.loaded_extra = torch.load(
                 io.BytesIO(blobs["extra_state"]),
@@ -521,8 +552,9 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
 
     state = _collective(ctx, prepare)
 
-    def preflight(objects, blobs):
-        adapter.prepare_restore(checkpoint_state, objects, blobs)
+    def preflight(objects):
+        adapter.prepare_restore(checkpoint_state, objects)
+        return adapter.prepare_rank_state
 
     fmt = _unwrap(
         core._collective_choice(

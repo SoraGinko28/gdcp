@@ -29,6 +29,13 @@ Per-rank safetensors, DCP, and HF all preserve `uint16`, `uint32`, and `uint64` 
 
 Apply FSDP2 `fully_shard` to every decoder layer and then the root. Tied embedding keys are represented by a canonical parameter and aliases: payload and optimizer state are stored once. The adapter restores the complete state dictionary while preserving parameter identity. AdamW subclasses may keep any number of per-parameter tensor fields matching parameter geometry, plus replicated scalar fields. Optimizer fields must already exist in the target, including custom fields. The mixed-precision validation fixture uses a real AdamW implementation that updates fp32 masters and casts them to bf16 parameters.
 
+In all three full-state formats, AdamW group membership is matched by fully
+qualified model parameter name. Group and parameter order in the target may
+differ from the checkpoint. Load restores the saved order and group options,
+populates `param_names` to match `params` in every group, and restores moments
+and steps to their corresponding parameters. Incompatible or ambiguous groups
+fail before tensor or rank-state payload reads.
+
 CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:nccl,cpu:gloo"`, so FSDP2 can use NCCL while votes and CPU state use Gloo. The GPU accessor stages one local tensor at a time, copies each save tensor to the host once, and writes back a load tensor once after all its ranges.
 
 HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys, and a typed JSON `optimizer.json` sidecar preserving param groups and aliases. Native HF loading builds storage from headers and an optional standard index. The header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and packed floats. If a requested tensor uses a dtype that the load path cannot represent, the error names the dtype and key.

@@ -946,4 +946,4 @@ def load(path, state, ctx, *, _preflight=None):
     )
     if type(prepared) is Err:
         return prepared
-    return core._load_components(prepared.value, ctx, {}, _preflight)
+    return core._load_components(prepared.value, ctx, state, dict, _preflight)

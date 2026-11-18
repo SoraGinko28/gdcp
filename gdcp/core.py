@@ -10,6 +10,7 @@ from typing import Any, Callable
 from gdtensor import Result
 from gdtensor.builder import (
     ComputeDTensorsView,
+    DTensorTable,
     Err,
     GDTensorIOError,
     Ok,
@@ -180,10 +181,14 @@ def _agree_components(state, ctx):
     return _collective(ctx, operation, compare)
 
 
-def _compute_view(component):
+def _compute_view(component, tensor_ids=None):
+    table = component.table
+    if tensor_ids is not None:
+        entries = {named.global_tensor_id: named for named in table.named_d_tensors}
+        table = DTensorTable([entries[key] for key in tensor_ids])
     return ComputeDTensorsView(
-        [named.global_tensor_id for named in component.table.named_d_tensors],
-        component.table,
+        [named.global_tensor_id for named in table.named_d_tensors],
+        table,
         component.accessor,
     )
 
@@ -534,10 +539,7 @@ def _prepare_load(path, state, ctx, backend, strict):
             path, component, description, ctx, backend, strict
         )
         prepared.append(item)
-    rank_state = _load_rank_state(
-        path, state, description.rank_state, ctx, saved_world=description.world_size
-    )
-    return prepared, rank_state
+    return prepared, description
 
 
 def _prepare_load_component(path, component, description, ctx, backend, strict):
@@ -556,6 +558,9 @@ def _prepare_load_component(path, component, description, ctx, backend, strict):
             raise ValueError(f"{component.name}: file size mismatch for {name}")
     storage = backend.open(root, table, layout, ctx.coordinator)
     _require(storage.check_constraints())
+    # The copy planner requires matching row order in both tables.
+    if compute.tensor_ids != storage.tensor_ids:
+        compute = _compute_view(component, storage.tensor_ids)
     return component, compute, storage, objects
 
 
@@ -635,25 +640,51 @@ def _prepare_load_view(ctx, compute, storage, stack):
     return replace(storage, begin_load=begin_load)
 
 
-def _load_payloads(views, ctx, validate):
+def _load_payloads(views, ctx, load_rank_state, *, preflight=None, validate=None):
+    prepare_rank_state = None
+    if preflight is not None:
+        checked = _collective(
+            ctx, "validate load objects", lambda: _validate_load_call(preflight)
+        )
+        if type(checked) is Err:
+            return checked
+        prepare_rank_state = checked.value
+    rank_state = _collective(ctx, "load rank state", load_rank_state)
+    if type(rank_state) is Err:
+        return rank_state
+
+    def validate_payloads():
+        if prepare_rank_state is not None:
+            prepare_rank_state(rank_state.value)
+        if validate is not None:
+            validate()
+
     stack = ExitStack()
     try:
         checked = _collective(
-            ctx, "validate load", lambda: _validate_load(views, ctx, validate, stack)
+            ctx,
+            "validate load",
+            lambda: _validate_load(views, ctx, validate_payloads, stack),
         )
         result = (
             checked if type(checked) is Err else _copy_load_payloads(checked.value, ctx)
         )
     finally:
         closed = _collective(ctx, "close load", stack.close)
-    return closed if type(result) is Ok else result
+    if type(result) is Err:
+        return result
+    return closed if type(closed) is Err else rank_state
+
+
+def _validate_load_call(validate):
+    try:
+        return validate()
+    except Exception as exc:
+        raise _Failure(_LoadValidationError(exc)) from exc
 
 
 def _validate_load(views, ctx, validate, stack):
-    try:
-        validate()
-    except Exception as exc:
-        raise _Failure(_LoadValidationError(exc)) from exc
+    _validate_load_call(validate)
     return [
         (name, compute, _prepare_load_view(ctx, compute, storage, stack))
         for name, compute, storage in views
@@ -670,21 +701,27 @@ def _copy_load_payloads(views, ctx):
     return Ok(None)
 
 
-def _load_components(prepared, ctx, rank_state, preflight):
+def _load_components(prepared, ctx, state, load_rank_state, preflight):
     views = [
         (component.name, compute, storage)
         for component, compute, storage, _ in prepared
     ]
-    objects_by_name = {component.name: objects for component, _, _, objects in prepared}
+    objects = {component.name: objects for component, _, _, objects in prepared}
 
-    def validate():
-        if preflight is not None:
-            preflight(objects_by_name, rank_state)
-
-    result = _load_payloads(views, ctx, validate)
+    result = _load_payloads(
+        views,
+        ctx,
+        load_rank_state,
+        preflight=(lambda: preflight(objects)) if preflight is not None else None,
+    )
     if type(result) is Err:
         return result
-    return _collective(ctx, "restore objects", lambda: _restore_objects(prepared))
+
+    def restore():
+        _restore_objects(prepared)
+        state.rank_state.update(result.value)
+
+    return _collective(ctx, "restore objects", restore)
 
 
 def _restore_objects(prepared):
@@ -707,10 +744,11 @@ def load(
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    components, rank_state = prepared.value
-    result = _load_components(components, ctx, rank_state, _preflight)
-    if type(result) is Err:
-        return result
-    return _collective(
-        ctx, "load complete", lambda: state.rank_state.update(rank_state)
-    )
+    components, description = prepared.value
+
+    def load_rank_state():
+        return _load_rank_state(
+            path, state, description.rank_state, ctx, saved_world=description.world_size
+        )
+
+    return _load_components(components, ctx, state, load_rank_state, _preflight)
