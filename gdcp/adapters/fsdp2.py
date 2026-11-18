@@ -1,7 +1,7 @@
 """Real FSDP2 state dictionaries and per-rank torch serialization."""
 
 import io
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -247,37 +247,109 @@ def _restore_objects(state, paths, objects):
             state["state"][fqn][field] = value
 
 
-def _install_optimizer_state(model, optimizer, state):
-    """Restore FSDP2's FQN state without casting or duplicating its tensors.
+def _validate_adamw_step(fqn, fields):
+    step = fields.get("step")
+    if not fields or isinstance(step, torch.Tensor):
+        return
+    try:
+        float(step)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"optimizer state for {fqn} has an invalid step") from exc
+
+
+def _prepare_optimizer_state(model, optimizer, state, objects, paths):
+    """Prepare FSDP2's FQN state without casting or duplicating its tensors.
 
     Unlike FSDP1, FSDP2 retains the original Parameter objects, so the FQN map
     directly identifies optimizer slots. The normal optimizer loader would
     allocate bf16 copies of every fp32 master and moment before installing
     them, both losing precision and exceeding large-checkpoint memory bounds.
     """
+    expected = {"param_groups"} | {
+        key
+        for key, (fqn, field) in paths.items()
+        if not isinstance(state["state"][fqn][field], torch.Tensor)
+    }
+    if objects.keys() != expected:
+        key = sorted(objects.keys() ^ expected)[0]
+        raise ValueError(f"optimizer: objects key mismatch for {key}")
+    for key in expected - {"param_groups"}:
+        if not isinstance(objects[key], (bool, int, float, str, type(None))):
+            raise ValueError(f"optimizer: unsupported non-tensor object {key}")
+
     parameters = dict(model.named_parameters())
-    saved_groups = state["param_groups"]
-    current_groups = optimizer.param_groups
+    saved_groups = objects["param_groups"]
+    current_groups = state["param_groups"]
+    if not isinstance(saved_groups, list):
+        raise ValueError("optimizer param_groups must be a list")
     if len(saved_groups) != len(current_groups):
         raise ValueError("optimizer parameter group count does not match")
     groups = [
         _optimizer_group(saved, current, parameters)
         for saved, current in zip(saved_groups, current_groups, strict=True)
     ]
+    _restore_objects(state, paths, objects)
+    if type(optimizer).__setstate__ is torch.optim.AdamW.__setstate__:
+        for fqn, fields in state["state"].items():
+            _validate_adamw_step(fqn, fields)
     slots = defaultdict(
         dict,
         {parameters[fqn]: dict(fields) for fqn, fields in state["state"].items()},
     )
-    optimizer.__setstate__({"state": slots, "param_groups": groups})
+    return {"state": slots, "param_groups": groups}
 
 
 def _optimizer_group(saved, current, parameters):
+    if not isinstance(saved, dict) or not isinstance(saved.get("params"), list):
+        raise ValueError("optimizer parameter group must contain a params list")
     if len(saved["params"]) != len(current["params"]):
         raise ValueError("optimizer parameter group size does not match")
+    if any(not isinstance(name, str) for name in saved["params"]) or Counter(
+        saved["params"]
+    ) != Counter(current["params"]):
+        raise ValueError("optimizer parameter group members do not match")
     group = dict(saved, params=[parameters[name] for name in saved["params"]])
     if "param_names" in current and "param_names" not in group:
         group["param_names"] = current["param_names"]
     return group
+
+
+def _fresh_optimizer_state(model, optimizer):
+    # PyTorch's state-dict helper calls optimizer.step() on an empty optimizer.
+    # Use private destination buffers for AdamW's lazy slots during load.
+    names = {parameter: name for name, parameter in model.named_parameters()}
+    groups = [
+        dict(group, params=[names[parameter] for parameter in group["params"]])
+        for group in optimizer.param_groups
+    ]
+    state = {}
+    if not any(
+        parameter.grad is not None
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ):
+        state = {
+            names[parameter]: _fresh_adamw_slots(parameter, group)
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.requires_grad
+        }
+    return {"state": state, "param_groups": groups}
+
+
+def _fresh_adamw_slots(parameter, group):
+    scalar_dtype = torch.get_default_dtype()
+    if group["fused"] or scalar_dtype != torch.float64:
+        scalar_dtype = torch.float32
+    device = parameter.device if group["capturable"] or group["fused"] else "cpu"
+    slots = {
+        "step": torch.empty((), dtype=scalar_dtype, device=device),
+        "exp_avg": torch.empty_like(parameter),
+        "exp_avg_sq": torch.empty_like(parameter),
+    }
+    if group["amsgrad"]:
+        slots["max_exp_avg_sq"] = torch.empty_like(parameter)
+    return slots
 
 
 class FSDP2Adapter:
@@ -287,6 +359,9 @@ class FSDP2Adapter:
         self.optimizer_state: dict | None = None
         self.optimizer_paths = {}
         self.model_aliases = {}
+        self.loaded_optimizer = None
+        self.loaded_model = None
+        self.loaded_extra = None
 
     def describe(self, checkpoint_state, ctx):
         _validate_state(
@@ -311,10 +386,19 @@ class FSDP2Adapter:
             state.components.sort(key=lambda component: component.name != "optimizer")
 
     def _optimizer(self, checkpoint_state, state, ctx):
-        self.optimizer_state = get_optimizer_state_dict(
-            checkpoint_state["model"], checkpoint_state["optimizer"]
+        model, optimizer = checkpoint_state["model"], checkpoint_state["optimizer"]
+        values = (
+            _fresh_optimizer_state(model, optimizer)
+            if self.loading and not optimizer.state
+            else get_optimizer_state_dict(model, optimizer)
         )
-        _validate_optimizer_tensors(checkpoint_state["model"], self.optimizer_state)
+        self.optimizer_state = values
+        if self.loading:
+            self.optimizer_state = {
+                "param_groups": values["param_groups"],
+                "state": {fqn: dict(fields) for fqn, fields in values["state"].items()},
+            }
+        _validate_optimizer_tensors(model, self.optimizer_state)
         tensors, objects, self.optimizer_paths = _optimizer_values(self.optimizer_state)
         state.components.append(_component("optimizer", tensors, objects, ctx))
 
@@ -325,36 +409,42 @@ class FSDP2Adapter:
         torch.save(checkpoint_state["extra_state"], buffer)
         return buffer.getvalue()
 
-    def restore(self, checkpoint_state, loaded):
-        by_name = {component.name: component for component in loaded.components}
-        if self.optimizer_state is not None:
-            self._restore_optimizer(checkpoint_state, by_name["optimizer"].objects)
+    def prepare_restore(self, checkpoint_state, objects, blobs):
         if self.model_state is not None:
-            self._restore_model(checkpoint_state, by_name["model"].objects)
-        if "extra_state" in loaded.rank_state:
-            checkpoint_state["extra_state"] = torch.load(
-                io.BytesIO(loaded.rank_state["extra_state"]),
+            self._prepare_model(objects.get("model", {}))
+        if self.optimizer_state is not None:
+            self.loaded_optimizer = _prepare_optimizer_state(
+                checkpoint_state["model"],
+                checkpoint_state["optimizer"],
+                self.optimizer_state,
+                objects.get("optimizer", {}),
+                self.optimizer_paths,
+            )
+        if "extra_state" in blobs:
+            self.loaded_extra = torch.load(
+                io.BytesIO(blobs["extra_state"]),
                 map_location="cpu",
                 weights_only=False,
             )
 
-    def _restore_model(self, checkpoint_state, objects):
+    def _prepare_model(self, objects):
         assert self.model_state is not None
         complete = dict(self.model_state)
+        if objects.keys() - {"aliases"}:
+            raise ValueError("model: unexpected checkpoint objects")
         aliases = objects.get("aliases", self.model_aliases)
         if aliases != self.model_aliases:
             raise ValueError("model tied parameter aliases do not match the checkpoint")
         complete.update({alias: complete[name] for alias, name in aliases.items()})
-        checkpoint_state["model"].load_state_dict(complete, strict=True)
+        self.loaded_model = complete
 
-    def _restore_optimizer(self, checkpoint_state, objects):
-        assert self.optimizer_state is not None
-        _restore_objects(self.optimizer_state, self.optimizer_paths, objects)
-        _install_optimizer_state(
-            checkpoint_state["model"],
-            checkpoint_state["optimizer"],
-            self.optimizer_state,
-        )
+    def restore(self, checkpoint_state, loaded):
+        if self.loaded_optimizer is not None:
+            checkpoint_state["optimizer"].__setstate__(self.loaded_optimizer)
+        if self.loaded_model is not None:
+            checkpoint_state["model"].load_state_dict(self.loaded_model, strict=True)
+        if "extra_state" in loaded.rank_state:
+            checkpoint_state["extra_state"] = self.loaded_extra
 
 
 def _finish(state):
@@ -401,19 +491,25 @@ def load_checkpoint(path, checkpoint_state, common_only=False):
     ctx = _context()
     adapter = FSDP2Adapter(loading=True, common_only=common_only)
     state = _collective(ctx, lambda: adapter.describe(checkpoint_state, ctx))
+
+    def preflight(objects, blobs):
+        adapter.prepare_restore(checkpoint_state, objects, blobs)
+
     root = Path(path)
     if (root / "model.safetensors").exists() or (
         root / "model.safetensors.index.json"
     ).exists():
         from .. import hf
 
-        result = hf.load_state(root, state, ctx)
+        result = hf.load_state(root, state, ctx, _preflight=preflight)
     elif (root / "model" / ".metadata").exists():
         from . import dcp
 
-        result = dcp.load(root, state, ctx)
+        result = dcp.load(root, state, ctx, _preflight=preflight)
     else:
-        result = core.load(root, state, ctx)
+        result = core.load(root, state, ctx, _preflight=preflight)
+    if type(result) is Err and isinstance(result.value, core._LoadValidationError):
+        raise result.value.cause
     _unwrap(result)
     _finish(state)
     _collective(ctx, lambda: adapter.restore(checkpoint_state, state))

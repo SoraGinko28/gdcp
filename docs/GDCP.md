@@ -165,10 +165,17 @@ in `extra_state/extra_state_rank_{rank}.pt` and loaded with pickle enabled;
 only load trusted checkpoints. If a rank's file is absent, GDCP warns and
 loads rank 0's file. Values inside that fallback object are not resharded.
 
-Load validates every requested component's tensor keys, logical and physical
-shapes, and dtypes before reading tensor payloads. Missing and unexpected
-keys are errors. Unrequested components in a full checkpoint are allowed.
-Optimizer restoration precedes model restoration.
+Before writing into the target model, optimizer, or caller's checkpoint dict,
+all ranks must pass validation of the requested tensor keys, shapes, dtypes,
+recorded tied-parameter aliases, optimizer objects and group membership, storage
+metadata, and requested rank state. A failed validation leaves those targets
+unchanged. Missing and unexpected keys in requested components are errors.
+Unrequested components in a full checkpoint are allowed. Optimizer restoration
+precedes model restoration.
+
+Tensor payloads are streamed into the target. An I/O error during those reads
+can leave tensors partially updated, and copied bytes are retained if a
+framework load hook fails during installation.
 
 The facade preserves the reference checkpointer's parameter names, order, and
 defaults. `io_metrics_on` and `barrier_rpc_tag_suffix` are ignored. Nondefault

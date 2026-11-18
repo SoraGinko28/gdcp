@@ -1,6 +1,8 @@
 """Collective, framework-neutral checkpoint save, load, and inspection."""
 
 import logging
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +28,12 @@ class _Failure(Exception):
     def __init__(self, error):
         self.error = error
         super().__init__(error.msg)
+
+
+class _LoadValidationError(GDTensorIOError):
+    def __init__(self, cause: Exception):
+        super().__init__(operation="validate load", msg=str(cause))
+        self.cause = cause
 
 
 def _require(result):
@@ -335,6 +343,14 @@ def _strict_tensor(component, tensor_id, named, saved):
         raise ValueError(f"{component.name}: shape mismatch for {tensor_id}")
     if meta.dtype != saved["dtype"] or meta.itemsize != saved["itemsize"]:
         raise ValueError(f"{component.name}: dtype mismatch for {tensor_id}")
+    if sorted(named.alias) != sorted(saved.get("aliases", [])):
+        raise _Failure(
+            _LoadValidationError(
+                ValueError(
+                    f"{component.name}: tied parameter aliases differ for {tensor_id}"
+                )
+            )
+        )
 
 
 def _load_objects(path, component, saved, strict):
@@ -378,7 +394,12 @@ def _prepare_load_component(path, component, description, ctx, backend, strict):
     compute = _compute_view(component)
     _require(compute.check_constraints())
     table, layout = desc.rebuild_component(saved, description.world_size)
-    storage = backend.open(Path(path) / component.name, table, layout, ctx.coordinator)
+    root = Path(path) / component.name
+    for name, info in saved["files"].items():
+        size = info.get("bytes")
+        if size and (root / name).stat().st_size != size:
+            raise ValueError(f"{component.name}: file size mismatch for {name}")
+    storage = backend.open(root, table, layout, ctx.coordinator)
     _require(storage.check_constraints())
     return component, compute, storage, objects
 
@@ -415,24 +436,96 @@ def _load_one(ctx, compute, storage):
     if not storage.physical_layout.tensor_entries:
         return Ok(None)
     result = rank_load(ctx.rank, compute, storage)
+    _raise_io_interrupt(storage)
     if type(result) is Ok:
         getattr(compute.data_accessor, "finish", lambda: None)()
     return result
 
 
-def _load_components(prepared, ctx):
-    for component, compute, storage, objects in prepared:
+def _prepare_load_view(ctx, compute, storage, stack):
+    # The public executor validates the rank plan before calling begin_load.
+    # Stop there on the first pass, then resolve headers without copying bytes.
+    planned = GDTensorIOError(operation="prepare load", msg="rank plan validated")
+    probe = replace(storage, begin_load=lambda view, rank: Err(planned))
+    result = rank_load(ctx.rank, compute, probe)
+    if type(result) is not Err or result.value is not planned:
+        _require(result)
+        raise RuntimeError("rank load skipped plan validation")
+    if not storage.physical_layout.tensor_entries:
+        return storage
+    assert storage.begin_load is not None
+    session = _require(storage.begin_load(storage, ctx.rank))
+    unused = session
+
+    def close_unused():
+        if unused is not None:
+            unused.finish()
+
+    def begin_load(view, rank):
+        nonlocal unused
+        unused = None
+        return Ok(session)
+
+    stack.callback(close_unused)
+    for pos in storage.physical_layout.tensor_entries:
+        _require(session.get_file_offset(pos))
+    return replace(storage, begin_load=begin_load)
+
+
+def _load_payloads(views, ctx, validate):
+    with ExitStack() as stack:
+        checked = _collective(
+            ctx, "validate load", lambda: _validate_load(views, ctx, validate, stack)
+        )
+        if type(checked) is Err:
+            return checked
+        return _copy_load_payloads(checked.value, ctx)
+
+
+def _validate_load(views, ctx, validate, stack):
+    try:
+        validate()
+    except Exception as exc:
+        raise _Failure(_LoadValidationError(exc)) from exc
+    return [
+        (name, compute, _prepare_load_view(ctx, compute, storage, stack))
+        for name, compute, storage in views
+    ]
+
+
+def _copy_load_payloads(views, ctx):
+    for name, compute, storage in views:
         result = _collective(
-            ctx, f"load {component.name}", lambda: _load_one(ctx, compute, storage)
+            ctx, f"load {name}", lambda: _load_one(ctx, compute, storage)
         )
         if type(result) is Err:
             return result
+    return Ok(None)
+
+
+def _load_components(prepared, ctx, rank_state, preflight):
+    views = [
+        (component.name, compute, storage)
+        for component, compute, storage, _ in prepared
+    ]
+    objects_by_name = {component.name: objects for component, _, _, objects in prepared}
+
+    def validate():
+        if preflight is not None:
+            preflight(objects_by_name, rank_state)
+
+    result = _load_payloads(views, ctx, validate)
+    if type(result) is Err:
+        return result
+    for component, _, _, objects in prepared:
         component.objects.clear()
         component.objects.update(objects)
     return Ok(None)
 
 
-def load(path, state, ctx, *, backend=None, strict=True) -> Result[None]:
+def load(
+    path, state, ctx, *, backend=None, strict=True, _preflight=None
+) -> Result[None]:
     """Restore requested components after all strict metadata checks pass."""
     backend = backend or SafeTensorsBackend()
     prepared = _collective(
@@ -442,7 +535,7 @@ def load(path, state, ctx, *, backend=None, strict=True) -> Result[None]:
         return prepared
     assert prepared.value is not None
     components, rank_state = prepared.value
-    result = _load_components(components, ctx)
+    result = _load_components(components, ctx, rank_state, _preflight)
     if type(result) is Err:
         return result
     state.rank_state.update(rank_state)

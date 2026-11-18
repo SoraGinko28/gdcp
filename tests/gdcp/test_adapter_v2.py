@@ -1,6 +1,8 @@
 """Focused adapter invariants independent of model size and rank launcher."""
 
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
+from threading import local
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -8,10 +10,20 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from torch.distributed import HashStore, destroy_process_group, init_process_group
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor
+
+from gdcp import FSDP2Checkpointer, desc
 from gdcp.adapters import fsdp2, torch_access
 from gdcp.adapters.torch_access import TorchAccessor
-from gdcp.state import RankContext
+from gdcp.state import CheckpointState, RankContext
 from gdtensor.builder import Err, Ok
+from gdtensor_conn.coord import ThreadCoordinator
+from gdtensor_conn.iobackend import FileIO
+
+_FORMATS = ("safetensors", "dcp", "hf")
 
 
 def _range(key, offset, size):
@@ -160,7 +172,9 @@ def test_optimizer_restore_preserves_fp32_master_and_extra_fields():
     adapter = fsdp2.FSDP2Adapter(loading=True)
     adapter.optimizer_state = values
     _tensors, objects, adapter.optimizer_paths = fsdp2._optimizer_values(values)
-    adapter._restore_optimizer({"model": model, "optimizer": optimizer}, objects)
+    target = {"model": model, "optimizer": optimizer}
+    adapter.prepare_restore(target, {"optimizer": objects}, {})
+    adapter.restore(target, CheckpointState())
     restored = optimizer.state[model.weight]
     assert restored["master_param"] is fields["master_param"]
     assert restored["exp_avg"].dtype == torch.float32
@@ -190,3 +204,210 @@ def test_invalid_accessor_range_returns_result_error():
     accessor = TorchAccessor({"weight": torch.zeros(2)}, 0, 1)
     result = accessor.read_to_buffer(_range("weight", 0, 12), lambda *args: Ok(None))
     assert type(result) is Err
+
+
+@pytest.fixture
+def mesh(monkeypatch):
+    pytest.importorskip("torch.testing._internal.distributed.fake_pg")
+    init_process_group("fake", store=HashStore(), rank=0, world_size=1)
+    monkeypatch.setattr(fsdp2, "_context", lambda: RankContext(0, 1))
+    try:
+        yield DeviceMesh("cpu", [0])
+    finally:
+        destroy_process_group()
+
+
+def _model(value, tied_to):
+    model = torch.nn.Module()
+    model.a = torch.nn.Parameter(torch.full((4,), value))
+    model.b = torch.nn.Parameter(torch.full((4,), value + 1))
+    model.alias = getattr(model, tied_to)
+    return model
+
+
+def _optimizer(model, lr, *, split=False, fresh=False):
+    params = (
+        [{"params": [model.a]}, {"params": [model.b]}] if split else model.parameters()
+    )
+    optimizer = torch.optim.AdamW(params, lr=lr, foreach=False)
+    if not fresh:
+        for param in model.parameters():
+            param.grad = torch.full_like(param, lr)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    return optimizer
+
+
+def _values(model, optimizer=None):
+    tensors = list(model.state_dict().values())
+    if optimizer is not None:
+        tensors += [
+            value for fields in optimizer.state.values() for value in fields.values()
+        ]
+    return [
+        (tensor.to_local() if isinstance(tensor, DTensor) else tensor).detach().tolist()
+        for tensor in tensors
+    ]
+
+
+def _load_rejected(path, state, match):
+    with pytest.raises((ValueError, RuntimeError), match=match):
+        FSDP2Checkpointer.load(path, state)
+
+
+@pytest.mark.parametrize("fmt", (*_FORMATS, "native_dcp"))
+def test_alias_validation_preserves_model(mesh, tmp_path, fmt):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "b"), mesh=mesh)
+    checkpoint_format = "dcp" if fmt == "native_dcp" else fmt
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source}, checkpoint_format=checkpoint_format
+    )
+    if fmt == "native_dcp":
+        (tmp_path / desc.MANIFEST_NAME).unlink()
+        (tmp_path / "model" / "objects.json").unlink()
+    before = _values(target)
+    error = RuntimeError if fmt == "native_dcp" else ValueError
+    with pytest.raises(error, match="tied.*alias"):
+        FSDP2Checkpointer.load(tmp_path, {"model": target})
+    assert _values(target) == before
+    assert target.alias is target.b
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("fresh", (False, True))
+def test_optimizer_group_validation_preserves_live_state(mesh, tmp_path, fmt, fresh):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "a"), mesh=mesh)
+    saved = _optimizer(source, 0.01, split=True)
+    optimizer = _optimizer(target, 0.25, fresh=fresh)
+    extra_state = {"step": -1}
+    state = {"model": target, "optimizer": optimizer, "extra_state": extra_state}
+    FSDP2Checkpointer.save(
+        tmp_path,
+        {"model": source, "optimizer": saved, "extra_state": {"step": 1}},
+        checkpoint_format=fmt,
+    )
+    before = _values(target, optimizer)
+    _load_rejected(tmp_path, state, "optimizer parameter group count")
+    assert _values(target, optimizer) == before
+    assert optimizer.param_groups[0]["lr"] == 0.25
+    assert state["extra_state"] is extra_state
+
+
+@pytest.mark.parametrize("fmt", ("safetensors", "dcp"))
+def test_later_component_header_failure_preserves_optimizer(mesh, tmp_path, fmt):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "a"), mesh=mesh)
+    saved, optimizer = _optimizer(source, 0.01), _optimizer(target, 0.25)
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source, "optimizer": saved}, checkpoint_format=fmt
+    )
+    suffix = "distcp" if fmt == "dcp" else "safetensors"
+    payload = tmp_path / "model" / f"__0_0.{suffix}"
+    payload.write_bytes(bytes(payload.stat().st_size))
+    before = _values(target, optimizer)
+    _load_rejected(
+        tmp_path, {"model": target, "optimizer": optimizer}, "Expecting value|zip file"
+    )
+    assert _values(target, optimizer) == before
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_rank_specific_alias_failure_stops_writes_on_every_rank(
+    tmp_path, monkeypatch, fmt
+):
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    source = _model(1.0, "a")
+    FSDP2Checkpointer.save(tmp_path, {"model": source}, checkpoint_format=fmt)
+    coordinator = ThreadCoordinator(2, timeout=10)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    writes = []
+    write = fsdp2.TorchAccessor.write_from_buffer
+
+    def record_write(accessor, tensor_range, callback):
+        writes.append(context.value.rank)
+        return write(accessor, tensor_range, callback)
+
+    monkeypatch.setattr(fsdp2.TorchAccessor, "write_from_buffer", record_write)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        target = _model(8.0, "b" if rank else "a")
+        before = _values(target)
+        _load_rejected(tmp_path, {"model": target}, "tied.*alias|another rank")
+        assert _values(target) == before
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+    assert not writes
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_missing_rank_state_preserves_fresh_optimizer(mesh, tmp_path, fmt, monkeypatch):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "a"), mesh=mesh)
+    saved, optimizer = _optimizer(source, 0.01), _optimizer(target, 0.25, fresh=True)
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source, "optimizer": saved}, checkpoint_format=fmt
+    )
+    before = _values(target, optimizer)
+    extra_state = object()
+    state = {"model": target, "optimizer": optimizer, "extra_state": extra_state}
+
+    def unexpected_read(*args):
+        pytest.fail("tensor file opened before checking rank state presence")
+
+    if fmt != "hf":
+        monkeypatch.setattr(FileIO, "pread", unexpected_read)
+    _load_rejected(tmp_path, state, "missing rank state|extra_state_rank_0")
+    assert _values(target, optimizer) == before
+    assert not optimizer.state
+    assert state["extra_state"] is extra_state
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_corrupt_rank_state_preserves_live_state(mesh, tmp_path, fmt):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "a"), mesh=mesh)
+    saved, optimizer = _optimizer(source, 0.01), _optimizer(target, 0.25)
+    extra_state = object()
+    state = {"model": target, "optimizer": optimizer, "extra_state": extra_state}
+    FSDP2Checkpointer.save(
+        tmp_path,
+        {"model": source, "optimizer": saved, "extra_state": {"step": 1}},
+        checkpoint_format=fmt,
+    )
+    (tmp_path / "extra_state" / "extra_state_rank_0.pt").write_bytes(b"")
+    before = _values(target, optimizer)
+    with pytest.raises((EOFError, RuntimeError), match="^$|extra_state|input"):
+        FSDP2Checkpointer.load(tmp_path, state)
+    assert _values(target, optimizer) == before
+    assert optimizer.param_groups[0]["lr"] == 0.25
+    assert state["extra_state"] is extra_state
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_valid_load_installs_fresh_optimizer_state(mesh, tmp_path, fmt):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "a"), mesh=mesh)
+    saved, optimizer = _optimizer(source, 0.01), _optimizer(target, 0.25, fresh=True)
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source, "optimizer": saved}, checkpoint_format=fmt
+    )
+    FSDP2Checkpointer.load(tmp_path, {"model": target, "optimizer": optimizer})
+    assert _values(target, optimizer) == _values(source, saved)
+    assert optimizer.param_groups[0]["lr"] == 0.01
+    assert target.alias is target.a
+
+
+def test_hf_weights_only_export_loads_tied_model_without_alias_sidecar(mesh, tmp_path):
+    source = fully_shard(_model(1.0, "a"), mesh=mesh)
+    target = fully_shard(_model(8.0, "a"), mesh=mesh)
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source}, checkpoint_format="hf", hf_dtype="fp32"
+    )
+    FSDP2Checkpointer.load(tmp_path, {"model": target})
+    assert _values(target) == _values(source)
+    assert target.alias is target.a

@@ -25,7 +25,7 @@ from gdtensor.builder import (
     Replicate,
     StorageDTensorsView,
 )
-from gdtensor.io import rank_load, rank_save
+from gdtensor.io import rank_save
 from gdtensor_conn._geometry import nonempty_columns
 from gdtensor_conn._layout import build_payload_index
 from gdtensor_conn.access import StorageDataAccessor
@@ -553,7 +553,7 @@ def _payload_digest(path, entry):
     return digest.hexdigest()
 
 
-def _validate_keys(path, combined, headers):
+def _validate_keys(combined, headers):
     expected = {named.global_tensor_id for named in combined.table.named_d_tensors}
     missing = expected - headers.keys()
     if missing:
@@ -564,18 +564,27 @@ def _validate_keys(path, combined, headers):
         for alias in named.alias
     }
     unexpected = headers.keys() - expected
+    duplicates = []
     for alias in unexpected & aliases.keys():
         canonical = aliases[alias]
         left, right = headers[alias], headers[canonical]
-        if any(
-            left[field] != right[field] for field in ("shape", "dtype", "itemsize")
-        ) or _payload_digest(path, left) != _payload_digest(path, right):
+        if any(left[field] != right[field] for field in ("shape", "dtype", "itemsize")):
             raise ValueError(f"HF tied alias {alias} differs from {canonical}")
+        duplicates.append((alias, canonical))
     unexpected -= aliases.keys()
     if not any(key.startswith("optimizer.") for key in expected):
         unexpected = {key for key in unexpected if not key.startswith("optimizer.")}
     if unexpected:
         raise ValueError(f"HF unexpected key {sorted(unexpected)[0]}")
+    return duplicates
+
+
+def _validate_alias_payloads(path, headers, duplicates):
+    for alias, canonical in duplicates:
+        if _payload_digest(path, headers[alias]) != _payload_digest(
+            path, headers[canonical]
+        ):
+            raise ValueError(f"HF tied alias {alias} differs from {canonical}")
 
 
 def _load_prepare(path, state, ctx):
@@ -583,7 +592,7 @@ def _load_prepare(path, state, ctx):
     core._validate_state(state)
     headers = read_headers(path)
     combined, _objects = _combined(state, headers)
-    _validate_keys(path, combined, headers)
+    duplicates = _validate_keys(combined, headers)
     entries = []
     for named in combined.table.named_d_tensors:
         key, meta = named.global_tensor_id, named.d_tensor.global_tensor_meta
@@ -623,6 +632,8 @@ def _load_prepare(path, state, ctx):
     core._require(storage.check_constraints())
     objects_file = Path(path) / _OBJECTS
     objects = desc.read_objects(objects_file) if objects_file.is_file() else {}
+    if not isinstance(objects, dict):
+        raise ValueError("HF optimizer.json must contain a mapping")
     if (
         any(component.name == "optimizer" for component in state.components)
         and "optimizer" not in objects
@@ -634,10 +645,10 @@ def _load_prepare(path, state, ctx):
         if not filename.is_file():
             filename = filename.with_name(f"{name}_rank_0.pt")
         blobs[name] = filename.read_bytes()
-    return combined, compute, storage, objects, blobs
+    return combined, compute, storage, objects, blobs, headers, duplicates
 
 
-def load_state(path, state, ctx):
+def load_state(path, state, ctx, *, _preflight=None):
     """Load native HF headers directly, including an optional optimizer sidecar."""
     prepared = core._collective(
         ctx, "HF prepare load", lambda: _load_prepare(path, state, ctx)
@@ -645,10 +656,19 @@ def load_state(path, state, ctx):
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    combined, compute, storage, objects, blobs = prepared.value
-    result = core._collective(
-        ctx, "HF load", lambda: _run_io(rank_load, ctx, combined, compute, storage)
-    )
+    combined, compute, storage, objects, blobs, headers, duplicates = prepared.value
+
+    def validate():
+        for component in state.components:
+            if not isinstance(objects.get(component.name, {}), dict):
+                raise ValueError(
+                    f"HF objects for {component.name} must contain a mapping"
+                )
+        if _preflight is not None:
+            _preflight(objects, blobs)
+        _validate_alias_payloads(path, headers, duplicates)
+
+    result = core._load_payloads([(combined.name, compute, storage)], ctx, validate)
     if type(result) is Err:
         return result
     for component in state.components:

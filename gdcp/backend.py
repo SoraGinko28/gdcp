@@ -1,6 +1,7 @@
 """Connector-backed storage views; file formats remain in gdtensor_conn."""
 
 from dataclasses import dataclass, replace
+from functools import partial
 
 from gdtensor import Result
 from gdtensor.builder import Err, GDTensorIOError, Ok
@@ -86,6 +87,17 @@ def _collective_begin(begin, coordinator):
     return wrapped
 
 
+def _close_failed_load(begin_load, io, root, view, rank):
+    try:
+        result = begin_load(view, rank)
+    except BaseException:
+        io.close_rank(rank, root)
+        raise
+    if type(result) is Err:
+        io.close_rank(rank, root)
+    return result
+
+
 @dataclass
 class SafeTensorsBackend:
     """Thin POSIX safetensors backend, with an optional connector FileIO."""
@@ -97,13 +109,19 @@ class SafeTensorsBackend:
         if layout.container_format != self.format:
             raise ValueError(f"unsupported format {layout.container_format!r}")
         ids = [named.global_tensor_id for named in storage_table.named_d_tensors]
+        io = _InterruptIO(self.io or FileIO())
         view = make_storage_view(
             ids,
             storage_table,
             layout,
             str(root),
-            io=_InterruptIO(self.io or FileIO()),
+            io=io,
             coord=coordinator,
+        )
+        begin_load = view.begin_load
+        assert begin_load is not None
+        view = replace(
+            view, begin_load=partial(_close_failed_load, begin_load, io, str(root))
         )
         if coordinator is None:
             return view

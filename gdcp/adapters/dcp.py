@@ -10,7 +10,8 @@ import os
 import pickle
 import struct
 import zipfile
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from math import prod
 from pathlib import Path
@@ -432,7 +433,12 @@ def _find_offset(root, table, pos, path, slot, metadata):
     if box is None:
         raise ValueError("DCP slot is outside its storage mesh")
     lo, hi = box
-    item = metadata.state_dict_metadata[pos.tensor_id]
+    item = _tensor_metadata(metadata, pos.tensor_id)
+    meta = global_tensor_meta_of(named)
+    if (list(item.size) or [1]) != list(meta.global_shape):
+        raise ValueError(f"{pos.tensor_id}: DCP shape mismatch")
+    if _CODES.get(item.properties.dtype) != meta.dtype:
+        raise ValueError(f"{pos.tensor_id}: DCP dtype mismatch")
     offsets = () if len(item.size) == 0 else tuple(lo)
     sizes = (
         ()
@@ -600,6 +606,50 @@ def _tensor_metadata(metadata, key):
     return item
 
 
+def _validate_native_keys(metadata, wanted):
+    assert metadata.storage_data is not None
+    owners = {key: key for key in wanted}
+    owners.update(
+        {alias: key for key, named in wanted.items() for alias in named.alias}
+    )
+    tensor_keys = {
+        key
+        for key, item in metadata.state_dict_metadata.items()
+        if isinstance(item, TensorStorageMetadata)
+    }
+    unexpected = tensor_keys - owners.keys()
+    if unexpected:
+        raise ValueError(f"native DCP unexpected key {sorted(unexpected)[0]}")
+    records = defaultdict(list)
+    for index, record in metadata.storage_data.items():
+        if index.fqn in tensor_keys:
+            records[index.fqn].append(
+                (
+                    tuple(index.offset),
+                    record.relative_path,
+                    record.offset,
+                    record.length,
+                )
+            )
+    aliases = {}
+    for key in sorted(tensor_keys):
+        _validate_native_alias(metadata, key, owners[key], records[key], aliases)
+
+
+def _validate_native_alias(metadata, key, owner, records, aliases):
+    item = _tensor_metadata(metadata, key)
+    canonical = _tensor_metadata(metadata, owner)
+    if (
+        item.size != canonical.size
+        or item.properties.dtype != canonical.properties.dtype
+    ):
+        raise ValueError(f"native DCP tied parameter alias {key} differs from {owner}")
+    # GDCP-native aliases point to the same records. Other DCP writers may
+    # serialize tied names independently, with no explicit alias information.
+    if records and aliases.setdefault(tuple(sorted(records)), owner) != owner:
+        raise ValueError(f"native DCP tied parameter aliases differ for {key}")
+
+
 def read_component(root, component):
     """Build the storage table from native metadata, without a GDCP manifest."""
     metadata = read_metadata(root)
@@ -615,8 +665,14 @@ def read_component(root, component):
         raise ValueError(
             f"{component.name}: native DCP is missing keys {sorted(wanted.keys() - metadata.state_dict_metadata.keys())}"
         )
+    _validate_native_keys(metadata, wanted)
     world = max([len(item.chunks) for key, item in items] + [1])
-    table = DTensorTable([_native_tensor(key, item, world) for key, item in items])
+    table = DTensorTable(
+        [
+            replace(_native_tensor(key, item, world), alias=wanted[key].alias)
+            for key, item in items
+        ]
+    )
     paths = _native_paths(metadata, table)
     layout = build_layout(
         table,
@@ -653,6 +709,8 @@ def _native_paths(metadata, table):
 def _prepare_native(path, state, ctx):
     core._validate_context(ctx)
     core._validate_state(state)
+    if state.rank_state:
+        raise ValueError("native DCP has no GDCP per-rank extra_state")
     prepared = []
     for component in state.components:
         root = Path(path) / component.name
@@ -671,22 +729,17 @@ def _prepare_native(path, state, ctx):
     return prepared
 
 
-def load(path, state, ctx):
+def load(path, state, ctx, *, _preflight=None):
     pending = core._collective(
         ctx, "prepare DCP load", lambda: core._require_not_pending(path)
     )
     if type(pending) is Err:
         return pending
     if (Path(path) / desc.MANIFEST_NAME).exists():
-        return core.load(path, state, ctx, backend=DcpBackend())
-    if state.rank_state:
-        return core._error(
-            "prepare native DCP load",
-            ValueError("native DCP has no GDCP per-rank extra_state"),
-        )
+        return core.load(path, state, ctx, backend=DcpBackend(), _preflight=_preflight)
     prepared = core._collective(
         ctx, "prepare native DCP load", lambda: _prepare_native(path, state, ctx)
     )
     if type(prepared) is Err:
         return prepared
-    return core._load_components(prepared.value, ctx)
+    return core._load_components(prepared.value, ctx, {}, _preflight)
