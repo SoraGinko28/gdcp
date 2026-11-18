@@ -14,6 +14,7 @@ import shutil
 import stat
 import sys
 from pathlib import Path
+from tempfile import mkdtemp
 
 from . import _ownership, desc
 
@@ -164,9 +165,8 @@ def _foreign_entries(root, owned):
     return [name for name, kind in _entries(root, owned) if kind == "foreign"]
 
 
-def _salvage_entry(old, root, name):
-    if name in _RESERVED:
-        raise FileExistsError("reserved transaction name")
+def _salvage_entry(old, root, name, planned):
+    _collisions(old, (name,), planned)
     for parent in reversed(name.parents[:-1]):
         directory = root / parent
         directory.mkdir(exist_ok=True)
@@ -177,11 +177,40 @@ def _salvage_entry(old, root, name):
     _sync_directory(source.parent)
 
 
-def _clean_old(old, root, owned):
+def _remove_verified(entry, expected, *, directory=False):
+    # Claim the current entry before checking its identity. Deleting under a
+    # private name cannot unlink a file recreated at the original pathname.
+    private = Path(mkdtemp(prefix=".gdcp-cleanup-", dir=entry.parent))
+    claimed = private / entry.name
+    try:
+        entry.rename(claimed)
+        if _entry_identity(claimed) != expected:
+            raise OSError(f"foreign entry replaced {entry} during cleanup")
+        if directory:
+            claimed.rmdir()
+        else:
+            claimed.unlink()
+    except BaseException:
+        if os.path.lexists(claimed):
+            _restore_claimed_entry(claimed, entry)
+        raise
+    finally:
+        if not os.path.lexists(claimed):
+            private.rmdir()
+
+
+def _restore_claimed_entry(claimed, entry):
+    try:
+        _rename_exclusive(claimed, entry)
+    except OSError as exc:
+        raise OSError(f"could not restore {entry}; retained {claimed}: {exc}") from exc
+
+
+def _clean_old(old, root, owned, planned):
     blocked = []
     for name in _foreign_entries(old, owned):
         try:
-            _salvage_entry(old, root, name)
+            _salvage_entry(old, root, name, planned)
         except (OSError, ValueError) as exc:
             blocked.append(f"{name}: {exc}")
     if blocked:
@@ -190,13 +219,9 @@ def _clean_old(old, root, owned):
     # Delete only verified checkpoint files and empty directories. New entries
     # can still arrive in the old directory through an open directory handle.
     for name, kind in _entries(old, owned):
-        entry = old / name
-        if kind == "foreign" or _entry_identity(entry) != owned[name]:
+        if kind == "foreign":
             raise OSError(f"foreign entry appeared during cleanup: {name}")
-        if kind == "directory":
-            entry.rmdir()
-        else:
-            entry.unlink()
+        _remove_verified(old / name, owned[name], directory=kind == "directory")
     old.rmdir()
 
 
@@ -243,6 +268,7 @@ class DirectoryTransaction:
         self.new_identity = None
         self.old_identity = None
         self.old_owned = {}
+        self.journal_identity = None
         self.planned = set()
         self.published = False
         self.exchanged = False
@@ -289,7 +315,9 @@ class DirectoryTransaction:
                 for name in foreign
             ],
         }
-        desc.atomic_write(self.stage / JOURNAL_NAME, desc.json_bytes(record))
+        self.journal_identity = desc.atomic_write(
+            self.stage / JOURNAL_NAME, desc.json_bytes(record)
+        )
         _sync_directory(self.stage)
         _sync_directory(self.stage.parent)
 
@@ -361,14 +389,16 @@ class DirectoryTransaction:
         journal = self.root / JOURNAL_NAME
         if not journal.is_file() or not _ownership.complete(self.root):
             return
-        record = json.loads(journal.read_bytes())
+        with journal.open("rb") as file:
+            record = json.load(file)
+            entry = os.fstat(file.fileno())
         if record["version"] != 1 or tuple(record["new_identity"]) != _identity(
             self.root
         ):
             self._refuse_recovery()
         for item in record["foreign"]:
             self._check_foreign_at_root(item)
-        journal.unlink()
+        _remove_verified(journal, (entry.st_dev, entry.st_ino))
         _sync_directory(self.root)
         _LOG.warning("removed published checkpoint transaction journal %s", journal)
 
@@ -392,9 +422,9 @@ class DirectoryTransaction:
             or not os.path.lexists(source)
             or _entry_identity(source) != expected
         ):
-            self._refuse_recovery()
+            self._refuse_recovery(f"cannot restore {source} to {target};")
         target.parent.mkdir(parents=True, exist_ok=True)
-        source.rename(target)
+        _rename_exclusive(source, target)
         _sync_directory(source.parent)
         _sync_directory(target.parent)
 
@@ -499,22 +529,33 @@ class DirectoryTransaction:
         if self.rank != 0 or self.new_identity is None:
             return
         if not self.accepted:
-            self.rollback()
-            self._remove_obsolete(self.stage, self.new_identity)
+            self._finish_aborted()
             return
         obsolete = self.backup if self.backed_up else self.stage
         if self._remove_obsolete(obsolete, self.old_identity):
             self._finish_accepted()
 
+    def _finish_aborted(self):
+        try:
+            self.rollback()
+        except Exception as exc:
+            _LOG.warning(
+                "checkpoint aborted but retained stage %s: %s", self.stage, exc
+            )
+        else:
+            self._remove_obsolete(self.stage, self.new_identity)
+
     def _finish_accepted(self):
+        journal = self.root / JOURNAL_NAME
         try:
             self._check(self.root, self.new_identity)
-            (self.root / JOURNAL_NAME).unlink(missing_ok=True)
+            if os.path.lexists(journal):
+                _remove_verified(journal, self.journal_identity)
             _sync_directory(self.root)
         except Exception as exc:
             _LOG.warning(
                 "checkpoint committed but retained transaction journal at %s: %s",
-                self.root,
+                journal,
                 exc,
             )
 
@@ -535,7 +576,7 @@ class DirectoryTransaction:
     def _delete_obsolete(self, path):
         if self.accepted:
             self._check(self.root, self.new_identity)
-            _clean_old(path, self.root, self.old_owned)
+            _clean_old(path, self.root, self.old_owned, self.planned)
         else:
             shutil.rmtree(path)
 

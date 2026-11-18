@@ -222,7 +222,9 @@ def atomic_write(path, data):
         file.write(data)
         file.flush()
         os.fsync(file.fileno())
+        entry = os.fstat(file.fileno())
     os.replace(temporary, path)
+    return entry.st_dev, entry.st_ino
 
 
 def json_bytes(value):

@@ -77,21 +77,32 @@ directories; otherwise GDCP uses old-to-backup, then stage-to-target renames.
 Publication is followed by parent-directory fsync and a collective success vote.
 Before accepted success, a caught failure or `BaseException` (including
 `KeyboardInterrupt` and `SystemExit`) rolls back and restores the foreign entries;
-interrupts propagate after cleanup. A failed first save leaves the target absent,
-or leaves its original foreign entries intact when the directory already existed.
-An overwrite needs space for old and new generations together.
+interrupts propagate after cleanup. If a carried entry's original name has been
+recreated, rollback leaves the replacement in the old target and the carried entry
+in the stage. It logs the retained stage and the blocked name, and the original
+interrupt still propagates. A failed first save leaves the target absent, or leaves
+its original foreign entries intact when the directory already existed. An
+overwrite needs space for old and new generations together.
 
 An entry created in the old directory between the final publication scan and
 the exchange (or the old-to-backup rename on the portable path) stays with the
-old directory through publication. After acceptance, cleanup scans the old
-sibling and moves the entry to the new target when an exclusive rename is
-available and the name is free. A collision, a reserved transaction name, or a
-failed move leaves the entry in the sibling and logs a warning naming the sibling
-and entry. The save returns success with the complete new checkpoint. Cleanup
-deletes only verified checkpoint files and uses empty-directory removal. An
-entry added to the obsolete directory after the cleanup scan can therefore also
-keep the sibling in place with a warning. The published journal stays until the
-obsolete sibling is removed so a retry can recognize retained content.
+old directory through publication. Entries created while the scan is in progress
+can also be missed if their directory was already enumerated. After acceptance,
+cleanup scans the old sibling and moves the entry to the new target when an
+exclusive rename is available and the name is free and unreserved. Reservations
+include format-specific names such as `model.safetensors.index.json` for an HF
+single-file save, where an index would take precedence during load. A collision,
+reserved name, or failed move leaves the entry in the sibling and logs a warning
+naming the sibling and entry. The save returns success with the new checkpoint.
+
+Cleanup renames each deletion candidate into a private temporary directory and
+verifies its identity there before deleting it. A captured replacement goes back
+to its original name if available. If that name has been recreated, both entries
+are retained and the warning identifies the temporary path. Directory removal
+requires an empty directory, so arrivals during deletion can also leave the
+obsolete sibling in place with a warning. The published journal stays until the
+sibling is removed. Its cleanup uses the identity recorded when the journal was
+written, preserving a foreign replacement at the journal name.
 
 Hard termination has these exact namespace windows:
 
@@ -103,7 +114,7 @@ Hard termination has these exact namespace windows:
 | After Linux exchange | Target contains the complete new checkpoint and the carried entries. Stage contains the old checkpoint and any arrivals missed by the final scan. |
 | Portable old-to-backup, before stage-to-target | Target is absent. Backup contains the complete old checkpoint and any arrivals missed by the final scan. Stage contains the complete new checkpoint and the carried entries. |
 | After stage-to-target, before acceptance | Target contains the complete new checkpoint and the carried entries. Backup contains the old checkpoint and any arrivals missed by the final scan. |
-| Accepted obsolete-generation cleanup | Uncontested late entries move to the new target. An interrupted or blocked cleanup can retain the obsolete sibling with remaining entries. After successful sibling removal, cleanup removes the journal. |
+| Accepted obsolete-generation cleanup | Uncontested late entries move to the new target. An interrupted or blocked cleanup can retain the obsolete sibling and a private cleanup directory containing the entry being checked. After successful sibling removal, cleanup removes the verified journal. |
 
 A first save has no old-generation rename: before stage-to-target the target is
 absent; afterwards it contains the new checkpoint. Recovery does not infer a

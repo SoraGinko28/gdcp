@@ -43,13 +43,18 @@ directories and symlinks keep their contents and inodes. A foreign name collisio
 detected at preflight fails before payload writes. A collision found in the final
 publication scan fails before the new checkpoint is published.
 Caught failures and pre-accept interrupts restore the old checkpoint and foreign
-entries. Interrupts propagate. Foreign entries found by the final scan move by
+entries. If an original name has been recreated, rollback keeps the carried entry
+in the stage, leaves the replacement in the target and logs the retained stage.
+The original interrupt propagates. Foreign entries found by the final scan move by
 rename just before publication, so a hard kill can temporarily leave some in the
 stage. The durable transaction journal lets retry return them to the verified old
 target. Entries created between that scan and the exchange or old-to-backup
 rename stay in the obsolete sibling until cleanup. Cleanup moves each such entry
-to its original relative name if it can do so without replacing anything. If it
-cannot, the save succeeds and logs a warning naming the retained sibling. Linux
+if its original relative name is free and unreserved. A single-file HF save
+reserves the index name because HF loaders check for it first. Cleanup moves old
+files and the published journal to private temporary directories before checking
+their identities and deleting them. If cleanup cannot move or safely delete an
+entry, the save succeeds and logs where it was retained. Linux
 exchange retains checkpoint old-or-new visibility; the two-rename fallback has
 an absent-target window with the old checkpoint in backup. Unpublished pending
 stages are recovered automatically; complete stages and backups are retained for
