@@ -292,7 +292,8 @@ def test_type_aliases_and_namespace_separation():
 @pytest.mark.parametrize(
     "file",
     sorted((ROOT / "tests").rglob("*.py"))
-    + sorted((ROOT / "gdtensor_conn").rglob("*.py")),
+    + sorted((ROOT / "gdtensor_conn").rglob("*.py"))
+    + sorted((ROOT / "gdcp").rglob("*.py")),
     ids=lambda p: str(p.relative_to(ROOT)),
 )
 def test_tests_and_sim_use_no_core_internal_api(file):
@@ -342,7 +343,38 @@ def _check_core_node(node, file, forbidden):
     if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
         assert node.name not in forbidden, (file, node.name)
     if isinstance(node, ast.ImportFrom):
-        assert not (node.module or "").startswith(("gdtensor_conn", "tests")), file
+        assert not (node.module or "").startswith(("gdtensor_conn", "gdcp", "tests")), (
+            file
+        )
+    if isinstance(node, ast.Import):
+        assert all(
+            not alias.name.startswith(("gdtensor_conn", "gdcp", "tests"))
+            for alias in node.names
+        ), file
+
+
+def test_gdcp_torch_imports_are_confined_to_framework_adapter_and_accessor():
+    allowed = {
+        "adapters/fsdp2.py",
+        "adapters/torch_access.py",
+        "adapters/hf.py",
+        "adapters/dcp.py",
+    }
+    for file in sorted((ROOT / "gdcp").rglob("*.py")):
+        if file.relative_to(ROOT / "gdcp").as_posix() in allowed:
+            continue
+        _check_no_torch_import(file)
+
+
+def _check_no_torch_import(file):
+    for node in ast.walk(ast.parse(file.read_text())):
+        if isinstance(node, ast.Import):
+            assert all(not alias.name.startswith("torch") for alias in node.names), file
+        if isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").startswith("torch"), file
+    assert not re.search(
+        r"(?:import_module|__import__)\([\"']torch", file.read_text()
+    ), file
 
 
 def test_no_reduction_api():
@@ -363,7 +395,7 @@ def test_no_reduction_api():
     "file",
     sorted(
         path
-        for directory in ("gdtensor", "gdtensor_conn", "tests")
+        for directory in ("gdtensor", "gdtensor_conn", "gdcp", "tests")
         for path in (ROOT / directory).rglob("*.py")
     ),
     ids=lambda path: str(path.relative_to(ROOT)),

@@ -1,5 +1,8 @@
 # grouped dtensor
 
+GDCP v1 adds synchronous FSDP2/AdamW checkpointing and cross-world-size restore
+over the existing public GDTensor API. See [GDCP usage and boundaries](docs/GDCP.md).
+
 分组分布式张量（grouped dtensor）的 view、布局和 IO 核心。Python 包名与 import 路径仍为 `gdtensor`，本文档其余 `gdtensor` 字样均为实际包名、模块路径或命令，不随展示名变化。仓库：[cklxx/gdtensor](https://github.com/cklxx/gdtensor)。唯一设计依据是 [DTensorsView-design.md](docs/DTensorsView-design.md)。实现与测试的对应关系见 [SPEC_TRACEABILITY.md](SPEC_TRACEABILITY.md)。
 
 | namespace | 导出范围 |

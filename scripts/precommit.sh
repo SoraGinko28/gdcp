@@ -15,24 +15,25 @@ fi
 export PYTHONPATH="."
 
 echo "[precommit] 1/5 fmt check"
-uv run --locked --extra torch-cpu ruff format --check gdtensor gdtensor_conn tests
+uv run --locked --extra torch-cpu ruff format --check gdtensor gdtensor_conn gdcp tests
 
 echo "[precommit] 2/5 lint"
-uv run --locked --extra torch-cpu ruff check --no-cache gdtensor gdtensor_conn tests
+uv run --locked --extra torch-cpu ruff check --no-cache gdtensor gdtensor_conn gdcp tests
 
 echo "[precommit] 3/5 byte-compile"
-uv run --locked --extra torch-cpu python -m compileall -q gdtensor gdtensor_conn tests
+uv run --locked --extra torch-cpu python -m compileall -q gdtensor gdtensor_conn gdcp tests
 
 echo "[precommit] 4/5 package imports"
 uv run --locked --extra torch-cpu python - <<'PY'
 import gdtensor, gdtensor.io, gdtensor.builder, gdtensor.session, gdtensor.access, gdtensor.tag
 import gdtensor_conn.models, gdtensor_conn.runner
+import gdcp, gdcp.backend, gdcp.core, gdcp.desc, gdcp.policy, gdcp.state
 print("imports ok")
 PY
 
 echo "[precommit] 5/5 API, IO contract, constraints and indentation"
 uv run --locked --extra torch-cpu python -m pytest -v --capture=tee-sys --log-cli-level=INFO -p no:cacheprovider \
-  tests/core tests/io tests/checkpoint/test_parallel_modes.py tests/sim/test_real_file_accessors.py
+  tests/core tests/io tests/gdcp tests/checkpoint/test_parallel_modes.py tests/sim/test_real_file_accessors.py
 
 # The basic path (fmt/lint/compile/imports/contract pytest) is self-contained.
 # The advanced formal gate is a separate opt-in step, independent of basic:

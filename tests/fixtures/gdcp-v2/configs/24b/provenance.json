@@ -1,0 +1,12 @@
+{
+  "model_id": "mistralai/Mistral-Small-24B-Base-2501",
+  "revision": "b0a2e4ed093c26997495ae625528f81ea04b749f",
+  "url": "https://huggingface.co/mistralai/Mistral-Small-24B-Base-2501/resolve/b0a2e4ed093c26997495ae625528f81ea04b749f/config.json",
+  "api": "https://huggingface.co/api/models/mistralai/Mistral-Small-24B-Base-2501",
+  "sha256": "ff5f8d1747db4e16def20db719d867e74d0b764330249357351b2b44520b8001",
+  "bytes": 623,
+  "model_type": "mistral",
+  "config_path": "Meta-Device-DCP-Save-Load/configs/24b/config.json",
+  "fetched_pst": "2026-11-09T07:36:57.535693-08:00",
+  "unmodified": true
+}

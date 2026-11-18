@@ -1,0 +1,455 @@
+"""Same-filesystem checkpoint publication and metadata-only foreign-entry moves.
+
+Concurrent readers/writers of one destination are unsupported. The recovery
+journal is durable before foreign entries leave the old directory; no foreign
+payload is copied or traversed. See docs/GDCP.md for hard-kill recovery windows.
+"""
+
+import ctypes
+import errno
+import json
+import logging
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from . import _ownership, desc
+
+_LOG = logging.getLogger(__name__)
+JOURNAL_NAME = ".gdcp_transaction"
+PREFLIGHT = (
+    "initialize save (check foreign-name collisions, mount point and same filesystem; "
+    "pass a subdirectory of the mount)"
+)
+
+
+def _entry_identity(path):
+    stat = path.lstat()
+    return stat.st_dev, stat.st_ino
+
+
+def _identity(path):
+    identity = _entry_identity(path)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"checkpoint transaction requires a directory: {path}")
+    return identity
+
+
+def _sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_tree(root):
+    # Only checkpoint directories: foreign trees have not been moved here yet.
+    for directory, _dirs, _files in os.walk(root, topdown=False):
+        _sync_directory(directory)
+
+
+def _mount_points():
+    if sys.platform != "linux":
+        return set()
+    points = set()
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        name = line.split()[4]
+        for escaped, value in (
+            (r"\040", " "),
+            (r"\011", "\t"),
+            (r"\012", "\n"),
+            (r"\134", "\\"),
+        ):
+            name = name.replace(escaped, value)
+        points.add(Path(name))
+    return points
+
+
+def _check_filesystem(root, stage):
+    reference = root if root.exists() else root.parent
+    if os.path.ismount(root) or root in _mount_points():
+        raise ValueError(
+            f"checkpoint target is a mount point: {root}; pass a subdirectory of the mount"
+        )
+    if reference.stat().st_dev != stage.parent.stat().st_dev:
+        raise ValueError(
+            f"checkpoint target and staging location are on different filesystems: "
+            f"{root}, {stage}; pass a subdirectory of the mount"
+        )
+
+
+def _exchange(left, right):
+    """Return False only when the OS/filesystem lacks directory exchange."""
+    if sys.platform != "linux":
+        return False
+    library = ctypes.CDLL(None, use_errno=True)
+    if not hasattr(library, "renameat2"):
+        return False
+    rename = library.renameat2
+    rename.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(left), -100, os.fsencode(right), 2) == 0:
+        return True
+    code = ctypes.get_errno()
+    if code in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        return False
+    raise OSError(code, os.strerror(code), str(right))
+
+
+def _foreign_entries(root, owned, directories, relative=Path()):
+    foreign = []
+    for path in (root / relative).iterdir():
+        name = relative / path.name
+        if name in owned:
+            continue
+        if name in directories and path.is_dir() and not path.is_symlink():
+            foreign.extend(_foreign_entries(root, owned, directories, name))
+        else:
+            foreign.append(name)
+    return foreign
+
+
+def _collisions(root, foreign, planned):
+    for name in foreign:
+        conflicts = sorted(
+            (item for item in planned if name == item or name in item.parents),
+            key=lambda item: (-len(item.parts), item),
+        )
+        if conflicts:
+            entry = next(
+                (item for item in conflicts if os.path.lexists(root / item)), name
+            )
+            raise FileExistsError(
+                f"new checkpoint conflicts with foreign entry: {entry}"
+            )
+
+
+def _status(path):
+    if not os.path.lexists(path):
+        return "absent"
+    if path.is_symlink() or not path.is_dir():
+        return "symlink or non-directory"
+    if (path / desc.PENDING_NAME).exists():
+        return "pending generation"
+    return (
+        "complete generation"
+        if _ownership.complete(path)
+        else "unrecognized/incomplete directory"
+    )
+
+
+class DirectoryTransaction:
+    """Rank-zero mutation; all ranks derive the resolved staging pathname."""
+
+    def __init__(self, path, rank):
+        self.requested = Path(os.path.abspath(path))
+        self.root = Path(os.path.realpath(path))
+        if not self.root.name:
+            raise ValueError("the filesystem root cannot be a checkpoint")
+        self.stage = self.root.with_name(f".{self.root.name}.gdcp-stage")
+        self.backup = self.root.with_name(f".{self.root.name}.gdcp-backup")
+        self.rank = rank
+        self.new_identity = None
+        self.old_identity = None
+        self.foreign = []
+        self.published = False
+        self.exchanged = False
+        self.backed_up = False
+        self.accepted = False
+
+    def begin(self, planned=()):
+        if self.rank != 0:
+            return
+        self._validate_target()
+        self._recover()
+        if os.path.lexists(self.root):
+            self.old_identity = _identity(self.root)
+            self.foreign = _foreign_entries(
+                self.root,
+                _ownership.owned_files(self.root),
+                _ownership.owned_directories(self.root),
+            )
+        _collisions(
+            self.root,
+            self.foreign,
+            {Path(name) for name in planned}
+            | {Path(JOURNAL_NAME), Path(desc.PENDING_NAME)},
+        )
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        _check_filesystem(self.root, self.stage)
+        self.stage.mkdir()
+        self.new_identity = _identity(self.stage)
+        desc.atomic_write(
+            self.stage / desc.PENDING_NAME, b"GDCP transaction initializing\n"
+        )
+        self._write_journal()
+
+    def _validate_target(self):
+        if self.requested.is_symlink() and not self.requested.exists():
+            raise ValueError(f"dangling checkpoint symlink: {self.requested}")
+        if os.path.lexists(self.root):
+            _identity(self.root)
+        # Check before recovery, too: a mounted target must never be mutated.
+        if self.root.parent.exists():
+            _check_filesystem(self.root, self.stage)
+
+    def _write_journal(self):
+        record = {
+            "version": 1,
+            "old_identity": self.old_identity,
+            "new_identity": self.new_identity,
+            "foreign": [
+                {"path": str(name), "identity": _entry_identity(self.root / name)}
+                for name in self.foreign
+            ],
+        }
+        desc.atomic_write(self.stage / JOURNAL_NAME, desc.json_bytes(record))
+        _sync_directory(self.stage)
+        _sync_directory(self.stage.parent)
+
+    def _refuse_recovery(self, detail=""):
+        paths = "; ".join(
+            f"{path}: {_status(path)}" for path in (self.root, self.stage, self.backup)
+        )
+        raise FileExistsError(
+            f"checkpoint recovery requires inspection: {detail} {paths}. Restore the desired complete "
+            "generation and its foreign entries, then remove only verified obsolete siblings before retrying"
+        )
+
+    def _recover_backup(self):
+        if (
+            os.path.lexists(self.root)
+            or self.backup.is_symlink()
+            or not _ownership.complete(self.backup)
+        ):
+            self._refuse_recovery()
+        self.backup.rename(self.root)
+        _sync_directory(self.root.parent)
+        _LOG.warning(
+            "restored complete checkpoint backup %s to %s", self.backup, self.root
+        )
+
+    def _recover_published_journal(self):
+        try:
+            self._recover_root_journal()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._refuse_recovery(f"cannot recover {self.root / JOURNAL_NAME}: {exc};")
+
+    def _recover(self):
+        if os.path.lexists(self.backup):
+            self._recover_backup()
+        if not os.path.lexists(self.stage):
+            self._recover_published_journal()
+            return
+        if self.stage.is_symlink() or not self.stage.is_dir():
+            self._refuse_recovery()
+        journal = self.stage / JOURNAL_NAME
+        try:
+            proven = self._recover_foreign(journal) if journal.is_file() else False
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._refuse_recovery(f"cannot recover {journal}: {exc};")
+        pending = (self.stage / desc.PENDING_NAME).is_file()
+        initializing = {entry.name for entry in self.stage.iterdir()} <= {
+            desc.PENDING_NAME + ".tmp"
+        }
+        if initializing and (self.root / JOURNAL_NAME).exists():
+            self._refuse_recovery()
+        if _ownership.complete(self.stage) or not (proven or pending or initializing):
+            self._refuse_recovery()
+        shutil.rmtree(self.stage)
+        _sync_directory(self.stage.parent)
+        _LOG.warning("removed unpublished checkpoint stage %s", self.stage)
+
+    def _foreign_record(self, item):
+        name = Path(item["path"])
+        if name.is_absolute() or ".." in name.parts or name == Path("."):
+            self._refuse_recovery()
+        return name, tuple(item["identity"])
+
+    def _check_foreign_at_root(self, item):
+        name, expected = self._foreign_record(item)
+        if _entry_identity(self.root / name) != expected:
+            self._refuse_recovery()
+
+    def _recover_root_journal(self):
+        journal = self.root / JOURNAL_NAME
+        if not journal.is_file() or not _ownership.complete(self.root):
+            return
+        record = json.loads(journal.read_bytes())
+        if record["version"] != 1 or tuple(record["new_identity"]) != _identity(
+            self.root
+        ):
+            self._refuse_recovery()
+        for item in record["foreign"]:
+            self._check_foreign_at_root(item)
+        journal.unlink()
+        _sync_directory(self.root)
+        _LOG.warning("removed published checkpoint transaction journal %s", journal)
+
+    def _recover_foreign(self, journal):
+        record = json.loads(journal.read_bytes())
+        old = tuple(record["old_identity"]) if record["old_identity"] else None
+        actual = _identity(self.root) if os.path.lexists(self.root) else None
+        if record["version"] != 1 or old != actual:
+            self._refuse_recovery()
+        self._check(self.stage, tuple(record["new_identity"]))
+        for item in record["foreign"]:
+            self._restore_entry(*self._foreign_record(item))
+        return True
+
+    def _restore_entry(self, name, expected):
+        source, target = self.stage / name, self.root / name
+        if os.path.lexists(target) and _entry_identity(target) == expected:
+            return
+        if (
+            os.path.lexists(target)
+            or not os.path.lexists(source)
+            or _entry_identity(source) != expected
+        ):
+            self._refuse_recovery()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(target)
+        _sync_directory(source.parent)
+        _sync_directory(target.parent)
+
+    def _carry_foreign(self):
+        for name in self.foreign:
+            self._move_foreign(name)
+
+    def _move_foreign(self, name):
+        source, target = self.root / name, self.stage / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(target):
+            raise FileExistsError(f"checkpoint wrote a foreign entry: {name}")
+        source.rename(target)
+        _sync_directory(source.parent)
+        _sync_directory(target.parent)
+
+    def publish(self):
+        if self.rank != 0:
+            return
+        self._check(self.stage, self.new_identity)
+        _sync_tree(self.stage)
+        if self.old_identity is not None:
+            self._check(self.root, self.old_identity)
+            self._carry_foreign()
+            self._replace_existing()
+        else:
+            self._publish_new()
+        _sync_directory(self.root.parent)
+
+    def _publish_new(self):
+        if os.path.lexists(self.root):
+            raise FileExistsError(f"checkpoint appeared during save: {self.root}")
+        self.stage.rename(self.root)
+        self.published = True
+
+    def _replace_existing(self):
+        if os.path.lexists(self.backup):
+            raise FileExistsError(
+                f"checkpoint backup appeared during save: {self.backup}"
+            )
+        self.exchanged = _exchange(self.stage, self.root)
+        if self.exchanged:
+            self.published = True
+            return
+        self.root.rename(self.backup)
+        self.backed_up = True
+        self.stage.rename(self.root)
+        self.published = True
+
+    def _refresh_publication(self):
+        # A BaseException may arrive after a rename but before its flag assignment.
+        self.published = (
+            self.new_identity is not None
+            and self.root.exists()
+            and _identity(self.root) == self.new_identity
+        )
+        self.backed_up = (
+            self.old_identity is not None
+            and self.backup.exists()
+            and _identity(self.backup) == self.old_identity
+        )
+        self.exchanged = (
+            self.published
+            and self.stage.exists()
+            and _identity(self.stage) == self.old_identity
+        )
+
+    def rollback(self):
+        if self.rank != 0 or self.new_identity is None:
+            return
+        self._refresh_publication()
+        if self.published:
+            self._undo_publication()
+        if self.backed_up:
+            self._check(self.backup, self.old_identity)
+            self.backup.rename(self.root)
+            self.backed_up = False
+        if (self.stage / JOURNAL_NAME).is_file():
+            self._recover_foreign(self.stage / JOURNAL_NAME)
+        _sync_directory(self.root.parent)
+
+    def _undo_publication(self):
+        self._check(self.root, self.new_identity)
+        if self.exchanged:
+            self._restore_exchange()
+        else:
+            self.root.rename(self.stage)
+        self.published = False
+
+    def _restore_exchange(self):
+        self._check(self.stage, self.old_identity)
+        if not _exchange(self.stage, self.root):
+            raise OSError("directory exchange became unavailable during rollback")
+
+    def accept(self):
+        self.accepted = True
+
+    def close(self):
+        if self.rank != 0 or self.new_identity is None:
+            return
+        if not self.accepted:
+            self.rollback()
+        else:
+            self._finish_accepted()
+        obsolete = self.backup if self.backed_up else self.stage
+        expected = self.old_identity if self.accepted else self.new_identity
+        self._remove_obsolete(obsolete, expected)
+
+    def _finish_accepted(self):
+        try:
+            self._check(self.root, self.new_identity)
+            (self.root / JOURNAL_NAME).unlink(missing_ok=True)
+            _sync_directory(self.root)
+        except Exception as exc:
+            _LOG.warning(
+                "checkpoint committed but retained transaction journal at %s: %s",
+                self.root,
+                exc,
+            )
+
+    def _remove_obsolete(self, path, expected):
+        if expected is None or not os.path.lexists(path):
+            return
+        try:
+            self._check(path, expected)
+            shutil.rmtree(path)
+            _sync_directory(path.parent)
+        except Exception as exc:
+            _LOG.warning(
+                "checkpoint committed/aborted but retained sibling %s: %s", path, exc
+            )
+
+    @staticmethod
+    def _check(path, expected):
+        if expected is None or _identity(path) != expected:
+            raise OSError(f"checkpoint directory changed during save: {path}")

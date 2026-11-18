@@ -1,0 +1,10 @@
+{
+  "model_id": "Qwen/Qwen3-4B",
+  "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "url": "https://huggingface.co/Qwen/Qwen3-4B/resolve/1cfa9a7208912126459214e8b04321603b3df60c/config.json",
+  "api": "https://huggingface.co/api/models/Qwen/Qwen3-4B",
+  "sha256": "8ba006f74fecfaaeb392872a60f4a480e7ec9860153d2e1b769ec81f9a147f8a",
+  "bytes": 726,
+  "unmodified": true,
+  "fetched_pst": "2026-11-16T01:53:50.915290-08:00"
+}

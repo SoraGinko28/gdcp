@@ -1,0 +1,12 @@
+{
+  "model_id": "Qwen/Qwen2.5-14B",
+  "revision": "97e1e76335b7017d8f67c08a19d103c0504298c9",
+  "url": "https://huggingface.co/Qwen/Qwen2.5-14B/resolve/97e1e76335b7017d8f67c08a19d103c0504298c9/config.json",
+  "api": "https://huggingface.co/api/models/Qwen/Qwen2.5-14B",
+  "sha256": "fdb89460be9a6383451437cdf632a3e087522efa682265461f33507e7069f026",
+  "bytes": 664,
+  "model_type": "qwen2",
+  "config_path": "Meta-Device-DCP-Save-Load/configs/14b/config.json",
+  "fetched_pst": "2026-11-09T07:36:55.385834-08:00",
+  "unmodified": true
+}

@@ -1,0 +1,684 @@
+"""HF-layout safetensors with rank-local GDTensor I/O and native header loading.
+
+This module stays framework neutral. Torch-facing convenience functions import
+``adapters.hf`` only when called. No GDCP manifest is needed to read HF files.
+"""
+
+import hashlib
+import json
+import re
+import struct
+from dataclasses import replace
+from functools import partial
+from math import prod
+from pathlib import Path
+from typing import Any
+
+from gdtensor.access import DTensorDataAccessor
+from gdtensor.builder import (
+    DTensorTable,
+    Err,
+    GlobalTensorMeta,
+    NaiveDTensor,
+    NamedDTensor,
+    Ok,
+    Replicate,
+    StorageDTensorsView,
+)
+from gdtensor.io import rank_load, rank_save
+from gdtensor_conn._geometry import nonempty_columns
+from gdtensor_conn._layout import build_payload_index
+from gdtensor_conn.access import StorageDataAccessor
+from gdtensor_conn.formats import (
+    HF_INDEX_NAME,
+    LoadSessionBase,
+    SafeTensorsSaveSession,
+)
+from gdtensor_conn.iobackend import FileIO
+from gdtensor_conn.models import build_layout
+
+from . import core, desc
+from .backend import (
+    _InterruptIO,
+    _collective_begin,
+    _raise_io_interrupt,
+    _remember_io_interrupt,
+)
+from ._transaction import PREFLIGHT
+from .policy import PerRankPolicy, storage_mesh
+from .state import Component
+
+_DTYPES = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "I16": 2,
+    "I32": 4,
+    "I64": 8,
+    "F16": 2,
+    "BF16": 2,
+    "F32": 4,
+    "F64": 8,
+}
+_OBJECTS = "optimizer.json"
+
+
+def shard_size_bytes(value):
+    """Parse HF-style decimal GB/MB/KB or binary GiB/MiB/KiB limits."""
+    if value is None:
+        return None
+    if type(value) is int and value > 0:
+        return value
+    match = (
+        re.fullmatch(
+            r"\s*([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)\s*",
+            value,
+            re.IGNORECASE,
+        )
+        if isinstance(value, str)
+        else None
+    )
+    if not match:
+        raise ValueError(
+            "max_shard_size must be a positive byte count or size such as '5GB'"
+        )
+    unit = match[2].upper()
+    power = 0 if unit == "B" else "KMGT".index(unit[0]) + 1
+    size = int(float(match[1]) * (1024 if "I" in unit else 1000) ** power)
+    if size < 1:
+        raise ValueError("max_shard_size must be positive")
+    return size
+
+
+def _file_assignment(table, max_shard_size):
+    limit = shard_size_bytes(max_shard_size)
+    groups, current, size = [], [], 0
+    for named in table.named_d_tensors:
+        meta = named.d_tensor.global_tensor_meta
+        nbytes = prod(meta.global_shape) * meta.itemsize
+        if limit is not None and current and size + nbytes > limit:
+            groups.append(current)
+            current, size = [], 0
+        current.append(named.global_tensor_id)
+        size += nbytes
+        if limit is not None and size > limit:
+            groups.append(current)
+            current, size = [], 0
+    if current or not groups:
+        groups.append(current)
+    count = len(groups)
+    return {
+        key: "model.safetensors"
+        if count == 1
+        else f"model-{i + 1:05d}-of-{count:05d}.safetensors"
+        for i, group in enumerate(groups)
+        for key in group
+    }
+
+
+class _CombinedAccessor(DTensorDataAccessor):
+    def __init__(self, routes):
+        self.routes = routes
+        self._active: DTensorDataAccessor | None = None
+
+    def _call(self, method, rng, callback):
+        accessor, key = self.routes[rng.global_tensor_id]
+        if self._active is not accessor:
+            getattr(self._active, "finish", lambda: None)()
+            self._active = accessor
+        return getattr(accessor, method)(replace(rng, global_tensor_id=key), callback)
+
+    def read_to_buffer(self, global_range, read_to_buffer):
+        return self._call("read_to_buffer", global_range, read_to_buffer)
+
+    def write_from_buffer(self, global_range, write_from_buffer):
+        return self._call("write_from_buffer", global_range, write_from_buffer)
+
+    def finish(self):
+        accessors = {id(accessor): accessor for accessor, _key in self.routes.values()}
+        for accessor in accessors.values():
+            getattr(accessor, "finish", lambda: None)()
+        self._active = None
+
+
+def _combined_entry(component, named, available):
+    prefix = "" if component.name == "model" else component.name + "."
+    key = prefix + named.global_tensor_id
+    aliases = [prefix + alias for alias in named.alias]
+    if available is not None and key not in available:
+        found = [alias for alias in aliases if alias in available]
+        key = found[0] if found else key
+    return NamedDTensor(key, named.d_tensor, aliases)
+
+
+def _combined(state, available=None):
+    entries, routes, logical, objects = [], {}, {}, {}
+    for component in state.components:
+        objects[component.name] = component.objects
+        for named in component.table.named_d_tensors:
+            entry = _combined_entry(component, named, available)
+            key = entry.global_tensor_id
+            entries.append(entry)
+            routes[key] = component.accessor, named.global_tensor_id
+            logical[key] = component.logical_shapes.get(
+                named.global_tensor_id,
+                list(named.d_tensor.global_tensor_meta.global_shape),
+            )
+    if len(entries) != len(routes):
+        raise ValueError("duplicate HF tensor name")
+    combined = Component("hf", DTensorTable(entries), _CombinedAccessor(routes))
+    combined.logical_shapes = logical
+    return combined, objects
+
+
+class _HFSaveSession(SafeTensorsSaveSession):
+    def __init__(self, *args, assignment, logical_shapes, **kwargs):
+        self.assignment = assignment
+        self.logical_shapes = logical_shapes
+        super().__init__(*args, **kwargs)
+
+    def my_files(self):
+        paths = set(super().my_files())
+        if self.rank == 0:
+            paths.update(self.assignment.values())
+        return sorted(paths)
+
+    def _header(self, path):
+        if path in self._headers:
+            return self._headers[path]
+        header: dict[str, Any] = {"__metadata__": {"format": "pt"}}
+        offset = 0
+        entries = [
+            named
+            for named in self.table.named_d_tensors
+            if self.assignment[named.global_tensor_id] == path
+        ]
+        for named in entries:
+            key = named.global_tensor_id
+            meta = named.d_tensor.global_tensor_meta
+            size = prod(meta.global_shape) * meta.itemsize
+            header[key] = {
+                "dtype": meta.dtype,
+                "shape": self.logical_shapes.get(key, list(meta.global_shape)),
+                "data_offsets": [offset, offset + size],
+            }
+            offset += size
+        raw = json.dumps(header, separators=(",", ":")).encode()
+        raw += b" " * (-len(raw) % 8)
+        self._headers[path] = struct.pack("<Q", len(raw)) + raw
+        return self._headers[path]
+
+    def _open_file(self, path):
+        if path in self.index.files:
+            return super()._open_file(path)
+        header = self._header(path)
+        self.data_start[path] = len(header)
+        self.io.create_staging(self.abspath(path), len(header))
+        if self.rank == 0:
+            self.io.pwrite(self.rank, self.abspath(path), 0, header)
+
+    def _leader_files(self):
+        files = [
+            path
+            for path in self.my_files()
+            if path in self.index.files
+            and self.index.files[path].leader.rank == self.rank
+        ]
+        if self.rank == 0:
+            files += sorted(set(self.assignment.values()) - self.index.files.keys())
+        return files
+
+    def _after_barrier(self):
+        return _remember_io_interrupt(self.io, self._write_completion)
+
+    def _write_completion(self):
+        if self.rank != 0:
+            return
+        if len(set(self.assignment.values())) > 1:
+            total = sum(
+                prod(named.d_tensor.global_tensor_meta.global_shape)
+                * named.d_tensor.global_tensor_meta.itemsize
+                for named in self.table.named_d_tensors
+            )
+            desc.atomic_write(
+                Path(self.root) / HF_INDEX_NAME,
+                desc.json_bytes(
+                    {"metadata": {"total_size": total}, "weight_map": self.assignment}
+                ),
+            )
+        # This optional connector marker is for atomic publication only. HF
+        # reading itself depends solely on the standard headers and index.
+        desc.atomic_write(
+            Path(self.root) / ".gdtensor_committed",
+            desc.json_bytes(
+                {
+                    "format": "safetensors",
+                    "files": sorted(set(self.assignment.values())),
+                }
+            ),
+        )
+
+
+class _HFLoadSession(LoadSessionBase):
+    def __init__(self, *args, headers, **kwargs):
+        self.headers = headers
+        super().__init__(*args, **kwargs)
+
+    def _read_file_offsets(self, path):
+        for slot in self.index.files[path].slots:
+            self.offsets[slot.pos] = self.headers[slot.pos.tensor_id]["offset"]
+
+
+def _begin_hf_session(session_type, arguments, options, view, rank):
+    try:
+        return Ok(session_type(rank, *arguments, **options))
+    except Exception as exc:
+        return core._error("HF begin session", exc)
+
+
+class HFBackend:
+    """Shared-file safetensors storage; no rank assembles global tensors."""
+
+    def __init__(self, assignment, logical_shapes=None, headers=None):
+        self.assignment = assignment
+        self.logical_shapes = logical_shapes or {}
+        self.headers = headers
+
+    def open(self, root, table, layout, coordinator=None):
+        io = _InterruptIO(FileIO())
+        index = build_payload_index(table, layout)
+        ids = [named.global_tensor_id for named in table.named_d_tensors]
+
+        arguments = str(root), table, layout, index, io
+        save_options = dict(
+            coord=coordinator,
+            assignment=self.assignment,
+            logical_shapes=self.logical_shapes,
+        )
+        begin_save = partial(_begin_hf_session, _HFSaveSession, arguments, save_options)
+        begin_load = partial(
+            _begin_hf_session, _HFLoadSession, arguments, dict(headers=self.headers)
+        )
+        return StorageDTensorsView(
+            ids,
+            table,
+            StorageDataAccessor(index, io),
+            layout,
+            _collective_begin(begin_save, coordinator) if coordinator else begin_save,
+            begin_load,
+        )
+
+
+def _group_storage_rows(combined, table):
+    # Preserve the policy's stored owners, then keep equal column runs adjacent.
+    # Both views need the same header order. Reordering the compute rows can
+    # rotate a replicated tensor's designated source writer; every replica has
+    # the same value, and its single stored slot is unchanged.
+    rows = sorted(
+        zip(combined.table.named_d_tensors, table.named_d_tensors, strict=True),
+        key=lambda row: tuple(nonempty_columns(row[1])),
+    )
+    combined = replace(combined, table=DTensorTable([row[0] for row in rows]))
+    return combined, DTensorTable([row[1] for row in rows])
+
+
+def _save_prepare(path, state, ctx, max_shard_size):
+    core._validate_context(ctx)
+    core._validate_state(state)
+    combined, objects = _combined(state)
+    table, _layout = PerRankPolicy().plan(combined, ctx.world_size)
+    combined, table = _group_storage_rows(combined, table)
+    compute = core._compute_view(combined)
+    core._require(compute.check_constraints())
+    assignment = _file_assignment(table, max_shard_size)
+    layout = build_layout(
+        table,
+        ctx.world_size,
+        "safetensors",
+        lambda order, rank, named: assignment[named.global_tensor_id],
+    )
+    storage = HFBackend(assignment, combined.logical_shapes).open(
+        path, table, layout, ctx.coordinator
+    )
+    core._require(storage.check_constraints())
+    return combined, objects, compute, storage
+
+
+def _run_io(call, ctx, combined, compute, storage):
+    try:
+        result = call(ctx.rank, compute, storage)
+        _raise_io_interrupt(storage)
+        return result
+    finally:
+        _finish_accessor(combined)
+
+
+def _initialize(transaction, state, ctx, objects, assignment, write_metadata):
+    planned = {Path(name) for name in assignment.values()}
+    planned.update(core._planned_rank_files(state, ctx))
+    planned.update({Path(_OBJECTS), Path(".gdtensor_committed")})
+    # A foreign index would take precedence over the newly written single file.
+    planned.add(Path(HF_INDEX_NAME))
+    if write_metadata is not None:
+        planned.add(Path("config.json"))
+    transaction.begin(planned)
+    if ctx.rank == 0:
+        root = transaction.stage
+        root.mkdir(parents=True, exist_ok=True)
+        desc.atomic_write(root / desc.PENDING_NAME, b"HF save in progress\n")
+        for name in state.rank_state:
+            (root / name).mkdir(parents=True, exist_ok=True)
+        desc.write_objects(root / _OBJECTS, objects)
+
+
+def _finish_accessor(combined):
+    combined.accessor.finish()
+
+
+def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
+    path = transaction.stage
+    prepared = core._collective(
+        ctx, "HF prepare save", lambda: _save_prepare(path, state, ctx, max_shard_size)
+    )
+    if type(prepared) is Err:
+        return prepared
+    assert prepared.value is not None
+    combined, objects, compute, storage = prepared.value
+    result = core._collective(
+        ctx,
+        PREFLIGHT,
+        lambda: _initialize(
+            transaction,
+            state,
+            ctx,
+            objects,
+            _file_assignment(storage.d_tensor_table, max_shard_size),
+            write_metadata,
+        ),
+    )
+    if type(result) is Err:
+        return result
+    if write_metadata is not None:
+        result = core._collective(ctx, "HF metadata", lambda: write_metadata(path))
+        if type(result) is Err:
+            return result
+    result = core._collective(
+        ctx, "HF rank state", lambda: core._save_rank_state(path, state, ctx)
+    )
+    if type(result) is Err:
+        return result
+    result = core._collective(
+        ctx, "HF save", lambda: _run_io(rank_save, ctx, combined, compute, storage)
+    )
+    if type(result) is Err:
+        return result
+    return core._collective(
+        ctx,
+        "HF publish",
+        lambda: _finalize(path, state, ctx),
+    )
+
+
+def _finalize(path, state, ctx):
+    if ctx.rank != 0:
+        return
+    marker = Path(path) / ".gdtensor_committed"
+    saved = json.loads(marker.read_bytes())
+    saved["rank_state"] = {
+        name: {
+            "ranks": list(range(ctx.world_size)),
+            "pattern": f"{name}_rank_{{rank}}.pt",
+        }
+        for name in state.rank_state
+    }
+    desc.atomic_write(marker, desc.json_bytes(saved))
+    (Path(path) / desc.PENDING_NAME).unlink()
+
+
+def save_state(path, state, ctx, *, max_shard_size=None, _write_metadata=None):
+    """Save HF files in a sibling, preserving the old checkpoint on failure."""
+    return core._transactional_save(
+        path,
+        ctx,
+        lambda transaction: _save_staged(
+            transaction, state, ctx, max_shard_size, _write_metadata
+        ),
+    )
+
+
+def _read_header_file(path):
+    with path.open("rb") as file:
+        prefix = file.read(8)
+        if len(prefix) != 8:
+            raise ValueError(f"{path.name}: truncated safetensors header")
+        length = struct.unpack("<Q", prefix)[0]
+        if length > 100_000_000:
+            raise ValueError(f"{path.name}: safetensors header exceeds 100 MB")
+        raw = file.read(length)
+    if len(raw) != length:
+        raise ValueError(f"{path.name}: truncated safetensors header")
+    return length, json.loads(raw)
+
+
+def _header_entry(filename, name, entry, length):
+    shape, dtype, offsets = entry["shape"], entry["dtype"], entry["data_offsets"]
+    if (
+        dtype not in _DTYPES
+        or not isinstance(shape, list)
+        or any(type(dim) is not int or dim < 0 for dim in shape)
+    ):
+        raise ValueError(f"{filename}: invalid metadata for {name}")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != 2
+        or any(type(value) is not int for value in offsets)
+    ):
+        raise ValueError(f"{filename}: invalid offsets for {name}")
+    nbytes = prod(shape) * _DTYPES[dtype]
+    if offsets[0] < 0 or offsets[1] - offsets[0] != nbytes:
+        raise ValueError(f"{filename}: tensor size mismatch for {name}")
+    return {
+        "shape": shape,
+        "dtype": dtype,
+        "itemsize": _DTYPES[dtype],
+        "file": filename,
+        "offset": 8 + length + offsets[0],
+    }, (offsets[0], offsets[1], name)
+
+
+def _add_header_file(root, filename, weight_map, headers):
+    desc._safe_relative(filename)
+    length, document = _read_header_file(root / filename)
+    entries = []
+    for name, entry in document.items():
+        if name == "__metadata__":
+            continue
+        if name in headers:
+            raise ValueError(f"duplicate HF tensor {name}")
+        if weight_map is not None and weight_map.get(name) != filename:
+            raise ValueError(f"HF index does not match header for {name}")
+        headers[name], span = _header_entry(filename, name, entry, length)
+        entries.append(span)
+    expected = 0
+    for start, end, name in sorted(entries):
+        if start != expected:
+            raise ValueError(f"{filename}: noncontiguous/overlapping payload at {name}")
+        expected = end
+    if (root / filename).stat().st_size != 8 + length + expected:
+        raise ValueError(f"{filename}: payload size does not match header")
+
+
+def read_headers(path):
+    """Validate a native HF single file/index and describe all tensor byte ranges."""
+    root = Path(path)
+    if (root / desc.PENDING_NAME).exists():
+        raise ValueError("HF checkpoint has an incomplete save (.gdcp_pending)")
+    index_file = root / HF_INDEX_NAME
+    weight_map = (
+        json.loads(index_file.read_bytes())["weight_map"]
+        if index_file.is_file()
+        else None
+    )
+    if weight_map is not None and (not isinstance(weight_map, dict) or not weight_map):
+        raise ValueError("HF weight_map must be a nonempty mapping")
+    files = (
+        sorted(set(weight_map.values()))
+        if weight_map is not None
+        else ["model.safetensors"]
+    )
+    headers = {}
+    for filename in files:
+        _add_header_file(root, filename, weight_map, headers)
+    if weight_map is not None and set(weight_map) != set(headers):
+        raise ValueError("HF index tensor set does not match safetensors headers")
+    return headers
+
+
+def _read_payload_part(file, count):
+    data = file.read(count)
+    if not data:
+        raise ValueError("truncated HF tensor payload")
+    return data
+
+
+def _payload_digest(path, entry):
+    remaining = prod(entry["shape"]) * entry["itemsize"]
+    digest = hashlib.sha256()
+    with (Path(path) / entry["file"]).open("rb") as file:
+        file.seek(entry["offset"])
+        while remaining:
+            data = _read_payload_part(file, min(remaining, 16 * 1024**2))
+            digest.update(data)
+            remaining -= len(data)
+    return digest.hexdigest()
+
+
+def _validate_keys(path, combined, headers):
+    expected = {named.global_tensor_id for named in combined.table.named_d_tensors}
+    missing = expected - headers.keys()
+    if missing:
+        raise ValueError(f"HF missing key {sorted(missing)[0]}")
+    aliases = {
+        alias: named.global_tensor_id
+        for named in combined.table.named_d_tensors
+        for alias in named.alias
+    }
+    unexpected = headers.keys() - expected
+    for alias in unexpected & aliases.keys():
+        canonical = aliases[alias]
+        left, right = headers[alias], headers[canonical]
+        if any(
+            left[field] != right[field] for field in ("shape", "dtype", "itemsize")
+        ) or _payload_digest(path, left) != _payload_digest(path, right):
+            raise ValueError(f"HF tied alias {alias} differs from {canonical}")
+    unexpected -= aliases.keys()
+    if not any(key.startswith("optimizer.") for key in expected):
+        unexpected = {key for key in unexpected if not key.startswith("optimizer.")}
+    if unexpected:
+        raise ValueError(f"HF unexpected key {sorted(unexpected)[0]}")
+
+
+def _load_prepare(path, state, ctx):
+    core._validate_context(ctx)
+    core._validate_state(state)
+    headers = read_headers(path)
+    combined, _objects = _combined(state, headers)
+    _validate_keys(path, combined, headers)
+    entries = []
+    for named in combined.table.named_d_tensors:
+        key, meta = named.global_tensor_id, named.d_tensor.global_tensor_meta
+        saved = headers[key]
+        logical = combined.logical_shapes.get(key, list(meta.global_shape))
+        if (
+            logical != saved["shape"]
+            or meta.dtype != saved["dtype"]
+            or meta.itemsize != saved["itemsize"]
+        ):
+            raise ValueError(f"HF shape/dtype mismatch for {key}")
+        entries.append(
+            NamedDTensor(
+                key,
+                NaiveDTensor(
+                    GlobalTensorMeta(
+                        saved["shape"] or [1], saved["dtype"], saved["itemsize"]
+                    ),
+                    [Replicate()],
+                    storage_mesh(1, [0]),
+                ),
+            )
+        )
+    table = DTensorTable(entries)
+    assignment = {key: info["file"] for key, info in headers.items()}
+    layout = build_layout(
+        table,
+        1,
+        "safetensors",
+        lambda order, rank, named: assignment[named.global_tensor_id],
+    )
+    storage = HFBackend(assignment, headers=headers).open(
+        path, table, layout, ctx.coordinator
+    )
+    compute = core._compute_view(combined)
+    core._require(compute.check_constraints())
+    core._require(storage.check_constraints())
+    objects_file = Path(path) / _OBJECTS
+    objects = desc.read_objects(objects_file) if objects_file.is_file() else {}
+    if (
+        any(component.name == "optimizer" for component in state.components)
+        and "optimizer" not in objects
+    ):
+        raise ValueError("HF full-state checkpoint is missing optimizer.json")
+    blobs = {}
+    for name in state.rank_state:
+        filename = Path(path) / name / f"{name}_rank_{ctx.rank}.pt"
+        if not filename.is_file():
+            filename = filename.with_name(f"{name}_rank_0.pt")
+        blobs[name] = filename.read_bytes()
+    return combined, compute, storage, objects, blobs
+
+
+def load_state(path, state, ctx):
+    """Load native HF headers directly, including an optional optimizer sidecar."""
+    prepared = core._collective(
+        ctx, "HF prepare load", lambda: _load_prepare(path, state, ctx)
+    )
+    if type(prepared) is Err:
+        return prepared
+    assert prepared.value is not None
+    combined, compute, storage, objects, blobs = prepared.value
+    result = core._collective(
+        ctx, "HF load", lambda: _run_io(rank_load, ctx, combined, compute, storage)
+    )
+    if type(result) is Err:
+        return result
+    for component in state.components:
+        if component.name in objects:
+            component.objects.clear()
+            component.objects.update(objects[component.name])
+    state.rank_state.update(blobs)
+    return core._collective(ctx, "HF load complete", lambda: None)
+
+
+def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
+    """Export HF weights; fp32 uses supplied optimizer master weights when present.
+
+    ``model_or_state`` is a module, a tensor mapping, or a checkpoint mapping
+    containing ``model`` and optionally ``optimizer``. ``dtype`` accepts
+    ``'fp32'`` or ``'bf16'``. ``max_shard_size=None`` emits one file; otherwise
+    a positive byte count or an HF-style limit such as ``'5GB'`` is accepted.
+    """
+    from .adapters.hf import save_hf as save
+
+    return save(path, model_or_state, dtype=dtype, max_shard_size=max_shard_size)
+
+
+def load_hf(path, model_or_state, dtype=None):
+    """Restore HF weights in place into a module or tensor/checkpoint mapping.
+
+    ``dtype`` optionally selects ``'fp32'`` optimizer master tensors or
+    ``'bf16'`` model parameters in a checkpoint mapping. With ``None`` it is
+    inferred from the file. Shapes and dtypes must match exactly.
+    """
+    from .adapters.hf import load_hf as load
+
+    return load(path, model_or_state, dtype=dtype)
