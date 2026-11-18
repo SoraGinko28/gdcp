@@ -511,6 +511,7 @@ class DcpBackend:
 
 
 def read_metadata(root):
+    """Read a trusted checkpoint explicitly selected for loading, as PyTorch does."""
     with open(Path(root) / ".metadata", "rb") as handle:
         metadata = pickle.load(handle)
     if not isinstance(metadata, Metadata):

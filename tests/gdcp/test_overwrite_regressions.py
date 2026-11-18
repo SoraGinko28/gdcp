@@ -1,12 +1,14 @@
 """Directory overwrite ownership, preflight, recovery and symlink regressions."""
 
+import builtins
 import json
 import os
+import pickle
 from pathlib import Path
 
 import pytest
 
-from gdcp import _transaction, desc, hf
+from gdcp import _transaction, desc, hf, inspect
 from gdcp.state import RankContext
 from gdtensor.builder import Err
 from gdtensor_conn.iobackend import FileIO
@@ -465,6 +467,112 @@ def test_native_dcp_metadata_owns_recorded_files_without_gdcp_manifest(tmp_path)
     assert not old_rank.exists()
     assert foreign.read_bytes() == b"unrecorded foreign DCP-like filename"
     _assert_generation("dcp", root, new, world=1)
+
+
+def _native_dcp_with_unrecognized_planner_data(root):
+    if not os.environ.get("GDTENSOR_TORCH_TESTS"):
+        pytest.skip("set GDTENSOR_TORCH_TESTS=1")
+    from torch.distributed.checkpoint.filesystem import _StorageInfo
+    from torch.distributed.checkpoint.metadata import Metadata, MetadataIndex
+
+    root.mkdir(parents=True)
+    payload = b"keep these bytes"
+    (root / "old.distcp").write_bytes(payload)
+    # A range is harmless but requires resolving a global outside DCP's schema.
+    metadata = Metadata(
+        {},
+        planner_data=range(1),
+        storage_data={
+            MetadataIndex("weight"): _StorageInfo("old.distcp", 0, len(payload))
+        },
+    )
+    (root / ".metadata").write_bytes(pickle.dumps(metadata, protocol=4))
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("component", [False, True], ids=["root", "component"])
+def test_unrecognized_native_dcp_metadata_claims_no_entries(tmp_path, fmt, component):
+    root = tmp_path / "checkpoint"
+    directory = root / "model" if component else root
+    _native_dcp_with_unrecognized_planner_data(directory)
+    before = _files(root)
+
+    results = _run(fmt, root, _fixture(world=1))
+
+    if component and fmt != "hf":
+        _assert_errors(results, "conflicts with foreign entry:")
+        assert _files(root) == before
+    else:
+        assert_ok(results)
+        for name, data in before.items():
+            assert (root / name).read_bytes() == data
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("failure", ["unreadable", "missing module"])
+def test_native_dcp_metadata_read_errors_leave_all_entries_foreign(
+    tmp_path, monkeypatch, fmt, failure
+):
+    root = tmp_path / "checkpoint"
+    root.mkdir()
+    metadata = root / ".metadata"
+    data = pickle.dumps(range, protocol=0).replace(
+        b"__builtin__", b"missing_dcp_module"
+    )
+    metadata.write_bytes(data)
+    reads, imports = [], []
+    original_open, original_import = builtins.open, builtins.__import__
+
+    def open_file(path, *args, **kwargs):
+        if path == metadata:
+            reads.append(path)
+            # Inject the OS error so the test works with elevated privileges.
+            if failure == "unreadable":
+                raise PermissionError("unreadable metadata")
+        return original_open(path, *args, **kwargs)
+
+    def import_module(name, *args, **kwargs):
+        if name == "missing_dcp_module":
+            imports.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", open_file)
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    assert type(inspect(root)) is Err  # Native DCP has no GDCP manifest.
+    assert not reads
+    assert_ok(_run(fmt, root, _fixture(world=1)))
+    assert reads
+    assert not imports
+    assert metadata.read_bytes() == data
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_recovery_preserves_unrecognized_native_dcp_backup(tmp_path, fmt):
+    root = tmp_path / "checkpoint"
+    backup = tmp_path / ".checkpoint.gdcp-backup"
+    _native_dcp_with_unrecognized_planner_data(backup)
+    before = _files(backup)
+
+    _assert_errors(
+        _run(fmt, root, _fixture(world=1)), "unrecognized/incomplete directory"
+    )
+    assert _files(backup) == before
+    assert not root.exists()
+
+
+def test_native_torch_dcp_metadata_still_establishes_ownership(tmp_path):
+    if not os.environ.get("GDTENSOR_TORCH_TESTS"):
+        pytest.skip("set GDTENSOR_TORCH_TESTS=1")
+    import torch
+    from torch.distributed.checkpoint import save as native_save
+
+    root = tmp_path / "checkpoint"
+    native_save({"weight": torch.ones(2)}, checkpoint_id=root, no_dist=True)
+    old_files = set(_files(root))
+    assert ".metadata" in old_files
+
+    assert_ok(_run("hf", root, _fixture(world=1)))
+    assert old_files.isdisjoint(_files(root))
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)

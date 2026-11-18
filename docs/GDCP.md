@@ -57,6 +57,14 @@ state cannot establish ownership of those files: they are preserved as foreign,
 and an attempt to rewrite their names is rejected. New HF completion markers
 record the exact rank-state mapping.
 
+Save preflight and recovery read native DCP `.metadata` as data without invoking
+pickle constructors or importing modules named by the file. Unreadable,
+malformed, or unsupported native metadata establishes no ownership, so every
+entry in that candidate checkpoint is foreign. Such metadata cannot establish
+that a generation is complete for recovery. `inspect` reads only the JSON
+manifest. Explicit DCP loads use pickle for native metadata, as PyTorch does.
+Only load DCP checkpoints you trust.
+
 The old checkpoint receives no payload writes. After every rank completes the
 new generation, rank 0 syncs its directories, moves foreign entries by rename
 into the stage, and publishes. Foreign directory trees are neither copied nor

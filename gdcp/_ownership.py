@@ -2,11 +2,11 @@
 
 import json
 import os
-import pickle
 import struct
 from pathlib import Path
 
 from . import desc
+from ._dcp_metadata import read_storage_records
 
 _INDEX = "model.safetensors.index.json"
 _MARKER = ".gdtensor_committed"
@@ -67,15 +67,11 @@ def _component_files(root, component, prefix):
 
 
 def _dcp_files(root):
-    # Native DCP metadata is pickled, just as in GDCP's native loader. Import
-    # torch only for this format; framework-neutral imports remain torch-free.
-    from .adapters.dcp import read_metadata
-
-    saved = read_metadata(root)
+    records = read_storage_records(root)
     files = {Path(".metadata")}
     if os.path.lexists(root / "objects.json"):
         files.add(Path("objects.json"))
-    files.update(_name(record.relative_path) for record in saved.storage_data.values())
+    files.update(_name(record.relative_path) for record in records)
     return files
 
 
@@ -122,12 +118,11 @@ def _inventory(root):
     try:
         return _recorded_inventory(root)
     except (
+        OSError,
         ValueError,
         KeyError,
         TypeError,
         AttributeError,
-        EOFError,
-        pickle.UnpicklingError,
     ):
         # Metadata with no recognizable checkpoint signature is foreign too.
         # Any new file at the same name must therefore fail collision checking.
@@ -204,13 +199,10 @@ def _entry_end(value):
 
 
 def _dcp_complete(root):
-    from .adapters.dcp import read_metadata
-
-    saved = read_metadata(root)
     return all(
         (root / _name(record.relative_path)).stat().st_size
         >= record.offset + record.length
-        for record in saved.storage_data.values()
+        for record in read_storage_records(root)
     )
 
 
@@ -244,9 +236,9 @@ def _manifest_complete(root):
 def complete(root):
     """Conservatively identify a complete generation using metadata and stats."""
     root = Path(root)
-    if not root.is_dir() or (root / desc.PENDING_NAME).exists():
-        return False
     try:
+        if not root.is_dir() or (root / desc.PENDING_NAME).exists():
+            return False
         return _complete(root)
     except (
         OSError,
@@ -254,9 +246,6 @@ def complete(root):
         KeyError,
         TypeError,
         AttributeError,
-        EOFError,
-        ImportError,
-        pickle.UnpicklingError,
     ):
         return False
 

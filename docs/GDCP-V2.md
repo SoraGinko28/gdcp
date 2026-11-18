@@ -11,9 +11,13 @@ The synchronous `FSDP2Checkpointer` retains every positional parameter and defau
 `load(path, checkpoint_state, ...)` detects HF files/indexes at the root, native DCP `.metadata` in component directories, and the GDCP per-rank safetensors manifest. It does not take a format option.
 
 ```python
-FSDP2Checkpointer.save(path, {"model": model, "optimizer": optimizer}, checkpoint_format="dcp")
+FSDP2Checkpointer.save(
+    path, {"model": model, "optimizer": optimizer}, checkpoint_format="dcp"
+)
 FSDP2Checkpointer.load(path, {"model": model, "optimizer": optimizer})
-gdcp.save_hf(path, {"model": model, "optimizer": optimizer}, dtype="fp32", max_shard_size="5GB")
+gdcp.save_hf(
+    path, {"model": model, "optimizer": optimizer}, dtype="fp32", max_shard_size="5GB"
+)
 gdcp.load_hf(path, model)
 ```
 
@@ -48,6 +52,12 @@ Automatic recovery assumes no other save to the same path is running. An overwri
 still needs space for both generations; accepted obsolete cleanup may leave a
 retained sibling. New HF completion markers also record exact rank-state file
 ownership; unrecorded legacy rank-state names remain foreign.
+
+Save preflight and recovery read native DCP `.metadata` as data. Unreadable,
+malformed, or unsupported metadata establishes no native DCP ownership or
+completeness for recovery. `inspect` reads only the JSON manifest. Explicit DCP
+loads use pickle for native metadata, as PyTorch does. Only load DCP checkpoints
+you trust.
 
 HF save groups rows with compatible storage columns before building its shared
 file layout. Rectangle count is bounded by the number of column groups rather
