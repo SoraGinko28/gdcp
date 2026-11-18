@@ -748,11 +748,11 @@ def _native_chunks(tensor_id, item):
     return nonempty
 
 
-def _native_objects(root, metadata, component):
+def _native_objects(root, metadata, component, flat=None):
     assert metadata.storage_data is not None
-    flat = {}
+    flat = {} if flat is None else flat
     for key, item in metadata.state_dict_metadata.items():
-        if isinstance(item, BytesStorageMetadata):
+        if isinstance(item, BytesStorageMetadata) and key not in flat:
             flat[key] = _read_object(root, metadata.storage_data[MetadataIndex(key)])
     if not flat:
         return {
@@ -830,9 +830,10 @@ def _validate_native_alias(metadata, key, owner, records, aliases):
         raise ValueError(f"native DCP tied parameter aliases differ for {key}")
 
 
-def read_component(root, component):
+def read_component(root, component, *, metadata=None, load_objects=None):
     """Build the storage table from native metadata, without a GDCP manifest."""
-    metadata = read_metadata(root)
+    if metadata is None:
+        metadata = read_metadata(root)
     wanted = {
         named.global_tensor_id: named for named in component.table.named_d_tensors
     }
@@ -870,11 +871,13 @@ def read_component(root, component):
         paths[key]: _native_records(metadata, key, item, chunks[key])
         for key, item in items
     }
-    objects = (
-        desc.read_objects(Path(root) / "objects.json")
-        if (Path(root) / "objects.json").exists()
-        else _native_objects(root, metadata, component)
-    )
+    sidecar = Path(root) / "objects.json"
+    if load_objects is not None:
+        objects = load_objects()
+    elif sidecar.exists():
+        objects = desc.read_objects(sidecar)
+    else:
+        objects = _native_objects(root, metadata, component)
     logical = {key: [] for key, item in items if len(item.size) == 0}
     return table, layout, objects, logical, world, records
 
@@ -895,7 +898,36 @@ def _native_records(metadata, key, item, chunks):
     return records
 
 
-def _prepare_native(path, state, ctx):
+def _native_membership_path(path):
+    # Torch can store the whole group list or flatten each group's fields.
+    return path[0] == "param_groups" and (len(path) < 3 or path[2] == "params")
+
+
+def _native_optimizer_objects(root, component, validate_groups):
+    metadata = read_metadata(root)
+    sidecar = root / "objects.json"
+    if sidecar.exists():
+        objects = desc.read_objects(sidecar)
+        core._validate_load_call(lambda: validate_groups(objects.get("param_groups")))
+        return metadata, lambda: objects
+
+    assert metadata.storage_data is not None
+    paths = {
+        key: metadata.planner_data[key]
+        for key, item in metadata.state_dict_metadata.items()
+        if isinstance(item, BytesStorageMetadata)
+        and _native_membership_path(metadata.planner_data[key])
+    }
+    flat = {
+        key: _read_object(root, metadata.storage_data[MetadataIndex(key)])
+        for key in paths
+    }
+    groups = unflatten_state_dict(flat, paths).get("param_groups")
+    core._validate_load_call(lambda: validate_groups(groups))
+    return metadata, lambda: _native_objects(root, metadata, component, flat)
+
+
+def _prepare_native_metadata(path, state, ctx, validate_groups):
     core._validate_context(ctx)
     core._validate_state(state)
     if state.rank_state:
@@ -903,11 +935,23 @@ def _prepare_native(path, state, ctx):
         raise ValueError(
             f"native DCP has no GDCP per-rank extra_state (requested {key!r})"
         )
+    if validate_groups is not None:
+        optimizer = next(c for c in state.components if c.name == "optimizer")
+        return _native_optimizer_objects(
+            Path(path) / optimizer.name, optimizer, validate_groups
+        )
+    return None, None
+
+
+def _prepare_native(path, state, ctx, optimizer):
     prepared = []
     for component in state.components:
         root = Path(path) / component.name
+        metadata, load_objects = (
+            optimizer if component.name == "optimizer" else (None, None)
+        )
         table, layout, objects, logical, world, records = read_component(
-            root, component
+            root, component, metadata=metadata, load_objects=load_objects
         )
         saved = desc.describe_component(table, layout, world, logical_shapes=logical)
         core._strict_tensors(component, saved, False)
@@ -930,7 +974,7 @@ def _has_manifest(path):
     return (Path(path) / desc.MANIFEST_NAME).exists()
 
 
-def load(path, state, ctx, *, _preflight=None):
+def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     manifest = core._collective_choice(
         ctx, "DCP load format", lambda: _has_manifest(path), (True, False)
     )
@@ -941,8 +985,19 @@ def load(path, state, ctx, *, _preflight=None):
     agreed = core._agree_components(state, ctx)
     if type(agreed) is Err:
         return agreed
+    # Native DCP stores membership in byte records alongside optimizer state.
+    # Vote on membership before any rank deserializes the remaining records.
+    checked = core._collective(
+        ctx,
+        "validate native DCP metadata",
+        lambda: _prepare_native_metadata(path, state, ctx, _validate_groups),
+    )
+    if type(checked) is Err:
+        return checked
     prepared = core._collective(
-        ctx, "prepare native DCP load", lambda: _prepare_native(path, state, ctx)
+        ctx,
+        "prepare native DCP load",
+        lambda: _prepare_native(path, state, ctx, checked.value),
     )
     if type(prepared) is Err:
         return prepared

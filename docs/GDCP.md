@@ -200,7 +200,10 @@ options and order, and fills each group's `param_names` with the corresponding
 fully qualified model names in `params` order. This also applies to unnamed
 optimizers, and a subsequent save records the restored names. AdamW moments
 and steps follow their parameters. Incompatible or ambiguous group membership
-fails on all ranks before tensor or extra-state payload reads.
+fails on all ranks before tensor or extra-state payload reads. When loading
+Torch-written native DCP, GDCP reads the group membership metadata first. Every
+rank must pass the group check before GDCP reads scalar optimizer state or
+separately stored group options.
 
 Tensor payloads are streamed into the target. An I/O error during those reads
 can leave tensors partially updated, and copied bytes are retained if a

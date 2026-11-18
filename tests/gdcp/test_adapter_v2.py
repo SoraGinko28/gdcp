@@ -12,12 +12,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from torch.distributed import HashStore, destroy_process_group, init_process_group
+from torch.distributed.checkpoint import save as torch_dcp_save
+from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Shard
 
 from gdcp import FSDP2Checkpointer, desc, load_hf, save_hf
-from gdcp.adapters import fsdp2, torch_access
+from gdcp.adapters import dcp, fsdp2, torch_access
 from gdcp.adapters import hf as hf_adapter
 from gdcp.adapters.torch_access import TorchAccessor
 from gdcp.hf import read_headers
@@ -731,6 +733,113 @@ def test_unreconcilable_optimizer_groups_fail_before_payload_reads(
     assert _values(target, optimizer) == before
     assert optimizer.param_groups is groups_before
     assert state["extra_state"] is extra_state
+
+
+def _native_grouped_optimizer(value, orders, *, named=False):
+    model = torch.nn.ParameterDict(
+        {name: torch.nn.Parameter(torch.full((4,), value)) for name in "abcd"}
+    )
+    optimizer = _grouped_optimizer(model, orders, named=named)
+    for index, parameter in enumerate(model.parameters(), start=1):
+        optimizer.state[parameter]["scalar_flag"] = value * index
+    return model, optimizer
+
+
+@pytest.fixture
+def native_optimizer_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    source, optimizer = _native_grouped_optimizer(1.0, ("ab", "cd"))
+    torch_dcp_save(source.state_dict(), checkpoint_id=tmp_path / "model", no_dist=True)
+    torch_dcp_save(
+        get_optimizer_state_dict(source, optimizer),
+        checkpoint_id=tmp_path / "optimizer",
+        no_dist=True,
+    )
+    return source, optimizer
+
+
+@pytest.mark.parametrize("corrupt", [None, "state.a.scalar_flag", "param_groups.0.lr"])
+def test_native_dcp_group_validation_precedes_payload_reads_on_every_rank(
+    native_optimizer_checkpoint, tmp_path, monkeypatch, corrupt
+):
+    root = tmp_path / "optimizer"
+    metadata = dcp.read_metadata(root)
+    keys_by_record = {
+        (record.relative_path, record.offset): index.fqn
+        for index, record in metadata.storage_data.items()
+    }
+    if corrupt is not None:
+        record = next(
+            record
+            for index, record in metadata.storage_data.items()
+            if index.fqn == corrupt
+        )
+        with (root / record.relative_path).open("r+b") as handle:
+            handle.seek(record.offset)
+            handle.write(bytes(record.length))
+
+    coordinator = ThreadCoordinator(2, timeout=10)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    read_object = dcp._read_object
+    reads = []
+
+    def record_read(path, record):
+        reads.append(
+            (context.value.rank, keys_by_record[record.relative_path, record.offset])
+        )
+        return read_object(path, record)
+
+    def unexpected_tensor_read(*args):
+        pytest.fail("read native tensor record before validating optimizer groups")
+
+    monkeypatch.setattr(dcp, "_read_object", record_read)
+    monkeypatch.setattr(dcp, "_native_payload", unexpected_tensor_read)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        orders = ("ac", "bd") if rank else ("dc", "ba")
+        target, optimizer = _native_grouped_optimizer(9.0, orders, named=True)
+        expected = (
+            "optimizer parameter group members do not match"
+            if rank
+            else "another rank failed"
+        )
+        groups_before = optimizer.param_groups
+        _load_rejected(tmp_path, {"model": target, "optimizer": optimizer}, expected)
+        assert optimizer.param_groups is groups_before
+        assert all(torch.all(parameter == 9) for parameter in target.parameters())
+        assert optimizer.state[target["a"]]["scalar_flag"] == 9
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+    assert sorted(reads) == [
+        (rank, f"param_groups.{index}.params")
+        for rank in range(2)
+        for index in range(2)
+    ]
+
+
+def test_native_dcp_restores_reordered_optimizer_groups_and_scalar_state(
+    native_optimizer_checkpoint, tmp_path
+):
+    source, saved = native_optimizer_checkpoint
+    target, optimizer = _native_grouped_optimizer(9.0, ("dc", "ba"), named=True)
+    FSDP2Checkpointer.load(tmp_path, {"model": target, "optimizer": optimizer})
+    for group, saved_group, order in zip(
+        optimizer.param_groups, saved.param_groups, ("ab", "cd"), strict=True
+    ):
+        assert group["param_names"] == list(order)
+        assert group["lr"] == saved_group["lr"]
+        assert all(
+            param is target[name]
+            for name, param in zip(order, group["params"], strict=True)
+        )
+    assert _values(target) == _values(source)
+    for name, param in source.items():
+        torch.testing.assert_close(
+            optimizer.state[target[name]], saved.state[param], rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize("fmt", ("safetensors", "dcp"))

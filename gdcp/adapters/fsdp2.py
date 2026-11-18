@@ -3,6 +3,7 @@
 import io
 from collections import defaultdict
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -308,7 +309,7 @@ def _optimizer_group_key(group):
     return tuple(sorted(names))
 
 
-def _optimizer_groups(saved, current, parameters):
+def _validate_optimizer_groups(saved, current):
     if not isinstance(saved, list):
         raise ValueError("optimizer param_groups must be a list")
     if len(saved) != len(current):
@@ -321,6 +322,10 @@ def _optimizer_groups(saved, current, parameters):
         )
     if saved_keys != current_keys:
         raise ValueError("optimizer parameter group members do not match")
+
+
+def _optimizer_groups(saved, current, parameters):
+    _validate_optimizer_groups(saved, current)
     return [
         dict(
             group,
@@ -571,7 +576,15 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
     elif fmt == "dcp":
         from . import dcp
 
-        result = dcp.load(path, state, ctx, _preflight=preflight)
+        optimizer = adapter.optimizer_state
+        validate_groups = (
+            partial(_validate_optimizer_groups, current=optimizer["param_groups"])
+            if optimizer is not None
+            else None
+        )
+        result = dcp.load(
+            path, state, ctx, _preflight=preflight, _validate_groups=validate_groups
+        )
     else:
         result = core.load(path, state, ctx, _preflight=preflight)
     if type(result) is Err and isinstance(result.value, core._LoadValidationError):

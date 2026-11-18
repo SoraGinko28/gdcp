@@ -34,7 +34,9 @@ qualified model parameter name. Group and parameter order in the target may
 differ from the checkpoint. Load restores the saved order and group options,
 populates `param_names` to match `params` in every group, and restores moments
 and steps to their corresponding parameters. Incompatible or ambiguous groups
-fail before tensor or rank-state payload reads.
+fail before tensor or rank-state payload reads. For Torch-written native DCP,
+all ranks validate group membership before reading scalar optimizer state or
+separately stored group options.
 
 CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:nccl,cpu:gloo"`, so FSDP2 can use NCCL while votes and CPU state use Gloo. The GPU accessor stages one local tensor at a time, copies each save tensor to the host once, and writes back a load tensor once after all its ranges.
 
