@@ -10,6 +10,7 @@ import os
 import pickle
 import struct
 import zipfile
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -33,6 +34,7 @@ from torch.distributed.checkpoint.metadata import (
 )
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import (
     ComputeDTensorsView,
     DTensorTable,
@@ -50,8 +52,8 @@ from gdtensor.builder import (
 from gdtensor.session import StorageLoadSession, StorageSaveSession
 from gdtensor_conn._geometry import owned_box
 from gdtensor_conn._layout import build_payload_index
-from gdtensor_conn._result import catch, invalid
-from gdtensor_conn.access import StorageDataAccessor
+from gdtensor_conn._result import catch, invalid, io_error
+from gdtensor_conn.access import StorageDataAccessor, call_buffer_callback
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
 
@@ -419,13 +421,30 @@ class _SaveSession(_Session, StorageSaveSession):
 
 
 class _LoadSession(_Session, StorageLoadSession):
-    def __init__(self, *args):
+    def __init__(self, *args, native_records=None):
         super().__init__(*args)
+        self.native_ranges = None
+        if native_records is not None:
+            self.native_ranges = {
+                path: [_native_payload(self.root, *record) for record in records]
+                for path, records in native_records.items()
+            }
+            self.offsets = {
+                pos: slot.contiguous_payload_offset
+                for pos, (_, slot) in self.index.slots.items()
+            }
+            return
         metadata = read_metadata(self.root)
         for pos, (path, slot) in self.index.slots.items():
             self.offsets[pos] = _find_offset(
                 self.root, self.table, pos, path, slot, metadata
             )
+
+    @catch
+    def init_data_accessor(self):
+        if self.native_ranges is not None:
+            return _NativeAccessor(self, self.native_ranges)
+        return StorageDataAccessor(self.index, self.io, session=self)
 
     @catch
     def finish(self):
@@ -472,13 +491,70 @@ def _find_offset(root, table, pos, path, slot, metadata):
     )
     if record is None or record.relative_path != path:
         raise ValueError(f"{pos.tensor_id}: DCP storage record does not match {path}")
+    return _record_payload(root, record, slot.nbytes, pos.tensor_id)
+
+
+def _record_payload(root, record, expected, tensor_id):
+    path = record.relative_path
     with open(Path(root) / path, "rb") as handle:
         offset, nbytes = _payload_record(_Window(handle, record.offset, record.length))
-    if nbytes != slot.nbytes:
+    if nbytes != expected:
         raise ValueError(
-            f"{pos.tensor_id}: DCP payload has {nbytes} bytes, expected {slot.nbytes}"
+            f"{tensor_id}: DCP payload has {nbytes} bytes, expected {expected}"
         )
     return record.offset + offset
+
+
+@dataclass(frozen=True)
+class _NativePayload:
+    start: int
+    end: int
+    path: str
+    offset: int
+
+
+def _native_payload(root, tensor_id, start, size, record):
+    offset = _record_payload(root, record, size, tensor_id)
+    return _NativePayload(
+        start, start + size, os.path.join(root, record.relative_path), offset
+    )
+
+
+class _NativeAccessor(DTensorDataAccessor):
+    """Read each virtual tensor file across its native DCP payload ranges."""
+
+    def __init__(self, session, ranges):
+        self.session = session
+        self.ranges = ranges
+
+    @catch
+    def read_to_buffer(self, global_range, read_to_buffer):
+        start = global_range.contiguous_payload_offset
+        end = start + global_range.size
+        chunks = self.ranges[global_range.file_path]
+        first = bisect_right(chunks, start, key=lambda chunk: chunk.end)
+        for index in range(first, len(chunks)):
+            chunk = chunks[index]
+            if chunk.start >= end:
+                break
+            self._read_chunk(
+                chunk, max(start, chunk.start), min(end, chunk.end), read_to_buffer
+            )
+
+    def _read_chunk(self, chunk, start, end, callback):
+        try:
+            data = self.session.io.pread(
+                self.session.rank,
+                chunk.path,
+                chunk.offset + start - chunk.start,
+                end - start,
+            )
+        except OSError as exc:
+            raise io_error("read", str(exc), chunk.path) from None
+        call_buffer_callback(callback, bytearray(data))
+
+    def write_from_buffer(self, global_range, write_from_buffer):
+        raise NotImplementedError("native DCP load accessor is read-only")
 
 
 @dataclass
@@ -487,7 +563,9 @@ class DcpBackend:
     io: FileIO | None = None
     format: str = "distcp"
 
-    def open(self, root, storage_table, layout, coordinator=None):
+    def open(
+        self, root, storage_table, layout, coordinator=None, *, native_records=None
+    ):
         if layout.container_format != "distcp":
             raise ValueError(f"unsupported DCP format {layout.container_format!r}")
         index = build_payload_index(storage_table, layout)
@@ -510,7 +588,15 @@ class DcpBackend:
 
         @catch
         def begin_load(view, rank):
-            return _LoadSession(rank, root, storage_table, layout, index, io_backend)
+            return _LoadSession(
+                rank,
+                root,
+                storage_table,
+                layout,
+                index,
+                io_backend,
+                native_records=native_records,
+            )
 
         begin = (
             _collective_begin(begin_save, coordinator) if coordinator else begin_save
@@ -550,11 +636,9 @@ def save(path, state, ctx):
     return core.save(path, state, ctx, policy=DcpPolicy(), backend=backend.value)
 
 
-def _native_tensor(tensor_id, item, world):
+def _native_tensor(tensor_id, item, count, world):
     shape = list(item.size) or [1]
-    chunks = sorted(item.chunks, key=lambda chunk: tuple(chunk.offsets))
-    _validate_chunks(tensor_id, shape, chunks, scalar=len(item.size) == 0)
-    count = max(len(chunks), 1)
+    count = max(count, 1)
     mesh = storage_mesh(world, range(world))
     if count != world:
         mesh = SlicedMesh(mesh, [Slice(0, count)])
@@ -566,22 +650,37 @@ def _native_tensor(tensor_id, item, world):
     return NamedDTensor(tensor_id, NaiveDTensor(meta, [placement], mesh))
 
 
-def _validate_chunks(tensor_id, shape, chunks, scalar=False):
+def _native_chunks(tensor_id, item):
+    shape = list(item.size)
+    chunks = sorted(item.chunks, key=lambda chunk: tuple(chunk.offsets))
+    error = ValueError(
+        f"{tensor_id}: DCP chunk geometry cannot be represented: only contiguous Shard(0) chunks are supported"
+    )
+    if not shape:
+        if len(chunks) != 1 or chunks[0].offsets or chunks[0].sizes:
+            raise error
+        return chunks
     if prod(shape) == 0 and not chunks:
-        return
-    count = len(chunks)
-    width = (shape[0] + count - 1) // count if count else 0
-    for index, chunk in enumerate(chunks):
-        lo, sizes = (
-            [index * width] + [0] * (len(shape) - 1),
-            [min(width, shape[0] - index * width)] + shape[1:],
-        )
-        if scalar:
-            lo, sizes = [], []
-        if list(chunk.offsets) != lo or list(chunk.sizes) != sizes:
-            raise ValueError(
-                f"{tensor_id}: DCP chunk geometry cannot be represented: only canonical contiguous Shard(0) chunks are supported"
-            )
+        return []
+    covered, nonempty = 0, []
+    for chunk in chunks:
+        offsets, sizes = chunk.offsets, chunk.sizes
+        if (
+            len(offsets) != len(shape)
+            or any(offsets[1:])
+            or list(sizes[1:]) != shape[1:]
+            or len(sizes) != len(shape)
+        ):
+            raise error
+        if sizes[0] == 0:
+            continue
+        if offsets[0] != covered or sizes[0] < 0 or covered + sizes[0] > shape[0]:
+            raise error
+        covered += sizes[0]
+        nonempty.append(chunk)
+    if covered != shape[0]:
+        raise error
+    return nonempty
 
 
 def _native_objects(root, metadata, component):
@@ -682,44 +781,52 @@ def read_component(root, component):
             f"{component.name}: native DCP is missing keys {sorted(wanted.keys() - metadata.state_dict_metadata.keys())}"
         )
     _validate_native_keys(metadata, wanted)
-    world = max([len(item.chunks) for key, item in items] + [1])
+    chunks = {key: _native_chunks(key, item) for key, item in items}
+    world = max([len(parts) for parts in chunks.values()] + [1])
     table = DTensorTable(
         [
-            replace(_native_tensor(key, item, world), alias=wanted[key].alias)
+            replace(
+                _native_tensor(key, item, len(chunks[key]), world),
+                alias=wanted[key].alias,
+            )
             for key, item in items
         ]
     )
-    paths = _native_paths(metadata, table)
+    # GDTensor plans over regular slots. One virtual file per tensor puts those
+    # slots in row order so byte ranges can cross the actual DCP record boundaries.
+    paths = {key: f"tensor-{order}.distcp" for order, (key, _) in enumerate(items)}
     layout = build_layout(
         table,
         world,
         "distcp",
-        lambda order, rank, named: paths[(named.global_tensor_id, rank)],
+        lambda order, rank, named: paths[named.global_tensor_id],
     )
+    records = {
+        paths[key]: _native_records(metadata, key, item, chunks[key])
+        for key, item in items
+    }
     objects = (
         desc.read_objects(Path(root) / "objects.json")
         if (Path(root) / "objects.json").exists()
         else _native_objects(root, metadata, component)
     )
     logical = {key: [] for key, item in items if len(item.size) == 0}
-    return table, layout, objects, logical, world
+    return table, layout, objects, logical, world, records
 
 
-def _native_paths(metadata, table):
+def _native_records(metadata, key, item, chunks):
     assert metadata.storage_data is not None
-    paths = {}
-    for named in table.named_d_tensors:
-        chunks = sorted(
-            metadata.state_dict_metadata[named.global_tensor_id].chunks,
-            key=lambda chunk: tuple(chunk.offsets),
-        )
-        for rank, chunk in enumerate(chunks):
-            record = metadata.storage_data[
-                MetadataIndex(named.global_tensor_id, chunk.offsets)
-            ]
-            desc._safe_relative(record.relative_path)
-            paths[(named.global_tensor_id, rank)] = record.relative_path
-    return paths
+    row_bytes = prod(item.size[1:]) * item.properties.dtype.itemsize
+    if row_bytes == 0:
+        return []
+    records = []
+    for chunk in chunks:
+        record = metadata.storage_data[MetadataIndex(key, chunk.offsets)]
+        desc._safe_relative(record.relative_path)
+        start = chunk.offsets[0] if item.size else 0
+        rows = chunk.sizes[0] if item.size else 1
+        records.append((key, start * row_bytes, rows * row_bytes, record))
+    return records
 
 
 def _prepare_native(path, state, ctx):
@@ -733,7 +840,9 @@ def _prepare_native(path, state, ctx):
     prepared = []
     for component in state.components:
         root = Path(path) / component.name
-        table, layout, objects, logical, world = read_component(root, component)
+        table, layout, objects, logical, world, records = read_component(
+            root, component
+        )
         saved = desc.describe_component(table, layout, world, logical_shapes=logical)
         core._strict_tensors(component, saved, False)
         compute = ComputeDTensorsView(
@@ -741,7 +850,9 @@ def _prepare_native(path, state, ctx):
             component.table,
             component.accessor,
         )
-        storage = DcpBackend().open(root, table, layout, ctx.coordinator)
+        storage = DcpBackend().open(
+            root, table, layout, ctx.coordinator, native_records=records
+        )
         core._require(compute.check_constraints())
         core._require(storage.check_constraints())
         prepared.append((component, compute, storage, objects))

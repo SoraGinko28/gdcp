@@ -2,8 +2,10 @@
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from threading import local
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,6 +16,7 @@ from gdtensor.builder import Err
 from gdtensor_conn.coord import ThreadCoordinator
 from gdtensor_conn.iobackend import FileIO
 from tests.support.gdcp import assert_ok, assert_values, collective, numpy_checkpoint
+from tests.support.oracle import ArrayFabric
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1"
@@ -208,7 +211,194 @@ def test_invalid_dcp_component_map_votes_on_every_rank(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def test_noncanonical_native_chunk_geometry_is_rejected(tmp_path):
+@contextmanager
+def _torch_rank(rank, world):
+    import torch.distributed as dist
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=world)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def _torch_shard(dense, rank, world):
+    import torch
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    size, start = Shard.local_shard_size_and_offset(dense.size(0), world, rank)
+    mesh = DeviceMesh("cpu", torch.arange(world))
+    return DTensor.from_local(
+        dense[start : start + size].clone(),
+        mesh,
+        [Shard(0)],
+        shape=dense.shape,
+        stride=dense.stride(),
+    )
+
+
+def _torch_write_shards(root, dense, world):
+    from torch.distributed.checkpoint import DefaultSavePlanner, FileSystemWriter
+
+    # Exercise torch's real planner and writer without a socket rendezvous.
+    writer = FileSystemWriter(root)
+    planners, plans = [], []
+    for rank in range(world):
+        with _torch_rank(rank, world):
+            planner = DefaultSavePlanner()
+            planner.set_up_planner(
+                {"weight": _torch_shard(dense, rank, world)}, is_coordinator=rank == 0
+            )
+            planners.append(planner)
+            plans.append(writer.prepare_local_plan(planner.create_local_plan()))
+    plans, metadata = planners[0].create_global_plan(plans)
+    plans = writer.prepare_global_plan(plans)
+    results = [
+        writer.write_data(planner.finish_plan(plan), planner).wait()
+        for planner, plan in zip(planners, plans)
+    ]
+    writer.finish(metadata, results)
+    return metadata.state_dict_metadata["weight"].chunks
+
+
+def _weight_checkpoint(world, values, *, initialized):
+    from gdtensor.builder import (
+        ArrangedMesh,
+        DTensorTable,
+        GlobalTensorMeta,
+        NaiveDTensor,
+        NamedDTensor,
+        Shard,
+    )
+    from gdtensor.tag import WorldSize
+    from gdcp.state import CheckpointState, Component
+
+    meta = GlobalTensorMeta(list(values.shape), "F32", values.itemsize)
+    dtensor = NaiveDTensor(meta, [Shard(0)], ArrangedMesh(WorldSize(world)))
+    table = DTensorTable([NamedDTensor("weight", dtensor)])
+    width = -(-len(values) // world)
+    indices = np.arange(values.size).reshape(values.shape)
+    points = {
+        rank: {"weight": indices[rank * width : (rank + 1) * width].ravel()}
+        for rank in range(world)
+    }
+    expected = {"weight": values}
+    fabric = ArrayFabric(table, points, expected if initialized else None)
+    states = [
+        CheckpointState(
+            [Component("model", table, fabric.view(rank).data_accessor, {})]
+        )
+        for rank in range(world)
+    ]
+    return SimpleNamespace(
+        states=states, fabrics={"model": fabric}, values={"model": expected}
+    )
+
+
+def _check_native_shard_load(root, values, world):
+    from gdcp.adapters.dcp import load
+
+    target = _weight_checkpoint(world, values, initialized=False)
+
+    def load_rank(path, state, ctx, **kwargs):
+        return load(path, state, ctx)
+
+    assert_ok(collective(load_rank, root, target))
+    assert_values(target, target)
+
+
+_SHARD_SWEEP = [(1, 1), (2, 1), (4, 2), (4, 4), (4, 5), (4, 8), (4, 9), (6, 13)]
+
+
+@pytest.mark.parametrize("world,rows", _SHARD_SWEEP)
+def test_native_dcp_load_torch_shard_sweep(tmp_path, world, rows):
+    torch = pytest.importorskip("torch")
+    values = torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3)
+    chunks = _torch_write_shards(tmp_path / "model", values, world)
+    if (world, rows) in ((4, 5), (6, 13)):
+        assert (chunks[-1].offsets[0], chunks[-1].sizes[0]) == (rows, 0)
+    for target_world in (world, world + 1):
+        _check_native_shard_load(tmp_path, values.numpy(), target_world)
+
+
+@pytest.mark.parametrize("world,rows", _SHARD_SWEEP)
+def test_torch_load_gdcp_dcp_shard_sweep(tmp_path, world, rows):
+    torch = pytest.importorskip("torch")
+    from torch.distributed.checkpoint import load as native_load
+
+    expected = torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3)
+    source = _weight_checkpoint(world, expected.numpy(), initialized=True)
+    assert_ok(_dcp_save(tmp_path, source))
+    for target_world in (world, world + 1):
+        for rank in range(target_world):
+            _check_torch_shard_load(
+                tmp_path / "model", expected, rank, target_world, native_load
+            )
+
+
+def _check_torch_shard_load(root, expected, rank, world, native_load):
+    import torch
+
+    with _torch_rank(rank, world):
+        target = _torch_shard(torch.full_like(expected, -1), rank, world)
+        native_load({"weight": target}, checkpoint_id=root, no_dist=True)
+        torch.testing.assert_close(
+            target.to_local(), _torch_shard(expected, rank, world).to_local()
+        )
+
+
+def test_native_dcp_load_uneven_shards_with_interior_empty(tmp_path):
+    import pickle
+
+    torch = pytest.importorskip("torch")
+    from torch.distributed._shard.sharded_tensor import Shard, init_from_local_shards
+    from torch.distributed.checkpoint import load as native_load, save as native_save
+    from torch.distributed.checkpoint.metadata import (
+        ChunkStorageMetadata,
+        MetadataIndex,
+    )
+    from gdcp.adapters.dcp import read_metadata
+
+    values = torch.arange(30, dtype=torch.float32).reshape(10, 3)
+    root = tmp_path / "model"
+    with _torch_rank(0, 1):
+        shards = [
+            Shard.from_tensor_and_offsets(values[start:end].clone(), [start, 0], 0)
+            for start, end in [(0, 2), (2, 9), (9, 10)]
+        ]
+        tensor = init_from_local_shards(shards, *values.shape)
+        native_save(
+            {"weight": tensor, "empty": values[:0]}, checkpoint_id=root, no_dist=True
+        )
+    metadata = read_metadata(root)
+    item = metadata.state_dict_metadata["weight"]
+    empty = metadata.state_dict_metadata.pop("empty").chunks[0]
+    offset = torch.Size([1, 0])
+    item.chunks.insert(1, ChunkStorageMetadata(offset, empty.sizes))
+    metadata.storage_data[MetadataIndex("weight", offset)] = metadata.storage_data.pop(
+        MetadataIndex("empty", empty.offsets)
+    )
+    (root / ".metadata").write_bytes(pickle.dumps(metadata))
+    restored = torch.full_like(values, -1)
+    native_load({"weight": restored}, checkpoint_id=root, no_dist=True)
+    torch.testing.assert_close(restored, values)
+    for world in (1, 4):
+        _check_native_shard_load(tmp_path, values.numpy(), world)
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        [([0, 0], [10, 2]), ([0, 2], [10, 2])],
+        [([0, 0], [6, 4]), ([5, 0], [5, 4])],
+        [([0, 0], [4, 4]), ([5, 0], [5, 4])],
+        [([0, 0], [6, 4])],
+    ],
+    ids=["column-shard", "overlap", "gap", "incomplete"],
+)
+def test_noncanonical_native_chunk_geometry_is_rejected(tmp_path, geometry):
     import pickle
     from torch.distributed.checkpoint.metadata import (
         ChunkStorageMetadata,
@@ -223,8 +413,8 @@ def test_noncanonical_native_chunk_geometry_is_rejected(tmp_path):
     item = metadata.state_dict_metadata["weight"]
     assert isinstance(item, TensorStorageMetadata)
     item.chunks = [
-        ChunkStorageMetadata(torch.Size([0, 0]), torch.Size([10, 2])),
-        ChunkStorageMetadata(torch.Size([0, 2]), torch.Size([10, 2])),
+        ChunkStorageMetadata(torch.Size(offsets), torch.Size(sizes))
+        for offsets, sizes in geometry
     ]
     (tmp_path / "model" / ".metadata").write_bytes(pickle.dumps(metadata))
     with pytest.raises(ValueError, match="chunk geometry cannot be represented"):
