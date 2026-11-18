@@ -12,10 +12,12 @@ The synchronous `FSDP2Checkpointer` retains every positional parameter and defau
 completion files at the root. `gdcp_manifest.json` identifies per-rank
 safetensors or DCP and records the component formats. A root
 `.gdtensor_committed` identifies a committed HF checkpoint, including older
-saves with no tensor files. For native checkpoints without GDCP completion
-files, load recognizes regular HF tensor files or an HF index at the root, or
-regular DCP `.metadata` in a component directory. If both native layouts are
-present, load reports an ambiguous format.
+saves with no tensor files. If both regular root completion files are present,
+load reports an ambiguous format. Saves reserve both root completion names and
+reject foreign entries at those names before publication. For native checkpoints
+without GDCP completion files, load recognizes regular HF tensor files or an HF
+index at the root, or regular DCP `.metadata` in a component directory. If both
+native layouts are present, load reports an ambiguous format.
 
 ```python
 FSDP2Checkpointer.save(
@@ -49,6 +51,12 @@ CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:ncc
 
 HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys,
 and a typed JSON `optimizer.json` sidecar preserving param groups and aliases.
+New full-state sidecars list the exact optimizer tensor keys, so model-only
+loads can skip optimizer tensors while validating every model key. Model keys
+beginning with `optimizer.` receive the same strict validation as other keys.
+Older full-state files without an optimizer tensor list can be loaded with both
+components or in common-only mode. A model-only load rejects extra keys when
+their optimizer ownership is unknown.
 An HF save with zero tensors writes a valid empty `model.safetensors`. Native
 HF loading builds storage from headers and an optional standard index. The
 header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and

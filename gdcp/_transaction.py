@@ -20,7 +20,12 @@ from . import _ownership, desc
 
 _LOG = logging.getLogger(__name__)
 JOURNAL_NAME = ".gdcp_transaction"
-_RESERVED = {Path(JOURNAL_NAME), Path(desc.PENDING_NAME)}
+_RESERVED = {
+    Path(JOURNAL_NAME),
+    Path(desc.PENDING_NAME),
+    Path(desc.MANIFEST_NAME),
+    Path(desc.HF_COMMITTED_NAME),
+}
 PREFLIGHT = (
     "initialize save (check foreign-name collisions, mount point and same filesystem; "
     "pass a subdirectory of the mount)"

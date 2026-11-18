@@ -68,8 +68,10 @@ _SAFETENSORS_DTYPE_BITS = {
     "U64": 64,
 }
 _OBJECTS = "optimizer.json"
-_COMMITTED = ".gdtensor_committed"
+_COMMITTED = desc.HF_COMMITTED_NAME
 _SINGLE_FILE = "model.safetensors"
+# The slash keeps this metadata key outside the component-name namespace.
+_OPTIMIZER_TENSORS = "/optimizer_tensors"
 
 
 def shard_size_bytes(value):
@@ -330,6 +332,12 @@ def _group_storage_rows(combined, table):
 
 def _save_prepare(path, state, ctx, max_shard_size):
     combined, objects = _combined(state)
+    for component in state.components:
+        if component.name == "optimizer":
+            objects[_OPTIMIZER_TENSORS] = sorted(
+                f"optimizer.{named.global_tensor_id}"
+                for named in component.table.named_d_tensors
+            )
     table, _layout = PerRankPolicy().plan(combined, ctx.world_size)
     combined, table = _group_storage_rows(combined, table)
     compute = core._compute_view(combined)
@@ -593,8 +601,6 @@ def _validate_keys(combined, headers, components):
     if "model" not in components:
         prefixes = tuple(name + "." for name in components)
         unexpected = {key for key in unexpected if key.startswith(prefixes)}
-    elif "optimizer" not in components:
-        unexpected = {key for key in unexpected if not key.startswith("optimizer.")}
     if unexpected:
         raise ValueError(f"HF unexpected key {sorted(unexpected)[0]}")
     return duplicates
@@ -608,12 +614,38 @@ def _validate_alias_payloads(path, headers, duplicates):
             raise ValueError(f"HF tied alias {alias} differs from {canonical}")
 
 
+def _load_objects(path, components):
+    filename = Path(path) / _OBJECTS
+    objects = desc.read_objects(filename) if filename.is_file() else {}
+    if not isinstance(objects, dict):
+        raise ValueError("HF optimizer.json must contain a mapping")
+    if "optimizer" in components and "optimizer" not in objects:
+        raise ValueError("HF full-state checkpoint is missing optimizer.json")
+    optimizer_tensors = objects.pop(_OPTIMIZER_TENSORS, [])
+    if (
+        not isinstance(optimizer_tensors, list)
+        or (optimizer_tensors and "optimizer" not in objects)
+        or any(
+            not isinstance(key, str) or not key.startswith("optimizer.")
+            for key in optimizer_tensors
+        )
+    ):
+        raise ValueError("invalid HF optimizer tensor inventory")
+    return objects, set(optimizer_tensors)
+
+
 def _load_prepare(path, state, ctx):
     core._validate_context(ctx)
     core._validate_state(state)
     headers = read_headers(path)
+    components = {component.name for component in state.components}
+    objects, optimizer_tensors = _load_objects(path, components)
+    if "optimizer" not in components:
+        headers = {
+            key: info for key, info in headers.items() if key not in optimizer_tensors
+        }
     combined, _objects = _combined(state, headers)
-    duplicates = _validate_keys(combined, headers, {c.name for c in state.components})
+    duplicates = _validate_keys(combined, headers, components)
     entries = []
     for named in combined.table.named_d_tensors:
         key, meta = named.global_tensor_id, named.d_tensor.global_tensor_meta
@@ -653,15 +685,6 @@ def _load_prepare(path, state, ctx):
     compute = core._compute_view(combined)
     core._require(compute.check_constraints())
     core._require(storage.check_constraints())
-    objects_file = Path(path) / _OBJECTS
-    objects = desc.read_objects(objects_file) if objects_file.is_file() else {}
-    if not isinstance(objects, dict):
-        raise ValueError("HF optimizer.json must contain a mapping")
-    if (
-        any(component.name == "optimizer" for component in state.components)
-        and "optimizer" not in objects
-    ):
-        raise ValueError("HF full-state checkpoint is missing optimizer.json")
     return combined, compute, storage, objects, headers, duplicates
 
 

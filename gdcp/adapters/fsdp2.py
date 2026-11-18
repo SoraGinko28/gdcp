@@ -533,13 +533,14 @@ def save_checkpoint(
 def _load_format(path, state):
     root = Path(path)
     core._require_not_pending(root)
-    if (root / desc.MANIFEST_NAME).is_file():
+    marker = desc._completion_marker(root)
+    if marker == desc.MANIFEST_NAME:
         if not state.components:
             return "safetensors"
         saved = desc.read_manifest(root, _validate_components=False)
         formats = {item["format"] for item in saved.components.values()}
         return "dcp" if "distcp" in formats else "safetensors"
-    if (root / hf._COMMITTED).is_file():
+    if marker == desc.HF_COMMITTED_NAME:
         return "hf"
     native_hf = hf._has_native_files(root)
     native_dcp = any(

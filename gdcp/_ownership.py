@@ -9,7 +9,7 @@ from . import desc
 from ._dcp_metadata import read_storage_records
 
 _INDEX = "model.safetensors.index.json"
-_MARKER = ".gdtensor_committed"
+_MARKER = desc.HF_COMMITTED_NAME
 _HF_FIXED = {_INDEX, _MARKER, "model.safetensors", "optimizer.json", "config.json"}
 _ITEMSIZE = {
     "BOOL": 1,
@@ -98,7 +98,7 @@ def _hf_files(root):
 
 def _recorded_inventory(root):
     root = Path(root)
-    if (root / desc.MANIFEST_NAME).is_file():
+    if desc._completion_marker(root) == desc.MANIFEST_NAME:
         return _manifest_files(root)
     if (root / _INDEX).is_file() or (root / "model.safetensors").is_file():
         if not (root / _INDEX).is_file():
@@ -254,7 +254,7 @@ def complete(root):
 
 
 def _complete(root):
-    if (root / desc.MANIFEST_NAME).is_file():
+    if desc._completion_marker(root) == desc.MANIFEST_NAME:
         return _manifest_complete(root)
     if (root / _INDEX).is_file() or (root / "model.safetensors").is_file():
         return _hf_complete(root)

@@ -27,6 +27,7 @@ from gdtensor.tag import TensorCount, WorldSize
 from .policy import storage_mesh
 
 MANIFEST_NAME = "gdcp_manifest.json"
+HF_COMMITTED_NAME = ".gdtensor_committed"
 PENDING_NAME = ".gdcp_pending"
 
 
@@ -213,6 +214,20 @@ def _add_layout_file(base, ids, name, info, entries, paths):
 def _safe_relative(name):
     if not isinstance(name, str) or Path(name).name != name or name in ("", ".", ".."):
         raise ValueError(f"invalid checkpoint filename {name!r}")
+
+
+def _completion_marker(root):
+    manifest = (root / MANIFEST_NAME).is_file()
+    hf = (root / HF_COMMITTED_NAME).is_file()
+    if manifest and hf:
+        raise ValueError(
+            f"ambiguous checkpoint format: {MANIFEST_NAME} and {HF_COMMITTED_NAME}"
+        )
+    if manifest:
+        return MANIFEST_NAME
+    if hf:
+        return HF_COMMITTED_NAME
+    return None
 
 
 def atomic_write(path, data):

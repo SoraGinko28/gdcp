@@ -147,7 +147,7 @@ def test_full_state_round_trip_integer_and_bool_buffers(tmp_path, monkeypatch, f
 
 
 @pytest.mark.parametrize("bits", [16, 32, 64])
-def test_hf_weights_only_checks_dtype_of_requested_keys(tmp_path, bits):
+def test_hf_weights_validate_optimizer_prefixed_model_keys(tmp_path, bits):
     import numpy as np
     from safetensors.numpy import save_file
 
@@ -158,9 +158,9 @@ def test_hf_weights_only_checks_dtype_of_requested_keys(tmp_path, bits):
         tmp_path / "model.safetensors",
     )
     weight = torch.zeros(2)
-    load_hf(tmp_path, {"weight": weight})
-    _assert_tensor_bits(weight, torch.ones(2))
-    weight.zero_()
+    with pytest.raises(RuntimeError, match=r"HF unexpected key optimizer\.ids"):
+        load_hf(tmp_path, {"weight": weight})
+    _assert_tensor_bits(weight, torch.zeros(2))
     with pytest.raises(
         RuntimeError, match=r"HF shape/dtype mismatch for optimizer\.ids"
     ):
@@ -336,6 +336,63 @@ def test_fsdp2_manifest_wins_over_uncommitted_hf_names(tmp_path, fmt, directory)
     assert common == {"extra_state": 7}
 
 
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_fsdp2_save_rejects_foreign_completion_marker(tmp_path, fmt):
+    if fmt == "hf":
+        marker = tmp_path / desc.MANIFEST_NAME
+        document = {
+            "gdcp_version": 1,
+            "world_size": 1,
+            "components": {"foreign": {"format": "unsupported"}},
+            "rank_state": {},
+        }
+    else:
+        marker = tmp_path / ".gdtensor_committed"
+        document = {"format": "safetensors", "files": []}
+    contents = desc.json_bytes(document)
+    marker.write_bytes(contents)
+    inode = marker.stat().st_ino
+
+    with pytest.raises(RuntimeError, match=f"foreign entry: {marker.name}"):
+        FSDP2Checkpointer.save(tmp_path, {"extra_state": 42}, checkpoint_format=fmt)
+
+    assert set(tmp_path.iterdir()) == {marker}
+    assert marker.read_bytes() == contents
+    assert marker.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_fsdp2_common_load_rejects_conflicting_completion_markers(tmp_path, fmt):
+    source, other = tmp_path / "source", tmp_path / "other"
+    other_fmt = "safetensors" if fmt == "hf" else "hf"
+    marker = desc.MANIFEST_NAME if fmt == "hf" else ".gdtensor_committed"
+    FSDP2Checkpointer.save(source, {"extra_state": 42}, checkpoint_format=fmt)
+    FSDP2Checkpointer.save(other, {"extra_state": 13}, checkpoint_format=other_fmt)
+    (source / marker).write_bytes((other / marker).read_bytes())
+
+    target = {"extra_state": 0}
+    with pytest.raises(RuntimeError, match="ambiguous checkpoint format"):
+        FSDP2Checkpointer.load(source, target, load_common_state_only=True)
+    assert target == {"extra_state": 0}
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "dcp"])
+def test_fsdp2_overwrite_replaces_owned_completion_marker(tmp_path, fmt):
+    cases = [
+        (fmt, desc.HF_COMMITTED_NAME),
+        ("hf", desc.MANIFEST_NAME),
+        (fmt, desc.HF_COMMITTED_NAME),
+    ]
+    for step, (checkpoint_format, previous_marker) in enumerate(cases):
+        FSDP2Checkpointer.save(
+            tmp_path, {"extra_state": step}, checkpoint_format=checkpoint_format
+        )
+        assert not (tmp_path / previous_marker).exists()
+        target = {}
+        FSDP2Checkpointer.load(tmp_path, target, load_common_state_only=True)
+        assert target == {"extra_state": step}
+
+
 def test_safetensors_manifest_wins_over_foreign_dcp_metadata(mesh, tmp_path):
     source = _checkpoint_subset(mesh, ("model",), 1.0, 0.01, None)
     target = _checkpoint_subset(mesh, ("model",), 9.0, 0.25, None)
@@ -374,6 +431,48 @@ def test_empty_hf_weights_round_trip(tmp_path):
     save_hf(tmp_path, {})
     assert hf.read_headers(tmp_path) == {}
     load_hf(tmp_path, {}, dtype="fp32")
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_hf_weights_load_rejects_unexpected_optimizer_prefixed_model_key(
+    tmp_path, native
+):
+    from safetensors.torch import save_file
+
+    saved = {"optimizer.weight": torch.ones(2), "optimizer.bias": torch.ones(2)}
+    if native:
+        save_file(saved, tmp_path / "model.safetensors")
+    else:
+        save_hf(tmp_path, saved)
+
+    target = {"optimizer.weight": torch.zeros(2)}
+    with pytest.raises(RuntimeError, match=r"HF unexpected key optimizer\.bias"):
+        load_hf(tmp_path, target)
+    assert torch.equal(target["optimizer.weight"], torch.zeros(2))
+
+
+def test_hf_model_only_load_distinguishes_weights_from_optimizer_slots(mesh, tmp_path):
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.optimizer = torch.nn.Linear(2, 2)
+    source = fully_shard(model, mesh=mesh)
+    optimizer = _optimizer(source, 0.01)
+    FSDP2Checkpointer.save(
+        tmp_path, {"model": source, "optimizer": optimizer}, checkpoint_format="hf"
+    )
+
+    target = torch.nn.Linear(2, 2, bias=False)
+    target.optimizer = torch.nn.Linear(2, 2, bias=False)
+    target = fully_shard(target, mesh=mesh)
+    before = _values(target)
+    with pytest.raises(RuntimeError, match=r"HF unexpected key optimizer\.bias"):
+        FSDP2Checkpointer.load(tmp_path, {"model": target})
+    assert _values(target) == before
+
+    match = torch.nn.Linear(2, 2, bias=False)
+    match.optimizer = torch.nn.Linear(2, 2)
+    match = fully_shard(match, mesh=mesh)
+    FSDP2Checkpointer.load(tmp_path, {"model": match})
+    assert _values(match) == _values(source)
 
 
 @pytest.mark.parametrize(

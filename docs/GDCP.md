@@ -48,7 +48,10 @@ GDCP writes `gdcp_manifest.json` as the checkpoint commit marker for per-rank
 safetensors and DCP after every rank commits its components and extra-state
 files. Per-rank safetensors component directories also have their own
 `.gdtensor_committed` files. HF uses a root `.gdtensor_committed` file as its
-checkpoint commit marker.
+checkpoint commit marker. A load with both regular root marker files fails
+format detection. Saves reserve both root marker names and reject a foreign
+entry at either name before publication.
+
 Every save is built in `.NAME.gdcp-stage` beside the resolved real target.
 A symlink to a directory keeps its original link text and inode; dangling links
 and links to files are errors. The filesystem root and mount-point targets
@@ -192,8 +195,9 @@ all ranks must pass validation of the requested tensor keys, shapes, dtypes,
 recorded tied-parameter aliases, optimizer objects and group membership, storage
 metadata, and requested rank state. A failed validation leaves those targets
 unchanged. Missing and unexpected keys in requested components are errors.
-Unrequested components in a full checkpoint are allowed. Optimizer restoration
-precedes model restoration.
+Unrequested components in a full checkpoint are allowed. HF model-only loads
+use the optimizer tensor list in `optimizer.json` to identify tensors they can
+skip. Optimizer restoration precedes model restoration.
 
 Optimizer groups are matched by their model parameter names. The target may
 reorder groups or parameters within a group. Load restores the saved group
