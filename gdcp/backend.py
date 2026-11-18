@@ -1,12 +1,15 @@
 """Connector-backed storage views; file formats remain in gdtensor_conn."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 
 from gdtensor import Result
-from gdtensor.builder import Err, GDTensorIOError, Ok
+from gdtensor.builder import Err, GDTensorIOError, Ok, StorageDTensorsView
 from gdtensor.session import StorageSaveSession
-from gdtensor_conn.formats import make_storage_view
+from gdtensor_conn._layout import build_payload_index
+from gdtensor_conn._result import catch, invalid, io_error
+from gdtensor_conn.access import StorageDataAccessor
+from gdtensor_conn.formats import SafeTensorsLoadSession, SafeTensorsSaveSession
 from gdtensor_conn.iobackend import FileIO
 
 
@@ -14,7 +17,6 @@ class _InterruptIO(FileIO):
     """Remember interrupts that connector commit converts to an error Result."""
 
     def __init__(self, delegate):
-        self.delegate = delegate
         self.interrupt = None
         self.tracer = delegate.tracer
         self.fds = delegate.fds
@@ -26,24 +28,9 @@ class _InterruptIO(FileIO):
         self.create_staging = delegate.create_staging
         self.close_rank = delegate.close_rank
         self.discard = delegate.discard
-
-    def remember(self, action):
-        try:
-            return action()
-        except BaseException as exc:
-            self.interrupt = self.interrupt or (
-                exc if not isinstance(exc, Exception) else None
-            )
-            raise
-
-    def sync(self, path):
-        return self.remember(lambda: self.delegate.sync(path))
-
-    def publish(self, temporary_path, final_path):
-        return self.remember(lambda: self.delegate.publish(temporary_path, final_path))
-
-    def write_all(self, rank, path, data):
-        return self.remember(lambda: self.delegate.write_all(rank, path, data))
+        self.sync = delegate.sync
+        self.publish = delegate.publish
+        self.write_all = delegate.write_all
 
 
 def _raise_io_interrupt(storage):
@@ -52,8 +39,52 @@ def _raise_io_interrupt(storage):
         raise io.interrupt
 
 
-def _remember_io_interrupt(io, action):
-    return io.remember(action) if isinstance(io, _InterruptIO) else action()
+class _CoordinatedSaveSession(SafeTensorsSaveSession):
+    def _attempt(self, action):
+        try:
+            action()
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and self.io.interrupt is None:
+                self.io.interrupt = exc
+            return exc
+        return None
+
+    def _close(self):
+        self.io.close_rank(self.rank, self.root)
+
+    @catch
+    def commit(self):
+        if self.state != "open":
+            raise invalid("session", f"commit on {self.state} session")
+        error = self._attempt(self._close)
+        if not self._vote(error is None):
+            self.state = "aborted"
+            self._discard()
+            raise io_error("commit", str(error or "another rank aborted"))
+        self.state = "committing"
+        error = self._attempt(self._publish)
+        published = self._vote(error is None)
+        if published:
+            error = self._attempt(self._after_barrier)
+        if not self._vote(published and error is None):
+            self.state = "unknown"
+            raise io_error(
+                "commit",
+                f"commit outcome unknown: {error or 'another rank failed to publish'}",
+            )
+        self.state = "committed"
+
+    @catch
+    def abort(self):
+        if self.state in ("committed", "aborted"):
+            raise invalid("session", f"abort on {self.state} session")
+        error = self._attempt(self._close)
+        if self.state != "unknown":
+            self._vote(False)
+            self._discard()
+        self.state = "aborted"
+        if error is not None:
+            raise io_error("abort", str(error))
 
 
 def _open_error(message):
@@ -87,15 +118,15 @@ def _collective_begin(begin, coordinator):
     return wrapped
 
 
-def _close_failed_load(begin_load, io, root, view, rank):
+@catch
+def _begin_session(session_type, root, index, io, view, rank, **options):
     try:
-        result = begin_load(view, rank)
+        return session_type(
+            rank, root, view.d_tensor_table, view.physical_layout, index, io, **options
+        )
     except BaseException:
         io.close_rank(rank, root)
         raise
-    if type(result) is Err:
-        io.close_rank(rank, root)
-    return result
 
 
 @dataclass
@@ -110,22 +141,20 @@ class SafeTensorsBackend:
             raise ValueError(f"unsupported format {layout.container_format!r}")
         ids = [named.global_tensor_id for named in storage_table.named_d_tensors]
         io = _InterruptIO(self.io or FileIO())
-        view = make_storage_view(
-            ids,
-            storage_table,
-            layout,
+        index = build_payload_index(storage_table, layout)
+        begin_save = partial(
+            _begin_session,
+            _CoordinatedSaveSession,
             str(root),
-            io=io,
+            index,
+            io,
             coord=coordinator,
         )
-        begin_load = view.begin_load
-        assert begin_load is not None
-        view = replace(
-            view, begin_load=partial(_close_failed_load, begin_load, io, str(root))
+        return StorageDTensorsView(
+            ids,
+            storage_table,
+            StorageDataAccessor(index, io),
+            layout,
+            _collective_begin(begin_save, coordinator) if coordinator else begin_save,
+            partial(_begin_session, SafeTensorsLoadSession, str(root), index, io),
         )
-        if coordinator is None:
-            return view
-        begin_save = view.begin_save
-        if begin_save is None:
-            raise ValueError("storage view has no begin_save callback")
-        return replace(view, begin_save=_collective_begin(begin_save, coordinator))

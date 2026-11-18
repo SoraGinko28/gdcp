@@ -170,7 +170,10 @@ def _write_config(path, model, dtype, ctx):
 
 
 def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
-    ctx = _context()
+    return _save_hf(path, model_or_state, dtype, max_shard_size, _context())
+
+
+def _save_hf(path, model_or_state, dtype, max_shard_size, ctx):
     model, state = _collective(
         ctx, lambda: _weights(model_or_state, dtype, ctx, loading=False)
     )

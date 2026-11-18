@@ -32,6 +32,7 @@ from gdtensor.tag import WorldSize
 from gdtensor_conn.coord import GlooCoordinator
 
 from .. import core
+from ..checkpointer import _SAVE_FORMATS, _save_route
 from ..state import CheckpointState, Component, RankContext
 from .torch_access import TorchAccessor
 
@@ -460,31 +461,40 @@ def save_checkpoint(
     checkpoint_format="safetensors",
     hf_dtype=None,
     max_shard_size=None,
+    _preflight=None,
 ):
-    if checkpoint_format == "hf" and hf_dtype is not None:
-        from .hf import save_hf
-
-        return save_hf(
-            path, checkpoint_state, dtype=hf_dtype, max_shard_size=max_shard_size
-        )
     ctx = _context()
+
+    def prepare():
+        if _preflight is not None:
+            return _preflight()
+        return path, _save_route(checkpoint_format, hf_dtype, max_shard_size)
+
+    root, route = _collective(ctx, prepare)
+    _unwrap(
+        core._agree_choice(
+            ctx, "checkpoint save route", route, (*_SAVE_FORMATS, "HF weights")
+        )
+    )
+    if route == "HF weights":
+        from .hf import _save_hf
+
+        return _save_hf(root, checkpoint_state, hf_dtype, max_shard_size, ctx)
     adapter = FSDP2Adapter()
     state = _collective(ctx, lambda: adapter.describe(checkpoint_state, ctx))
     state.global_steps = global_steps
-    if checkpoint_format == "safetensors":
-        result = core.save(path, state, ctx)
-    elif checkpoint_format == "dcp":
+    if route == "safetensors":
+        result = core.save(root, state, ctx)
+    elif route == "dcp":
         from . import dcp
 
-        result = dcp.save(path, state, ctx)
-    elif checkpoint_format == "hf":
+        result = dcp.save(root, state, ctx)
+    else:
         from .. import hf
 
-        result = hf.save_state(path, state, ctx, max_shard_size=max_shard_size)
-    else:
-        raise ValueError(f"unknown checkpoint_format {checkpoint_format!r}")
+        result = hf.save_state(root, state, ctx, max_shard_size=max_shard_size)
     _unwrap(result)
-    _finish(state)
+    _collective(ctx, lambda: _finish(state))
 
 
 def _load_format(path):
@@ -498,10 +508,16 @@ def _load_format(path):
     return "safetensors"
 
 
-def load_checkpoint(path, checkpoint_state, common_only=False):
+def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=None):
     ctx = _context()
     adapter = FSDP2Adapter(loading=True, common_only=common_only)
-    state = _collective(ctx, lambda: adapter.describe(checkpoint_state, ctx))
+
+    def prepare():
+        if _preflight is not None:
+            _preflight()
+        return adapter.describe(checkpoint_state, ctx)
+
+    state = _collective(ctx, prepare)
 
     def preflight(objects, blobs):
         adapter.prepare_restore(checkpoint_state, objects, blobs)

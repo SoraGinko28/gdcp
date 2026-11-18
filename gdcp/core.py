@@ -72,11 +72,17 @@ def _collective(ctx, operation, action: Callable[[], Any]) -> Result[Any]:
 
 def _collective_choice(ctx, operation, action, choices):
     selected = _collective(ctx, operation, action)
-    if type(selected) is Err or ctx.coordinator is None:
+    if type(selected) is Err:
         return selected
+    return _agree_choice(ctx, operation, selected.value, choices)
+
+
+def _agree_choice(ctx, operation, selected, choices):
+    if ctx.coordinator is None:
+        return Ok(selected)
     for choice in choices:
-        if ctx.coordinator.vote(selected.value == choice):
-            return selected
+        if ctx.coordinator.vote(selected == choice):
+            return Ok(selected)
     return _error(operation, ValueError(f"ranks disagree on {operation}"))
 
 
@@ -98,10 +104,17 @@ def _validate_state(state):
             raise TypeError(f"rank_state {name} must contain bytes")
 
 
-def _broadcast_names(ctx, source, names):
+def _broadcast_names(ctx, operation, source, names):
     coordinator = ctx.coordinator
     assert coordinator is not None
-    data = json.dumps(sorted(names)).encode() if ctx.rank == source else b""
+    prepared = _collective(
+        ctx,
+        operation,
+        lambda: json.dumps(names()).encode() if ctx.rank == source else b"",
+    )
+    if type(prepared) is Err:
+        return prepared
+    data = prepared.value
     received = bytearray()
     # The coordinator's boolean AND can broadcast one bit at a time from source.
     while coordinator.vote(ctx.rank != source or len(received) < len(data)):
@@ -113,26 +126,58 @@ def _broadcast_names(ctx, source, names):
                 if not coordinator.vote(not (byte >> bit & 1))
             )
         )
-    return set(json.loads(received))
+    return _collective(ctx, operation, lambda: json.loads(received))
 
 
 def _agree_rank_state(state, ctx):
     coordinator = ctx.coordinator
     if ctx.world_size == 1 or coordinator is None:
-        return
-    names = set(state.rank_state)
-    if coordinator.vote(not names):
-        return
-    reference = _broadcast_names(ctx, 0, names)
-    difference = names ^ reference
-    if coordinator.vote(not difference):
-        return
+        return Ok(None)
+    operation = "agree on rank state"
+    names = _collective(ctx, operation, lambda: set(state.rank_state))
+    if type(names) is Err or coordinator.vote(not names.value):
+        return names
+    reference = _broadcast_names(ctx, operation, 0, lambda: sorted(names.value))
+    if type(reference) is Err:
+        return reference
+    difference = _collective(ctx, operation, lambda: names.value ^ set(reference.value))
+    if type(difference) is Err or coordinator.vote(not difference.value):
+        return difference
     for source in range(1, ctx.world_size):
-        if not coordinator.vote(ctx.rank != source or not difference):
-            (key,) = _broadcast_names(ctx, source, [min(difference, default="")])
+        if not coordinator.vote(ctx.rank != source or not difference.value):
+            break
+    mismatch = _broadcast_names(ctx, operation, source, lambda: [min(difference.value)])
+    if type(mismatch) is Err:
+        return mismatch
+    (key,) = mismatch.value
+    return _error(
+        operation,
+        ValueError(f"rank_state keys disagree for {key!r} (ranks 0 and {source})"),
+    )
+
+
+def _agree_components(state, ctx):
+    coordinator = ctx.coordinator
+    if ctx.world_size == 1 or coordinator is None:
+        return Ok(None)
+    operation = "agree on checkpoint components"
+    names = _collective(
+        ctx, operation, lambda: [item.name for item in state.components]
+    )
+    if type(names) is Err or coordinator.vote(not names.value):
+        return names
+    reference = _broadcast_names(ctx, operation, 0, lambda: names.value)
+    if type(reference) is Err:
+        return reference
+
+    def compare():
+        if names.value != reference.value:
             raise ValueError(
-                f"rank_state keys disagree for {key!r} (ranks 0 and {source})"
+                f"ranks disagree on checkpoint component sequence (rank 0: "
+                f"{reference.value!r}, rank {ctx.rank}: {names.value!r})"
             )
+
+    return _collective(ctx, operation, compare)
 
 
 def _compute_view(component):
@@ -163,18 +208,65 @@ def _initialize_save(path, state, ctx):
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     desc.atomic_write(root / desc.PENDING_NAME, b"GDCP save in progress\n")
-    for name in [component.name for component in state.components] + list(
-        state.rank_state
-    ):
-        (root / name).mkdir(parents=True, exist_ok=True)
+    names = [component.name for component in state.components] + list(state.rank_state)
+    _initialize_directories(root, names)
+
+
+def _initialize_directories(root, names):
+    # Check the staging filesystem itself for case and Unicode aliases. A
+    # distinct directory for each spelling also keeps its rank files distinct.
+    seen = {}
+    for name in dict.fromkeys(names):
+        directory = root / name
+        directory.mkdir(exist_ok=True)
+        info = directory.stat()
+        identity = info.st_dev, info.st_ino
+        if identity in seen:
+            raise ValueError(
+                f"checkpoint directories {seen[identity]!r} and {name!r} alias"
+            )
+        seen[identity] = name
+
+
+def _rank_save(ctx, compute, storage):
+    coordinator = ctx.coordinator
+    if coordinator is None:
+        return rank_save(ctx.rank, compute, storage)
+    begin_save = storage.begin_save
+    entered = False
+
+    def begin(view, rank):
+        nonlocal entered
+        entered = True
+        if not coordinator.vote(True):
+            return _error(
+                "save plan", ValueError("another rank failed to plan its save")
+            )
+        return begin_save(view, rank)
+
+    try:
+        assert begin_save is not None
+        return rank_save(ctx.rank, compute, replace(storage, begin_save=begin))
+    finally:
+        # A rank can fail to build or validate its plan before begin_save.
+        if not entered:
+            coordinator.vote(False)
 
 
 def _save_one(ctx, compute, storage):
     # The connector has no session leader for a completely empty component.
     # Its semantic tensor entries still live in GDCP's manifest.
-    if not storage.physical_layout.tensor_entries:
+    has_payload = _collective_choice(
+        ctx,
+        "component payload presence",
+        lambda: bool(storage.physical_layout.tensor_entries),
+        (True, False),
+    )
+    if type(has_payload) is Err:
+        return has_payload
+    if not has_payload.value:
         return Ok(None)
-    result = rank_save(ctx.rank, compute, storage)
+    result = _rank_save(ctx, compute, storage)
     _raise_io_interrupt(storage)
     if type(result) is Ok:
         getattr(compute.data_accessor, "finish", lambda: None)()
@@ -321,9 +413,10 @@ def _transactional_save(path, state, ctx, action):
     validated = _collective(ctx, "validate save", lambda: _validate_save(state, ctx))
     if type(validated) is Err:
         return validated
-    agreed = _collective(
-        ctx, "agree on rank state", lambda: _agree_rank_state(state, ctx)
-    )
+    agreed = _agree_rank_state(state, ctx)
+    if type(agreed) is Err:
+        return agreed
+    agreed = _agree_components(state, ctx)
     if type(agreed) is Err:
         return agreed
     created = _collective(
@@ -337,24 +430,20 @@ def _transactional_save(path, state, ctx, action):
         result = action(transaction)
         if type(result) is Ok:
             result = _collective(ctx, "checkpoint publish", transaction.publish)
+    except BaseException as exc:
+        _collective(ctx, "checkpoint rollback", transaction.rollback)
+        if not isinstance(exc, Exception):
+            raise
+        return _error("checkpoint transaction", exc)
+    else:
         if type(result) is Err:
             rollback = _collective(ctx, "checkpoint rollback", transaction.rollback)
             result = rollback if type(rollback) is Err else result
         else:
             transaction.accept()
-    except BaseException as exc:
-        try:
-            _collective(ctx, "checkpoint rollback", transaction.rollback)
-        finally:
-            transaction.close()
-        if not isinstance(exc, Exception):
-            raise
-        return _error("checkpoint transaction", exc)
-    try:
-        transaction.close()
-    except Exception as exc:
-        result = _error("checkpoint recovery", exc)
-    return result
+    finally:
+        closed = _collective(ctx, "checkpoint recovery", transaction.close)
+    return closed if type(result) is Ok else result
 
 
 def save(path, state, ctx, *, policy=None, backend=None) -> Result[None]:
@@ -608,6 +697,9 @@ def load(
     path, state, ctx, *, backend=None, strict=True, _preflight=None
 ) -> Result[None]:
     """Restore requested components after all strict metadata checks pass."""
+    agreed = _agree_components(state, ctx)
+    if type(agreed) is Err:
+        return agreed
     backend = backend or SafeTensorsBackend()
     prepared = _collective(
         ctx, "prepare load", lambda: _prepare_load(path, state, ctx, backend, strict)

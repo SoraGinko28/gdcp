@@ -21,28 +21,23 @@ from gdtensor.builder import (
     GlobalTensorMeta,
     NaiveDTensor,
     NamedDTensor,
-    Ok,
     Replicate,
     StorageDTensorsView,
 )
-from gdtensor.io import rank_save
 from gdtensor_conn._geometry import nonempty_columns
 from gdtensor_conn._layout import build_payload_index
 from gdtensor_conn.access import StorageDataAccessor
-from gdtensor_conn.formats import (
-    HF_INDEX_NAME,
-    LoadSessionBase,
-    SafeTensorsSaveSession,
-)
+from gdtensor_conn.formats import HF_INDEX_NAME, LoadSessionBase
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
 
 from . import core, desc
 from .backend import (
+    _CoordinatedSaveSession,
     _InterruptIO,
+    _begin_session,
     _collective_begin,
     _raise_io_interrupt,
-    _remember_io_interrupt,
 )
 from ._transaction import PREFLIGHT
 from .policy import PerRankPolicy, storage_mesh
@@ -171,7 +166,7 @@ def _combined(state, available=None):
     return combined, objects
 
 
-class _HFSaveSession(SafeTensorsSaveSession):
+class _HFSaveSession(_CoordinatedSaveSession):
     def __init__(self, *args, assignment, logical_shapes, **kwargs):
         self.assignment = assignment
         self.logical_shapes = logical_shapes
@@ -229,9 +224,6 @@ class _HFSaveSession(SafeTensorsSaveSession):
         return files
 
     def _after_barrier(self):
-        return _remember_io_interrupt(self.io, self._write_completion)
-
-    def _write_completion(self):
         if self.rank != 0:
             return
         if len(set(self.assignment.values())) > 1:
@@ -269,13 +261,6 @@ class _HFLoadSession(LoadSessionBase):
             self.offsets[slot.pos] = self.headers[slot.pos.tensor_id]["offset"]
 
 
-def _begin_hf_session(session_type, arguments, options, view, rank):
-    try:
-        return Ok(session_type(rank, *arguments, **options))
-    except Exception as exc:
-        return core._error("HF begin session", exc)
-
-
 class HFBackend:
     """Shared-file safetensors storage; no rank assembles global tensors."""
 
@@ -289,15 +274,17 @@ class HFBackend:
         index = build_payload_index(table, layout)
         ids = [named.global_tensor_id for named in table.named_d_tensors]
 
-        arguments = str(root), table, layout, index, io
-        save_options = dict(
+        arguments = str(root), index, io
+        begin_save = partial(
+            _begin_session,
+            _HFSaveSession,
+            *arguments,
             coord=coordinator,
             assignment=self.assignment,
             logical_shapes=self.logical_shapes,
         )
-        begin_save = partial(_begin_hf_session, _HFSaveSession, arguments, save_options)
         begin_load = partial(
-            _begin_hf_session, _HFLoadSession, arguments, dict(headers=self.headers)
+            _begin_session, _HFLoadSession, *arguments, headers=self.headers
         )
         return StorageDTensorsView(
             ids,
@@ -342,9 +329,9 @@ def _save_prepare(path, state, ctx, max_shard_size):
     return combined, objects, compute, storage
 
 
-def _run_io(call, ctx, combined, compute, storage):
+def _save_io(ctx, combined, compute, storage):
     try:
-        result = call(ctx.rank, compute, storage)
+        result = core._rank_save(ctx, compute, storage)
         _raise_io_interrupt(storage)
         return result
     finally:
@@ -364,8 +351,7 @@ def _initialize(transaction, state, ctx, objects, assignment, write_metadata):
         root = transaction.stage
         root.mkdir(parents=True, exist_ok=True)
         desc.atomic_write(root / desc.PENDING_NAME, b"HF save in progress\n")
-        for name in state.rank_state:
-            (root / name).mkdir(parents=True, exist_ok=True)
+        core._initialize_directories(root, state.rank_state)
         desc.write_objects(root / _OBJECTS, objects)
 
 
@@ -409,7 +395,7 @@ def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
     if type(result) is Err:
         return result
     result = core._collective(
-        ctx, "HF save", lambda: _run_io(rank_save, ctx, combined, compute, storage)
+        ctx, "HF save", lambda: _save_io(ctx, combined, compute, storage)
     )
     if type(result) is Err:
         return result

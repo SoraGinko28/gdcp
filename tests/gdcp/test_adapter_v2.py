@@ -71,6 +71,87 @@ def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
         list(pool.map(load, range(2)))
 
 
+@pytest.mark.parametrize(
+    "options, expected",
+    [
+        ({"checkpoint_format": "bad"}, "unsupported checkpoint_format"),
+        ({"checkpoint_format": "dcp", "hf_dtype": "fp32"}, "require checkpoint_format"),
+        ({"async_fast_checkpoint": True}, "async_fast_checkpoint"),
+    ],
+)
+def test_invalid_fsdp2_save_arguments_vote_on_every_rank(
+    tmp_path, monkeypatch, options, expected
+):
+    coordinator = ThreadCoordinator(2, timeout=2)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+
+    def save(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        match = "another rank failed" if rank else expected
+        with pytest.raises(
+            (ValueError, RuntimeError, NotImplementedError), match=match
+        ):
+            FSDP2Checkpointer.save(
+                tmp_path / "checkpoint", {}, **(options if not rank else {})
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(save, range(2)))
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ({"checkpoint_format": "safetensors"}, {"checkpoint_format": "dcp"}),
+        ({"checkpoint_format": "hf"}, {"checkpoint_format": "hf", "hf_dtype": "bf16"}),
+    ],
+)
+def test_fsdp2_save_routes_agree_before_dispatch(tmp_path, monkeypatch, options):
+    coordinator = ThreadCoordinator(2, timeout=2)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    described = []
+    describe = fsdp2.FSDP2Adapter.describe
+
+    def track_describe(adapter, state, ctx):
+        described.append(ctx.rank)
+        return describe(adapter, state, ctx)
+
+    monkeypatch.setattr(fsdp2.FSDP2Adapter, "describe", track_describe)
+
+    def save(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        with pytest.raises(RuntimeError, match="ranks disagree on checkpoint save"):
+            FSDP2Checkpointer.save(tmp_path / "checkpoint", {}, **options[rank])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(save, range(2)))
+    assert not described
+    assert not list(tmp_path.iterdir())
+
+
+def test_invalid_fsdp2_load_arguments_vote_on_every_rank(tmp_path, monkeypatch):
+    coordinator = ThreadCoordinator(2, timeout=2)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        match = "another rank failed" if rank else "ignore_model_keys"
+        with pytest.raises((RuntimeError, NotImplementedError), match=match):
+            FSDP2Checkpointer.load(
+                tmp_path,
+                {},
+                ignore_model_keys=None if rank else set(),
+                load_common_state_only=True,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+
+
 def _range(key, offset, size):
     return SimpleNamespace(global_tensor_id=key, global_tensor_offset=offset, size=size)
 

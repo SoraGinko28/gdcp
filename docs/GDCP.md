@@ -29,6 +29,10 @@ Model-only save and load, model-only load from a full checkpoint, extra-only
 save, and `load_common_state_only=True` are supported. Optimizer state needs
 the accompanying model to establish parameter names, including when loading.
 The normal load requires a model. Common-only load restores extra state.
+All ranks must use the same FSDP2 save format and agree on whether an HF save
+exports weights only or full state. Per-rank safetensors and DCP loads require
+the same ordered component list on every rank. Saves also require that agreement
+before staging begins.
 
 `gdcp_manifest.json` is the checkpoint commit marker. GDCP writes it last,
 after every rank commits every requested component and extra-state file.
@@ -143,10 +147,11 @@ foreign entries, then remove only verified obsolete siblings before retrying.
 The portable absent-target window restores a complete backup automatically but
 still refuses a complete stage after returning foreign entries. After exchange,
 a retained old stage is refused; after portable publication, a retained backup is
-refused. An accepted cleanup failure logs a warning and returns success with the
-new checkpoint complete. An interrupt after the accepted-success boundary during
-obsolete cleanup likewise leaves the accepted new generation; old files may
-already have been removed. Process death, failed coordination, power/device loss,
+refused. Recoverable cleanup failures log a warning and return success with the
+new checkpoint complete. If an error escapes transaction cleanup after acceptance,
+every rank reports a cleanup failure and the new checkpoint is already committed.
+An interrupt during obsolete cleanup also leaves the accepted new generation.
+Process death, failed coordination, power/device loss,
 or a filesystem that refuses rollback cannot promise a collective error return or
 restoration at the original pathname. Data and directory fsyncs retain their
 existing durability assumptions.
@@ -165,6 +170,8 @@ in `extra_state/extra_state_rank_{rank}.pt` and loaded with pickle enabled;
 only load trusted checkpoints. All ranks must supply the same set of rank-state
 keys when saving. If the keys differ, every rank reports the same error naming a
 differing key before GDCP creates a staging directory or writes checkpoint files.
+If different names resolve to the same directory on the checkpoint filesystem,
+the save fails on every rank before any tensor or rank-state payload is written.
 The manifest lists the files saved for each key. A missing declared file fails
 the load on every rank. When loading with a larger world size, only ranks outside
 the saved world warn and load rank 0's file. Values inside that fallback object

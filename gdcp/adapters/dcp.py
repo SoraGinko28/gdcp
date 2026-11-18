@@ -535,10 +535,16 @@ def read_metadata(root):
 
 
 def save(path, state, ctx):
-    components = {component.name: component for component in state.components}
-    return core.save(
-        path, state, ctx, policy=DcpPolicy(), backend=DcpBackend(components)
+    backend = core._collective(
+        ctx,
+        "prepare DCP save",
+        lambda: DcpBackend(
+            {component.name: component for component in state.components}
+        ),
     )
+    if type(backend) is Err:
+        return backend
+    return core.save(path, state, ctx, policy=DcpPolicy(), backend=backend.value)
 
 
 def _native_tensor(tensor_id, item, world):
@@ -752,6 +758,9 @@ def load(path, state, ctx, *, _preflight=None):
         return manifest
     if manifest.value:
         return core.load(path, state, ctx, backend=DcpBackend(), _preflight=_preflight)
+    agreed = core._agree_components(state, ctx)
+    if type(agreed) is Err:
+        return agreed
     prepared = core._collective(
         ctx, "prepare native DCP load", lambda: _prepare_native(path, state, ctx)
     )

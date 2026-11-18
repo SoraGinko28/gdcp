@@ -187,6 +187,27 @@ def test_dcp_save_close_failure_votes_on_every_rank(tmp_path, monkeypatch):
     assert not root.exists()
 
 
+def test_invalid_dcp_component_map_votes_on_every_rank(tmp_path):
+    from gdcp.adapters.dcp import save
+
+    fixture = numpy_checkpoint(2, initialized=True)
+    fixture.states[0].components = [object()]
+    coordinator = ThreadCoordinator(2, timeout=2)
+
+    def save_rank(rank):
+        return save(
+            tmp_path / "checkpoint",
+            fixture.states[rank],
+            RankContext(rank, 2, coordinator),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(save_rank, range(2)))
+    assert all(type(result) is Err for result in results), results
+    assert "name" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
 def test_noncanonical_native_chunk_geometry_is_rejected(tmp_path):
     import pickle
     from torch.distributed.checkpoint.metadata import (

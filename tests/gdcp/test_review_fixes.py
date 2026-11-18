@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from gdcp import _transaction, desc, hf
+from gdcp import _transaction, core, desc, hf
 from gdcp.state import RankContext
 from gdtensor.builder import Err
 from gdtensor_conn.coord import ThreadCoordinator
@@ -20,6 +20,159 @@ _PAYLOADS = [
     ("dcp", "model/__0_0.distcp"),
     ("hf", "model.safetensors"),
 ]
+_FORMATS = [fmt for fmt, _ in _PAYLOADS]
+
+
+def _parallel(call):
+    coordinator = ThreadCoordinator(2, timeout=2)
+
+    def invoke(rank):
+        return call(RankContext(rank, 2, coordinator))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return list(pool.map(invoke, range(2)))
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("names", [("Upper", "upper"), ("é", "e\u0301")])
+def test_rank_state_filesystem_aliases_fail_before_payloads(
+    tmp_path, monkeypatch, fmt, names
+):
+    probe = tmp_path / names[0]
+    probe.mkdir()
+    if not (tmp_path / names[1]).exists():
+        pytest.skip("checkpoint filesystem distinguishes these names")
+    probe.rmdir()
+    root = tmp_path / "checkpoint"
+    old, source = _fixture(), _fixture(shift=7)
+    assert_ok(_run(fmt, root, old))
+    for rank, state in enumerate(source.states):
+        state.rank_state = {name: f"{name}-{rank}".encode() for name in names}
+    writes = []
+    write = core._save_rank_state
+
+    def track_write(*args):
+        writes.append(True)
+        return write(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(core, "_save_rank_state", track_write)
+        results = _run(fmt, root, source)
+    assert all(type(result) is Err for result in results), results
+    assert any(all(name in result.value.msg for name in names) for result in results)
+    assert not writes
+    _assert_generation(fmt, root, old, world=2)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_rank_state_serialization_failure_votes_before_broadcast(tmp_path, fmt):
+    class RankKey(str):
+        def __lt__(self, other):
+            raise ValueError("cannot order rank keys")
+
+    fixture = _fixture()
+    fixture.states[0].rank_state = {RankKey(name): b"" for name in ("one", "two")}
+    fixture.states[1].rank_state = {name: b"" for name in ("one", "two")}
+    call, options = _operation(fmt, False, fixture)
+    root = tmp_path / "checkpoint"
+    results = _parallel(
+        lambda ctx: call(root, fixture.states[ctx.rank], ctx, **options)
+    )
+    assert all(type(result) is Err for result in results), results
+    assert "cannot order rank keys" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("phase", ["commit", "abort"])
+def test_descriptor_close_failure_coordinates_save(tmp_path, monkeypatch, fmt, phase):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture()
+    call, options = _operation(fmt, False, fixture)
+    close, write = FileIO.close_rank, FileIO.pwrite
+
+    def fail_close(io, rank, prefix=None):
+        close(io, rank, prefix)
+        if rank == 0:
+            raise OSError("injected descriptor close failure")
+
+    def fail_write(io, rank, path, offset, data):
+        if rank == 0 and offset > 0:
+            raise OSError("injected payload write failure")
+        return write(io, rank, path, offset, data)
+
+    monkeypatch.setattr(FileIO, "close_rank", fail_close)
+    if phase == "abort":
+        monkeypatch.setattr(FileIO, "pwrite", fail_write)
+    results = _parallel(
+        lambda ctx: call(root, fixture.states[ctx.rank], ctx, **options)
+    )
+    assert all(type(result) is Err for result in results), results
+    failure = "descriptor close" if phase == "commit" else "payload write"
+    assert f"injected {failure} failure" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", ["safetensors", "dcp"])
+@pytest.mark.parametrize("mismatch", ["missing", "order"])
+@pytest.mark.parametrize("loading", [False, True])
+def test_component_sequence_agreement_precedes_io(tmp_path, fmt, mismatch, loading):
+    root = tmp_path / "checkpoint"
+    source, target = _fixture(), _fixture(shift=7)
+    if loading:
+        assert_ok(_run(fmt, root, source))
+    call, options = _operation(fmt, loading, target)
+    components = target.states[1].components
+    if mismatch == "missing":
+        components.pop(0)
+    else:
+        components.reverse()
+    model = target.fabrics["model"].buffers[0]["weight"]
+    before = model.tobytes()
+    results = _parallel(lambda ctx: call(root, target.states[ctx.rank], ctx, **options))
+    assert all(type(result) is Err for result in results), results
+    assert all("component" in result.value.msg for result in results)
+    assert model.tobytes() == before
+    if not loading:
+        assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_save_plan_failure_votes_before_opening_sessions(tmp_path, monkeypatch, fmt):
+    fixture = _fixture()
+    call, options = _operation(fmt, False, fixture)
+    root = tmp_path / "checkpoint"
+    save = core.rank_save
+
+    def fail_plan(rank, compute, storage):
+        if rank == 0:
+            return core._error("save plan", ValueError("injected save plan failure"))
+        return save(rank, compute, storage)
+
+    monkeypatch.setattr(core, "rank_save", fail_plan)
+    results = _parallel(
+        lambda ctx: call(root, fixture.states[ctx.rank], ctx, **options)
+    )
+    assert all(type(result) is Err for result in results), results
+    assert "injected save plan failure" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+def test_transaction_close_failure_returns_error_on_every_rank(tmp_path, monkeypatch):
+    fixture = _fixture()
+    close = _transaction.DirectoryTransaction.close
+    root = tmp_path / "checkpoint"
+
+    def fail_close(transaction):
+        close(transaction)
+        if transaction.rank == 0:
+            raise OSError("injected transaction close failure")
+
+    monkeypatch.setattr(_transaction.DirectoryTransaction, "close", fail_close)
+    results = _parallel(lambda ctx: core.save(root, fixture.states[ctx.rank], ctx))
+    assert all(type(result) is Err for result in results), results
+    assert "injected transaction close failure" in results[0].value.msg
+    assert (root / desc.MANIFEST_NAME).is_file()
 
 
 @pytest.mark.parametrize("fmt", [fmt for fmt, _ in _PAYLOADS])

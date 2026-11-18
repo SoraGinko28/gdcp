@@ -31,21 +31,29 @@ CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:ncc
 
 HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys, and a typed JSON `optimizer.json` sidecar preserving param groups and aliases. Native HF loading builds storage from headers and an optional standard index; no GDCP manifest is needed. DCP loading accepts native per-rank chunks only if their geometry is representable by GDTensor and rejects unsupported layouts explicitly.
 
-All three formats require the same rank-state keys on every rank before any
-checkpoint writes. GDCP records the saved rank files in its manifest for
-per-rank safetensors and DCP, and in the completion marker for HF. A missing
-declared file fails validation on all ranks. When the loading world is larger,
+All three formats require the same rank-state keys and ordered component list on
+every rank before staging a save. Names that resolve to the same directory on the
+checkpoint filesystem fail preflight on all ranks before any payload is written.
+FSDP2 validates save options collectively and requires every rank to select the
+same format and HF export mode. A descriptor close failure during a save aborts
+publication on every rank.
+
+GDCP records the saved rank files in its manifest for per-rank safetensors and
+DCP, and in the completion marker for HF. A missing declared file fails
+validation on all ranks. When the loading world is larger,
 ranks outside the saved world warn and use rank 0's file. Older HF checkpoints
 without a rank-state inventory still use the rank filenames to look up state.
 Requesting rank state from native DCP without a GDCP manifest fails collectively.
 
-Per-rank safetensors, DCP, and HF loads validate all requested tensor keys,
-shapes, dtypes, storage metadata, available tied-parameter alias information,
-optimizer objects and parameter groups, and requested rank state before writing
-into live targets. If any rank fails validation, the model, optimizer, and
-caller's checkpoint dict stay unchanged on every rank. Native formats without an
-explicit alias map are checked using the alias information their metadata
-provides. Tensor payloads are streamed into the target, so a read error during
+Per-rank safetensors and DCP loads require every rank to request the same
+components in the same order. Per-rank safetensors, DCP, and HF loads validate
+all requested tensor keys, shapes, dtypes, storage metadata, available
+tied-parameter alias information, optimizer objects and parameter groups, and
+requested rank state before writing into live targets. If any rank fails
+validation, the model, optimizer, and caller's checkpoint dict stay unchanged
+on every rank. Native formats without an explicit alias map are checked using
+the alias information their metadata provides. Tensor payloads are streamed into
+the target, so a read error during
 the transfer can leave tensors partially updated.
 
 All three formats and weights-only HF exports use the directory transaction and

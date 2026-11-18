@@ -2,6 +2,19 @@
 
 from pathlib import Path
 
+_SAVE_FORMATS = ("safetensors", "dcp", "hf")
+
+
+def _save_route(checkpoint_format, hf_dtype, max_shard_size):
+    route = next((fmt for fmt in _SAVE_FORMATS if fmt == checkpoint_format), None)
+    if route is None:
+        raise ValueError(f"unsupported checkpoint_format {checkpoint_format!r}")
+    if route != "hf" and (hf_dtype is not None or max_shard_size is not None):
+        raise ValueError("hf_dtype and max_shard_size require checkpoint_format='hf'")
+    if route == "hf" and hf_dtype is not None:
+        return "HF weights"
+    return route
+
 
 def _reject(options, defaults, kwargs):
     for name, value in options.items():
@@ -9,6 +22,17 @@ def _reject(options, defaults, kwargs):
             raise NotImplementedError(f"{name} is not supported in GDCP v1")
     if kwargs:
         raise NotImplementedError(f"{next(iter(kwargs))} is not supported in GDCP v1")
+
+
+def _fsdp2_adapter(preflight):
+    try:
+        from .adapters import fsdp2
+    except ModuleNotFoundError as exc:
+        # Diagnose unsupported arguments even without the optional Torch dependency.
+        if exc.name == "torch":
+            preflight()
+        raise
+    return fsdp2
 
 
 class FSDP2Checkpointer:
@@ -53,27 +77,23 @@ class FSDP2Checkpointer:
         checkpoint_format = kwargs.pop("checkpoint_format", "safetensors")
         hf_dtype = kwargs.pop("hf_dtype", None)
         max_shard_size = kwargs.pop("max_shard_size", None)
-        _reject(options, defaults, kwargs)
-        if checkpoint_format not in ("safetensors", "dcp", "hf"):
-            raise ValueError(f"unsupported checkpoint_format {checkpoint_format!r}")
-        if checkpoint_format != "hf" and (
-            hf_dtype is not None or max_shard_size is not None
-        ):
-            raise ValueError(
-                "hf_dtype and max_shard_size require checkpoint_format='hf'"
-            )
-        from .adapters.fsdp2 import save_checkpoint
 
-        root = Path(path)
-        if global_steps is not None and not ignore_append_global_steps_to_folder:
-            root = root / f"global_step_{global_steps}"
-        save_checkpoint(
-            root,
+        def preflight():
+            _reject(options, defaults, kwargs)
+            route = _save_route(checkpoint_format, hf_dtype, max_shard_size)
+            root = Path(path)
+            if global_steps is not None and not ignore_append_global_steps_to_folder:
+                root = root / f"global_step_{global_steps}"
+            return root, route
+
+        _fsdp2_adapter(preflight).save_checkpoint(
+            path,
             checkpoint_state,
             global_steps,
             checkpoint_format=checkpoint_format,
             hf_dtype=hf_dtype,
             max_shard_size=max_shard_size,
+            _preflight=preflight,
         )
 
     @classmethod
@@ -121,7 +141,10 @@ class FSDP2Checkpointer:
             "dsp_size": 1,
             "cp_size": 1,
         }
-        _reject(options, defaults, kwargs)
-        from .adapters.fsdp2 import load_checkpoint
 
-        load_checkpoint(path, checkpoint_state, load_common_state_only)
+        def preflight():
+            _reject(options, defaults, kwargs)
+
+        _fsdp2_adapter(preflight).load_checkpoint(
+            path, checkpoint_state, load_common_state_only, _preflight=preflight
+        )
