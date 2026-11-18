@@ -14,6 +14,9 @@ _HF_FIXED = {_INDEX, _MARKER, "model.safetensors", "optimizer.json", "config.jso
 _ITEMSIZE = {
     "BOOL": 1,
     "U8": 1,
+    "U16": 2,
+    "U32": 4,
+    "U64": 8,
     "I8": 1,
     "I16": 2,
     "I32": 4,

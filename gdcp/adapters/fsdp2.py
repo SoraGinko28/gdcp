@@ -18,7 +18,6 @@ from torch.distributed.tensor import (
     Shard as TorchShard,
 )
 
-from gdtensor import make_gd_tensor
 from gdtensor.builder import (
     ArrangedMesh,
     DTensorTable,
@@ -27,6 +26,7 @@ from gdtensor.builder import (
     NaiveDTensor,
     NamedDTensor,
     Replicate,
+    Shard,
 )
 from gdtensor.tag import WorldSize
 from gdtensor_conn.coord import GlooCoordinator
@@ -39,6 +39,9 @@ from .torch_access import TorchAccessor
 _DTYPES = {
     torch.bool: "BOOL",
     torch.uint8: "U8",
+    torch.uint16: "U16",
+    torch.uint32: "U32",
+    torch.uint64: "U64",
     torch.int8: "I8",
     torch.int16: "I16",
     torch.int32: "I32",
@@ -110,19 +113,17 @@ def _describe_tensor(key, tensor, ctx):
         raise NotImplementedError(f"{key}: meta tensors are not supported")
     if tensor.dtype not in _DTYPES:
         raise NotImplementedError(f"{key}: unsupported real dtype {tensor.dtype}")
-    if isinstance(tensor, DTensor):
-        _validate_dtensor(key, tensor, ctx)
-        described = make_gd_tensor(tensor)
-        if tensor.ndim == 0:
-            described.global_tensor_meta.global_shape = [1]
-        return described
     meta = GlobalTensorMeta(
         list(tensor.shape) or [1], _DTYPES[tensor.dtype], tensor.element_size()
     )
-    return NaiveDTensor(meta, [Replicate()], ArrangedMesh(WorldSize(ctx.world_size)))
+    mesh = ArrangedMesh(WorldSize(ctx.world_size))
+    if isinstance(tensor, DTensor):
+        placement = _dtensor_placement(key, tensor, ctx)
+        return NaiveDTensor(meta, [placement], mesh, torch_d_tensor=tensor)
+    return NaiveDTensor(meta, [Replicate()], mesh)
 
 
-def _validate_dtensor(key, tensor, ctx):
+def _dtensor_placement(key, tensor, ctx):
     mesh = tensor.device_mesh
     if mesh.ndim != 1 or mesh.mesh.reshape(-1).tolist() != list(range(ctx.world_size)):
         raise NotImplementedError(f"{key}: mesh must be one-dimensional over all ranks")
@@ -133,9 +134,10 @@ def _validate_dtensor(key, tensor, ctx):
     if isinstance(placement, TorchShard) and placement.dim == 0:
         if tensor.ndim == 0:
             raise NotImplementedError(f"{key}: a scalar cannot use Shard(0)")
-        return
+        return Shard(0)
     if not isinstance(placement, TorchReplicate):
         raise NotImplementedError(f"{key}: only Shard(0) and Replicate are supported")
+    return Replicate()
 
 
 def _component(name, tensors, objects, ctx):

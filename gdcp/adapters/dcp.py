@@ -62,6 +62,9 @@ from ..policy import PerRankPolicy, storage_mesh
 _DTYPES = {
     "BOOL": torch.bool,
     "U8": torch.uint8,
+    "U16": torch.uint16,
+    "U32": torch.uint32,
+    "U64": torch.uint64,
     "I8": torch.int8,
     "I16": torch.int16,
     "I32": torch.int32,

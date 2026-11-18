@@ -36,6 +36,8 @@ before staging begins.
 
 Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
 Integer and boolean buffers round-trip bit for bit into targets of the same dtype.
+This includes `uint16`, `uint32`, and `uint64` buffers and `int16` buffers sharded
+with `Shard(0)`.
 See [GDCP v2 formats](GDCP-V2.md) for `save_hf` and `load_hf` options.
 
 `gdcp_manifest.json` is the checkpoint commit marker. GDCP writes it last,

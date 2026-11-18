@@ -25,6 +25,8 @@ gdcp.load_hf(path, model)
 
 `gdcp.load_hf(path, model_or_state, dtype=None)` loads weights into existing local tensor shards. When omitted, `dtype` is inferred from the requested floating-point tensors in the checkpoint. Floating-point targets must have the selected dtype. With an optimizer checkpoint dictionary, `dtype="fp32"` targets its fp32 master weights. Integer and boolean tensors are restored bit for bit into targets with matching dtypes. A target containing only integer and boolean tensors can load with `dtype=None`. This function does not infer or update missing Adam moments from a weights-only checkpoint.
 
+Per-rank safetensors, DCP, and HF all preserve `uint16`, `uint32`, and `uint64` buffers and `int16` buffers with `Shard(0)` placement. HF uses the native safetensors dtype codes `U16`, `U32`, `U64`, and `I16` in both export modes.
+
 Apply FSDP2 `fully_shard` to every decoder layer and then the root. Tied embedding keys are represented by a canonical parameter and aliases: payload and optimizer state are stored once. The adapter restores the complete state dictionary while preserving parameter identity. AdamW subclasses may keep any number of per-parameter tensor fields matching parameter geometry, plus replicated scalar fields. Optimizer fields must already exist in the target, including custom fields. The mixed-precision validation fixture uses a real AdamW implementation that updates fp32 masters and casts them to bf16 parameters.
 
 CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:nccl,cpu:gloo"`, so FSDP2 can use NCCL while votes and CPU state use Gloo. The GPU accessor stages one local tensor at a time, copies each save tensor to the host once, and writes back a load tensor once after all its ranges.

@@ -14,7 +14,7 @@ torch = pytest.importorskip("torch")
 from torch.distributed import HashStore, destroy_process_group, init_process_group
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 from gdcp import FSDP2Checkpointer, desc, load_hf, save_hf
 from gdcp.adapters import fsdp2, torch_access
@@ -52,6 +52,10 @@ def test_hf_dtype_inference_failure_votes_on_every_rank(tmp_path, monkeypatch):
 def _batch_norm(dtype, *, initialized):
     model = torch.nn.BatchNorm1d(3, dtype=dtype)
     model.register_buffer("mask", torch.tensor([initialized, False, initialized]))
+    for bits in (16, 32, 64):
+        values = [0, 2**bits - 1, 2 ** (bits - 1) + 1] if initialized else [0, 0, 0]
+        name = f"uint{bits}"
+        model.register_buffer(name, torch.tensor(values, dtype=getattr(torch, name)))
     if initialized:
         model.num_batches_tracked.fill_(16777217)
         model.running_mean.copy_(torch.tensor([1.125, -2.25, 3.5]))
@@ -102,6 +106,8 @@ def test_hf_weights_round_trip_integer_and_bool_buffers(
         headers = read_headers(checkpoint)
         assert headers["num_batches_tracked"]["dtype"] == "I64"
         assert headers["mask"]["dtype"] == "BOOL"
+        for bits in (16, 32, 64):
+            assert headers[f"uint{bits}"]["dtype"] == f"U{bits}"
         assert headers["running_mean"]["dtype"] == code
         load_hf(checkpoint, target)
         _assert_hf_weights(
@@ -124,7 +130,7 @@ def test_hf_weights_load_integer_and_bool_without_float_dtype(tmp_path):
             _assert_tensor_bits(target[name], value)
 
 
-@pytest.mark.parametrize("fmt", ["safetensors", "dcp"])
+@pytest.mark.parametrize("fmt", _FORMATS)
 def test_full_state_round_trip_integer_and_bool_buffers(tmp_path, monkeypatch, fmt):
     monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
     source = _batch_norm(torch.float32, initialized=True)
@@ -143,23 +149,95 @@ def test_hf_weights_only_checks_dtype_of_requested_keys(tmp_path, bits):
     from safetensors.numpy import save_file
 
     key = "optimizer.ids"
+    values = [0, 2**bits - 1]
     save_file(
-        {"weight": np.ones(2, dtype=np.float32), key: np.ones(2, dtype=f"uint{bits}")},
+        {"weight": np.ones(2, dtype=np.float32), key: np.array(values, f"uint{bits}")},
         tmp_path / "model.safetensors",
     )
     weight = torch.zeros(2)
     load_hf(tmp_path, {"weight": weight})
     _assert_tensor_bits(weight, torch.ones(2))
-    for target_dtype in (torch.int64, getattr(torch, f"uint{bits}")):
-        weight.zero_()
-        with pytest.raises(
-            (ValueError, RuntimeError),
-            match=rf"unsupported dtype U{bits} for optimizer\.ids",
-        ):
-            load_hf(
-                tmp_path, {"weight": weight, key: torch.zeros(2, dtype=target_dtype)}
-            )
-        _assert_tensor_bits(weight, torch.zeros(2))
+    weight.zero_()
+    with pytest.raises(
+        RuntimeError, match=r"HF shape/dtype mismatch for optimizer\.ids"
+    ):
+        load_hf(tmp_path, {"weight": weight, key: torch.zeros(2, dtype=torch.int64)})
+    _assert_tensor_bits(weight, torch.zeros(2))
+    target_dtype = getattr(torch, f"uint{bits}")
+    target = torch.zeros(2, dtype=target_dtype)
+    load_hf(tmp_path, {"weight": weight, key: target})
+    _assert_tensor_bits(target, torch.tensor(values, dtype=target_dtype))
+    _assert_tensor_bits(weight, torch.ones(2))
+
+
+def test_hf_weights_can_overwrite_native_unsigned_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    save_file(
+        {
+            f"uint{bits}": torch.zeros(2, dtype=getattr(torch, f"uint{bits}"))
+            for bits in (16, 32, 64)
+        },
+        tmp_path / "model.safetensors",
+    )
+    save_hf(tmp_path, {"weight": torch.ones(2)})
+    assert set(read_headers(tmp_path)) == {"weight"}
+
+
+@pytest.fixture(params=[1, 2])
+def sharded_world(request, monkeypatch):
+    world = request.param
+    init_process_group("fake", store=HashStore(), rank=0, world_size=world)
+    context = local()
+    coordinator = ThreadCoordinator(world, timeout=5) if world > 1 else None
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(hf_adapter, "_context", lambda: context.value)
+    try:
+        yield DeviceMesh("cpu", list(range(world))), world, context, coordinator
+    finally:
+        destroy_process_group()
+
+
+def _sharded_buffer(mesh, values, rank, world):
+    buffer = DTensor.from_local(
+        values.chunk(world)[rank].clone(),
+        mesh,
+        [Shard(0)],
+        run_check=False,
+        shape=values.shape,
+        stride=values.stride(),
+    )
+    model = torch.nn.Module()
+    model.register_buffer("ids", buffer)
+    return model
+
+
+@pytest.mark.parametrize("mode", ["fp32", "bf16", "native_hf", *_FORMATS])
+def test_sharded_int16_buffer_round_trip(tmp_path, sharded_world, mode):
+    from safetensors.torch import save_file
+
+    mesh, world, context, coordinator = sharded_world
+    values = torch.tensor([-32768, -1234, 0, 17, 32767], dtype=torch.int16)
+    if mode == "native_hf":
+        save_file({"ids": values}, tmp_path / "model.safetensors")
+
+    def round_trip(rank):
+        context.value = RankContext(rank, world, coordinator)
+        source = _sharded_buffer(mesh, values, rank, world)
+        target = _sharded_buffer(mesh, torch.zeros_like(values), rank, world)
+        if mode in ("fp32", "bf16"):
+            save_hf(tmp_path, source, dtype=mode)
+        if mode in _FORMATS:
+            FSDP2Checkpointer.save(tmp_path, {"model": source}, checkpoint_format=mode)
+            FSDP2Checkpointer.load(tmp_path, {"model": target})
+        else:
+            assert read_headers(tmp_path)["ids"]["dtype"] == "I16"
+            load_hf(tmp_path, target)
+        _assert_tensor_bits(target.ids.to_local(), values.chunk(world)[rank])
+
+    with ThreadPoolExecutor(max_workers=world) as pool:
+        list(pool.map(round_trip, range(world)))
 
 
 def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
