@@ -42,25 +42,28 @@ exports weights only or full state. All three formats require the same ordered
 component list on every rank during load and before staging a save.
 
 When a coordinator is present, GDCP checks the live world size, unique rank
-IDs, ordered component names, and rank-state keys before payload I/O. Each rank
-creates a claim and compares its checksummed description with rank 0's. Saves
-use the reserved `.NAME.gdcp-vote` directory beside the resolved target. Loads
-use `.gdcp-load-vote` in the resolved target's parent so ranks can load from
-rank-local copies with different names under that parent. Loads compare the
-requested state, which also works for partial restores and native checkpoints.
-The number of collective votes in this phase is independent of the number of
-ranks and the data being compared.
+IDs, ordered component names, and rank-state keys before payload I/O. All ranks
+use one agreement directory in the resolved target's shared parent. Saves use
+the reserved `.gdcp-save-vote` directory and also check that ranks agree on the
+resolved target name. Loads use `.gdcp-load-vote` and compare the requested
+state, which supports partial restores, native checkpoints, and rank-local
+copies with different names under the same parent. Each rank creates a claim
+and compares its checksummed description with rank 0's. The number of votes
+in this phase is independent of the number of ranks and the data being compared.
 
 Coordinated saves and loads need a writable shared target parent. The filesystem
 must provide exclusive file creation, advisory file locks across participating
 nodes, and visibility of fsynced files and directory entries to all ranks after
 a coordinator vote. A rank that cannot read or verify a record votes to fail the
 operation. Rank 0 holds the agreement directory's owner lock through cleanup.
-Overlapping load agreement phases in one parent directory can report that the
-directory is in use. GDCP removes its records before proceeding to payload I/O
-and cleans up when it catches a failure or interrupt during agreement. After
-process death, the next operation that acquires the owner lock removes recognized
-stale records. An unrecognized directory is preserved and reported as an error.
+Overlapping save agreement phases or overlapping load agreement phases in one
+parent can fail if the directory is already in use. GDCP removes its records
+before payload I/O and cleans up entries it created if setup fails or is
+interrupted. To recover a pre-existing agreement directory, GDCP requires a
+valid owner marker and a lock it can acquire. This also applies to legacy
+`.NAME.gdcp-vote` save directories. GDCP preserves unrecognized directories,
+including empty directories and directories with an empty owner marker, and
+returns an error.
 
 Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
 Integer and boolean buffers round-trip bit for bit into targets of the same dtype.

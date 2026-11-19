@@ -4,11 +4,12 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import local
+from threading import Event, local
 
 import pytest
 
 from gdcp import _transaction, core, desc, hf
+from gdcp._agreement import AgreementRecords
 from gdcp.backend import SafeTensorsBackend
 from gdcp.policy import PerRankPolicy
 from gdcp.state import RankContext
@@ -118,7 +119,7 @@ def test_agreement_record_failure_precedes_payloads(
         assert_ok(_run(fmt, root, _fixture()))
     original = _files(root)
     call, options = _operation(fmt, loading, fixture)
-    scratch = ".gdcp-load-vote" if loading else ".checkpoint.gdcp-vote"
+    scratch = ".gdcp-load-vote" if loading else ".gdcp-save-vote"
     read = Path.read_bytes
     current = local()
     faults = []
@@ -161,13 +162,16 @@ def test_agreement_record_failure_precedes_payloads(
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize("loading", [False, True])
-def test_agreement_recovers_owned_records(tmp_path, fmt, loading):
+@pytest.mark.parametrize(
+    "scratch_name", [".checkpoint.gdcp-vote", ".gdcp-save-vote", ".gdcp-load-vote"]
+)
+def test_agreement_recovers_owned_records(tmp_path, fmt, scratch_name):
     root = tmp_path / "checkpoint"
     fixture = _fixture()
+    loading = scratch_name == ".gdcp-load-vote"
     if loading:
         assert_ok(_run(fmt, root, fixture))
-    scratch = tmp_path / (".gdcp-load-vote" if loading else ".checkpoint.gdcp-vote")
+    scratch = tmp_path / scratch_name
     scratch.mkdir()
     (scratch / ".owner").write_bytes(b"GDCP rank agreement v1\n")
     (scratch / "rank-1").write_bytes(b"partial record from interrupted process")
@@ -191,6 +195,138 @@ def test_agreement_preserves_unrecognized_sibling(tmp_path):
     assert _files(scratch) == {"rank-0": b"foreign file"}
 
 
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("different_targets", [False, True])
+def test_duplicate_rank_zero_before_staging(
+    tmp_path, monkeypatch, fmt, different_targets
+):
+    fixture = _fixture(world=1)
+    call, options = _operation(fmt, False, fixture)
+    current = local()
+    absent, initialized = Event(), Event()
+    lexists, initialize = os.path.lexists, AgreementRecords._initialize
+    owner = tmp_path / ".checkpoint0.gdcp-vote" / ".owner"
+    staged = []
+
+    def pause_owner_lookup(path):
+        if path != owner or different_targets:
+            return lexists(path)
+        if current.index == 0 and not absent.is_set():
+            found = lexists(path)
+            absent.set()
+            assert initialized.wait(2)
+            return found
+        assert absent.wait(2)
+        return lexists(path)
+
+    def signal_initialized(records, fd):
+        initialize(records, fd)
+        initialized.set()
+
+    def save(ctx):
+        current.index = ctx.rank
+        root = tmp_path / f"checkpoint{ctx.rank if different_targets else 0}"
+        return call(
+            root, fixture.states[0], RankContext(0, 1, ctx.coordinator), **options
+        )
+
+    monkeypatch.setattr(os.path, "lexists", pause_owner_lookup)
+    monkeypatch.setattr(AgreementRecords, "_initialize", signal_initialized)
+    begin = _transaction.DirectoryTransaction.begin
+
+    def track_begin(transaction, planned):
+        staged.append(transaction.stage)
+        begin(transaction, planned)
+
+    monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
+    results = _parallel(save)
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "duplicate rank 0" in results[0].value.msg
+    assert not staged
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_save_rejects_different_targets_before_staging(tmp_path, fmt):
+    fixture = _fixture()
+    call, options = _operation(fmt, False, fixture)
+
+    def save(ctx):
+        return call(
+            tmp_path / f"checkpoint{ctx.rank}", fixture.states[ctx.rank], ctx, **options
+        )
+
+    results = _parallel(save)
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "checkpoint save target" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("loading", [False, True])
+@pytest.mark.parametrize("fault", [OSError, KeyboardInterrupt])
+def test_agreement_setup_failure_removes_created_entries(
+    tmp_path, monkeypatch, fmt, loading, fault
+):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture()
+    if loading:
+        assert_ok(_run(fmt, root, fixture))
+    original = _files(tmp_path)
+    call, options = _operation(fmt, loading, fixture)
+    scan = AgreementRecords._records
+
+    def fail_first_scan(records):
+        monkeypatch.setattr(AgreementRecords, "_records", scan)
+        assert records.owner.is_file()
+        raise fault("injected agreement setup failure")
+
+    def attempt(ctx):
+        try:
+            return call(root, fixture.states[ctx.rank], ctx, **options)
+        except KeyboardInterrupt as exc:
+            return exc
+
+    monkeypatch.setattr(AgreementRecords, "_records", fail_first_scan)
+    leader, peer = _parallel(attempt)
+    assert type(leader) is (Err if fault is OSError else fault)
+    assert type(peer) is Err
+    assert _files(tmp_path) == original
+    assert list(tmp_path.iterdir()) == ([root] if loading else [])
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize(
+    "scratch_name", [".checkpoint.gdcp-vote", ".gdcp-save-vote", ".gdcp-load-vote"]
+)
+@pytest.mark.parametrize("empty_owner", [False, True])
+def test_agreement_preserves_sibling_without_ownership(
+    tmp_path, fmt, scratch_name, empty_owner
+):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture()
+    loading = scratch_name == ".gdcp-load-vote"
+    if loading:
+        assert_ok(_run(fmt, root, fixture))
+    scratch = tmp_path / scratch_name
+    scratch.mkdir()
+    owner = scratch / ".owner"
+    if empty_owner:
+        owner.touch()
+    inode = scratch.stat().st_ino
+    original = _files(tmp_path)
+
+    results = _run(fmt, root, fixture, loading=loading)
+
+    assert all(type(result) is Err for result in results), results
+    assert "unrecognized agreement directory" in results[0].value.msg
+    assert scratch.stat().st_ino == inode
+    assert _files(tmp_path) == original
+    assert set(tmp_path.iterdir()) == ({root, scratch} if loading else {scratch})
+
+
 def test_agreement_cleanup_finishes_after_interrupt(tmp_path, monkeypatch):
     root = tmp_path / "checkpoint"
     fixture = _fixture()
@@ -199,7 +335,7 @@ def test_agreement_cleanup_finishes_after_interrupt(tmp_path, monkeypatch):
 
     def unlink_owner(path, *args, **kwargs):
         result = unlink(path, *args, **kwargs)
-        if path.parent.name == ".checkpoint.gdcp-vote" and path.name == ".owner":
+        if path.parent.name == ".gdcp-save-vote" and path.name == ".owner":
             raise interrupt
         return result
 

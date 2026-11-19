@@ -18,7 +18,7 @@ from gdtensor.builder import (
 from gdtensor.io import rank_load, rank_save
 
 from . import desc
-from ._agreement import AgreementRecords, agreement_bytes
+from ._agreement import agreement_bytes, agreement_records
 from ._transaction import PREFLIGHT, DirectoryTransaction
 from .backend import SafeTensorsBackend, _raise_io_interrupt
 from .policy import PerRankPolicy
@@ -119,7 +119,13 @@ def _component_names(state):
     return tuple(component.name for component in state.components)
 
 
-def _exchange_agreement(records, ctx, data):
+def _claim_agreement(records, previous, rank, data):
+    if rank == 0 and previous is not None:
+        previous.recover()
+    return records.claim(rank, data)
+
+
+def _exchange_agreement(records, previous, ctx, data):
     coordinator = ctx.coordinator
     assert coordinator is not None
     if coordinator.vote(ctx.rank != 0):
@@ -128,11 +134,15 @@ def _exchange_agreement(records, ctx, data):
     if type(opened) is Err:
         return opened
     if not coordinator.vote(opened.value is True):
-        if coordinator.vote(not records.owned):
-            return _agreement_error("checkpoint agreement record is already in use")
-        return _agreement_error("duplicate rank 0")
+        if not coordinator.vote(not records.owned):
+            return _agreement_error("duplicate rank 0")
+        if coordinator.vote(not records.busy):
+            return _agreement_error(f"unrecognized agreement directory: {records.path}")
+        return _agreement_error("checkpoint agreement record is already in use")
 
-    claimed = _collective(ctx, _AGREEMENT, lambda: records.claim(ctx.rank, data))
+    claimed = _collective(
+        ctx, _AGREEMENT, lambda: _claim_agreement(records, previous, ctx.rank, data)
+    )
     if type(claimed) is Err:
         return claimed
     unreadable = _agreement_error("cannot read or verify checkpoint agreement record")
@@ -148,6 +158,11 @@ def _exchange_agreement(records, ctx, data):
     return unreadable if type(diagnosed) is Err else _agreement_error(diagnosed.value)
 
 
+def _prepare_agreement(path, ctx, components, rank_state, loading):
+    records, previous, target = agreement_records(path, loading=loading)
+    return records, previous, agreement_bytes(ctx, components(), rank_state, target)
+
+
 def _agree(path, ctx, components, rank_state, *, loading=False):
     if ctx.coordinator is None:
         return _collective(
@@ -156,17 +171,14 @@ def _agree(path, ctx, components, rank_state, *, loading=False):
     prepared = _collective(
         ctx,
         _AGREEMENT,
-        lambda: (
-            AgreementRecords(path, loading=loading),
-            agreement_bytes(ctx, components(), rank_state),
-        ),
+        lambda: _prepare_agreement(path, ctx, components, rank_state, loading),
     )
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    records, data = prepared.value
+    records, previous, data = prepared.value
     try:
-        agreed = _exchange_agreement(records, ctx, data)
+        agreed = _exchange_agreement(records, previous, ctx, data)
     finally:
         closed = _collective(ctx, "remove checkpoint agreement record", records.close)
     return closed if type(agreed) is Ok else agreed
@@ -174,8 +186,10 @@ def _agree(path, ctx, components, rank_state, *, loading=False):
 
 def _recover_agreement(path, ctx, loading):
     _validate_context(ctx)
-    records = AgreementRecords(path, loading=loading)
+    records, previous, _ = agreement_records(path, loading=loading)
     records.recover()
+    if previous is not None:
+        previous.recover()
 
 
 def _agree_load(path, state, ctx):

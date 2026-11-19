@@ -1,6 +1,5 @@
 """Filesystem records for agreements that the boolean coordinator cannot carry."""
 
-import errno
 import fcntl
 import hashlib
 import json
@@ -34,8 +33,10 @@ def _is_record(entry):
 
 
 def _description_error(other, reference):
-    rank, (_, components, keys) = other
-    _, expected_components, expected_keys = reference
+    rank, (_, components, keys, target) = other
+    _, expected_components, expected_keys, expected_target = reference
+    if target != expected_target:
+        return f"ranks disagree on checkpoint save target (ranks 0 and {rank})"
     if keys != expected_keys:
         key = min(set(keys) ^ set(expected_keys))
         return f"rank_state keys disagree for {key!r} (ranks 0 and {rank})"
@@ -44,19 +45,29 @@ def _description_error(other, reference):
     return None
 
 
-class AgreementRecords:
-    """A reserved sibling, held by rank zero for one agreement phase."""
+def agreement_records(path, *, loading):
+    root = Path(os.path.realpath(path))
+    if not loading and not root.name:
+        raise ValueError("the filesystem root cannot be a checkpoint")
+    name = ".gdcp-load-vote" if loading else ".gdcp-save-vote"
+    records = AgreementRecords(root.parent / name)
+    if loading:
+        return records, None, None
+    previous = AgreementRecords(root.with_name(f".{root.name}.gdcp-vote"))
+    return records, previous, root.name
 
-    def __init__(self, path, *, loading):
-        root = Path(os.path.realpath(path))
-        if not loading and not root.name:
-            raise ValueError("the filesystem root cannot be a checkpoint")
-        name = ".gdcp-load-vote" if loading else f".{root.name}.gdcp-vote"
-        self.path = root.parent / name
+
+class AgreementRecords:
+    """A reserved directory, held by rank zero for one agreement phase."""
+
+    def __init__(self, path):
+        self.path = path
         self.owner = self.path / _OWNER
         self.fd = None
         self.identity = None
+        self.created = False
         self.owned = False
+        self.busy = False
 
     def recover(self):
         if not os.path.lexists(self.path):
@@ -66,30 +77,55 @@ class AgreementRecords:
         finally:
             self.close()
         if not acquired:
-            raise FileExistsError("checkpoint agreement record is already in use")
+            raise FileExistsError(self.acquisition_error())
+
+    def acquisition_error(self):
+        if self.busy:
+            return "checkpoint agreement record is already in use"
+        return f"unrecognized agreement directory: {self.path}"
 
     def acquire(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.mkdir(exist_ok=True)
-        identity = _identity(self.path)
-        if not os.path.lexists(self.owner) and any(self.path.iterdir()):
-            raise FileExistsError(f"unrecognized agreement directory: {self.path}")
+        try:
+            self.path.mkdir()
+        except FileExistsError:
+            return self._acquire_existing()
+        self.created = True
+        self.identity = _identity(self.path)
+        fd = self._open_owner(os.O_CREAT | os.O_EXCL)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self._verify_owner(fd)
+        self._initialize(fd)
+        return True
+
+    def _open_owner(self, create=0):
         fd = os.open(
             self.owner,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | create,
             0o666,
         )
+        self.fd = fd
+        return fd
+
+    def _acquire_existing(self):
+        try:
+            self.identity = _identity(self.path)
+            fd = self._open_owner()
+        except FileNotFoundError:
+            return False
+        # A creator holds the lock before writing the marker. Checking the
+        # marker first keeps a contender from locking a half-initialized owner.
+        self._verify_owner(fd)
+        if os.pread(fd, len(_MAGIC) + 1, 0) != _MAGIC:
+            return False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(fd)
+            self.busy = True
             return False
-        except BaseException:
-            os.close(fd)
-            raise
-        self.fd = fd
-        self.identity = identity
         self._verify_owner(fd)
+        if os.pread(fd, len(_MAGIC) + 1, 0) != _MAGIC:
+            return False
         self._initialize(fd)
         return True
 
@@ -111,64 +147,60 @@ class AgreementRecords:
         return records
 
     def _initialize(self, fd):
-        marker = os.read(fd, len(_MAGIC) + 1)
         records = self._records()
-        if marker != _MAGIC and (marker or records):
+        if self.created and records:
             raise FileExistsError(f"unrecognized agreement directory: {self.path}")
+        if self.created and os.write(fd, _MAGIC) != len(_MAGIC):
+            raise OSError(f"short write of agreement owner marker: {self.owner}")
         self.owned = True
         for entry in records:
             entry.unlink()
-        if not marker and os.write(fd, _MAGIC) != len(_MAGIC):
-            raise OSError(f"short write of agreement owner marker: {self.owner}")
         os.fsync(fd)
         _sync_directory(self.path)
         _sync_directory(self.path.parent)
 
     def close(self):
+        try:
+            self._cleanup()
+        finally:
+            self._close_owner()
+
+    def _close_owner(self):
         fd = self.fd
-        if fd is None:
-            return
         self.fd = None
-        if not self.owned:
+        if fd is not None:
             os.close(fd)
+
+    def _cleanup(self):
+        if not (self.created or self.owned):
             return
         try:
-            self._remove(fd)
+            self._remove(self.fd)
         except (KeyboardInterrupt, SystemExit):
-            self._retry_cleanup(fd)
+            self._retry_cleanup(self.fd)
             raise
-        finally:
-            os.close(fd)
 
     def _retry_cleanup(self, fd):
         with suppress(OSError, ValueError):
             self._remove(fd)
 
     def _remove(self, fd):
-        if os.path.lexists(self.owner):
-            self._remove_records(fd)
-        elif not os.path.lexists(self.path):
+        if not os.path.lexists(self.path):
             _sync_directory(self.path.parent)
             return
-        elif _identity(self.path) != self.identity:
+        if self.identity is not None and _identity(self.path) != self.identity:
             raise OSError(f"agreement directory changed: {self.path}")
-        try:
-            self.path.rmdir()
-        except OSError as exc:
-            self._check_cleanup_race(exc)
+        if fd is not None and os.path.lexists(self.owner):
+            self._remove_owner(fd)
+        self.path.rmdir()
         _sync_directory(self.path.parent)
 
-    def _remove_records(self, fd):
+    def _remove_owner(self, fd):
         self._verify_owner(fd)
-        for entry in self._records():
+        records = self._records() if self.owned else ()
+        for entry in records:
             entry.unlink()
         self.owner.unlink()
-
-    def _check_cleanup_race(self, exc):
-        # Another invocation can claim an empty sibling just after we unlink
-        # our owner file. Leave the replacement to the new lock holder.
-        if exc.errno != errno.ENOTEMPTY or not os.path.lexists(self.owner):
-            raise exc
 
     def claim(self, rank, data):
         try:
@@ -249,5 +281,5 @@ class AgreementRecords:
         )
 
 
-def agreement_bytes(ctx, components, rank_state):
-    return desc.json_bytes([ctx.world_size, components, sorted(rank_state)])
+def agreement_bytes(ctx, components, rank_state, target):
+    return desc.json_bytes([ctx.world_size, components, sorted(rank_state), target])
