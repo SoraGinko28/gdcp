@@ -423,14 +423,10 @@ class _SaveSession(_Session, StorageSaveSession):
 
 
 class _LoadSession(_Session, StorageLoadSession):
-    def __init__(self, *args, native_records=None):
+    def __init__(self, *args, native_ranges=None):
         super().__init__(*args)
-        self.native_ranges = None
-        if native_records is not None:
-            self.native_ranges = {
-                path: [_native_payload(self.root, *record) for record in records]
-                for path, records in native_records.items()
-            }
+        self.native_ranges = native_ranges
+        if native_ranges is not None:
             self.offsets = {
                 pos: slot.contiguous_payload_offset
                 for pos, (_, slot) in self.index.slots.items()
@@ -669,6 +665,12 @@ class DcpBackend:
             raise ValueError(f"unsupported DCP format {layout.container_format!r}")
         index = build_payload_index(storage_table, layout)
         io_backend = self.io or FileIO()
+        native_ranges = None
+        if native_records is not None:
+            native_ranges = {
+                path: [_native_payload(root, *record) for record in records]
+                for path, records in native_records.items()
+            }
 
         @catch
         def begin_save(view, rank):
@@ -694,7 +696,7 @@ class DcpBackend:
                 layout,
                 index,
                 io_backend,
-                native_records=native_records,
+                native_ranges=native_ranges,
             )
 
         begin = (
@@ -1081,14 +1083,18 @@ def _prepare_native_component(root, component, ctx, metadata, load_objects):
         component.table,
         component.accessor,
     )
-    storage = DcpBackend().open(
-        root, table, layout, ctx.coordinator, native_records=records
-    )
     core._require(compute.check_constraints())
-    core._require(storage.check_constraints())
+
+    def prepare_storage():
+        storage = DcpBackend().open(
+            root, table, layout, ctx.coordinator, native_records=records
+        )
+        core._require(storage.check_constraints())
+        return storage
+
     if load_objects is None:
         load_objects = partial(_read_native_objects, root, metadata, component)
-    return component, compute, storage, load_objects
+    return component, compute, prepare_storage, load_objects
 
 
 def _has_manifest(path):
@@ -1114,22 +1120,34 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     agreed = core._agree_components(state, ctx)
     if type(agreed) is Err:
         return agreed
-    # Vote on membership and the tensor inventory before unrestricted object loads.
-    checked = core._collective(
+    metadata = core._collective(
         ctx,
         "validate native DCP metadata",
         lambda: _prepare_native(path, state, ctx, _validate_groups),
     )
-    if type(checked) is Err:
-        return checked
-    components = checked.value
+    if type(metadata) is Err:
+        return metadata
+    components = metadata.value
     assert components is not None
+    # Check backing records only after every rank validates membership and keys.
+    records = core._collective(
+        ctx,
+        "validate native DCP tensor records",
+        lambda: [
+            (component, compute, prepare_storage(), load_objects)
+            for component, compute, prepare_storage, load_objects in components
+        ],
+    )
+    if type(records) is Err:
+        return records
+    validated = records.value
+    assert validated is not None
     prepared = core._collective(
         ctx,
         "load native DCP objects",
         lambda: [
             (component, compute, storage, load_objects())
-            for component, compute, storage, load_objects in components
+            for component, compute, storage, load_objects in validated
         ],
     )
     if type(prepared) is Err:

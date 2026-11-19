@@ -2,8 +2,11 @@
 
 import ctypes
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
+from shutil import copytree
 from threading import local
 from types import SimpleNamespace
 from typing import Any, cast
@@ -13,6 +16,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from torch.distributed import HashStore, destroy_process_group, init_process_group
+from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint import save as torch_dcp_save
 from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from torch.distributed.device_mesh import DeviceMesh
@@ -1276,6 +1280,68 @@ def test_native_dcp_validates_inventory_on_all_ranks_before_unrestricted_load(
             optimizer.state[target["a"]]["extra_moment"] = torch.zeros_like(target["a"])
             expected = r"missing keys.*state\.a\.extra_moment"
         _load_rejected(tmp_path, {"model": target, "optimizer": optimizer}, expected)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+    assert not unrestricted
+
+
+@pytest.mark.parametrize("fault", ["model-file", "optimizer-file", "optimizer-record"])
+def test_native_dcp_validates_records_on_all_ranks_before_unrestricted_load(
+    tmp_path, monkeypatch, fault
+):
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    intact, damaged = tmp_path / "intact", tmp_path / "damaged"
+    source, saved = _native_grouped_optimizer(1.0, ("ab", "cd"))
+    torch_dcp_save(source.state_dict(), checkpoint_id=intact / "model", no_dist=True)
+    torch_dcp_save(
+        get_optimizer_state_dict(source, saved),
+        storage_writer=FileSystemWriter(
+            intact / "optimizer", single_file_per_rank=False
+        ),
+        no_dist=True,
+    )
+    copytree(intact, damaged)
+    component, key = (
+        ("model", "a") if fault == "model-file" else ("optimizer", "state.a.exp_avg")
+    )
+    root = damaged / component
+    metadata = dcp.read_metadata(root)
+    record = next(
+        record for index, record in metadata.storage_data.items() if index.fqn == key
+    )
+    payload = root / record.relative_path
+    if fault == "optimizer-record":
+        payload.write_bytes(bytes(payload.stat().st_size))
+        error = "zip file"
+    else:
+        payload.unlink()
+        error = re.escape(str(payload))
+
+    coordinator = ThreadCoordinator(2, timeout=10)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    unrestricted = []
+    torch_load = torch.load
+
+    def record_load(file, *args, **kwargs):
+        if kwargs.get("weights_only") is not True:
+            unrestricted.append(context.value.rank)
+        return torch_load(file, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", record_load)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        target, optimizer = _native_grouped_optimizer(9.0, ("ab", "cd"))
+        before = deepcopy(optimizer.state_dict())
+        _load_rejected(
+            damaged if rank else intact,
+            {"model": target, "optimizer": optimizer},
+            error if rank else "another rank failed",
+        )
+        assert all(torch.all(parameter == 9) for parameter in target.parameters())
+        torch.testing.assert_close(optimizer.state_dict(), before, rtol=0, atol=0)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(load, range(2)))

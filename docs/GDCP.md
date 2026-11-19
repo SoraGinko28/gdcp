@@ -83,8 +83,9 @@ malformed, or unsupported native metadata establishes no ownership, so every
 entry in that candidate checkpoint is foreign. Such metadata cannot establish
 that a generation is complete for recovery. `inspect` reads only the JSON
 manifest. Native DCP loads also decode `.metadata` as data. They can use pickle
-for non-tensor objects after collective validation. Manifest-backed DCP loads
-use pickle for component metadata. Only load DCP checkpoints you trust.
+for non-tensor objects after collective validation of metadata and tensor
+records. Manifest-backed DCP loads use pickle for component metadata. Only load
+DCP checkpoints you trust.
 
 The old checkpoint receives no payload writes. After every rank completes the
 new generation, rank 0 syncs its directories and rescans the old target against
@@ -220,7 +221,8 @@ and steps follow their parameters. Per-rank safetensors, DCP, and HF report
 incompatible or ambiguous groups before checking requested tensor keys or
 reading tensor and extra-state payloads. For Torch-written native DCP, GDCP
 decodes membership with a restricted loader. Every rank must pass the group and
-tensor inventory checks before GDCP reads scalar optimizer state or separately
+tensor inventory checks, then validate the backing tensor records with a
+restricted loader, before GDCP reads scalar optimizer state or separately
 stored group options.
 
 Tensor payloads are streamed into the target. An I/O error during those reads

@@ -45,8 +45,9 @@ populates `param_names` to match `params` in every group, and restores moments
 and steps to their corresponding parameters. Incompatible or ambiguous groups
 fail before requested tensor-key checks and before tensor or rank-state payload
 reads. For Torch-written native DCP, GDCP uses a restricted decoder for group
-membership. All ranks validate membership and tensor inventory before GDCP
-reads scalar optimizer state or separately stored group options.
+membership. All ranks validate membership and tensor inventory, then check the
+backing tensor records with a restricted decoder, before GDCP reads scalar
+optimizer state or separately stored group options.
 
 CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:nccl,cpu:gloo"`, so FSDP2 can use NCCL while votes and CPU state use Gloo. The GPU accessor stages one local tensor at a time, copies each save tensor to the host once, and writes back a load tensor once after all its ranges.
 
@@ -145,8 +146,8 @@ Save preflight and recovery read native DCP `.metadata` as data. Unreadable,
 malformed, or unsupported metadata establishes no native DCP ownership or
 completeness for recovery. `inspect` reads only the JSON manifest. Native DCP
 loads also decode `.metadata` as data and can use pickle for non-tensor objects
-after collective validation. Manifest-backed DCP loads use pickle for component
-metadata. Only load DCP checkpoints you trust.
+after collective validation of metadata and tensor records. Manifest-backed DCP
+loads use pickle for component metadata. Only load DCP checkpoints you trust.
 
 HF save groups rows with compatible storage columns before building its shared
 file layout. Rectangle count is bounded by the number of column groups rather
