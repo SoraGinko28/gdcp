@@ -185,13 +185,14 @@ depend on rerunning the current storage policy.
 Optimizer non-tensor values live in `optimizer/objects.json`. JSON container
 tags preserve tuple/list distinctions. Extra state is stored with `torch.save`
 in `extra_state/extra_state_rank_{rank}.pt` and loaded with pickle enabled;
-only load trusted checkpoints. Before staging a save, ranks must agree on the
-world size and the set of rank-state keys. If keys differ at that point, every
-rank reports the same error naming a differing key. GDCP writes each rank's
-snapshot of its rank state and checks before publication that the rank
-configuration and key sets still match and that every declared file exists.
-A failed check returns an error on every rank and preserves any previous
-checkpoint.
+only load trusted checkpoints. Before staging a save, GDCP checks that each
+rank ID is claimed once and that all participants agree on the world size and
+the set of rank-state keys. If keys differ at that point, every rank reports
+the same error naming a differing key. GDCP writes each rank's snapshot of its
+rank state and checks the rank configuration and key sets between save phases.
+A detected change returns the same error on every rank, even if a callback
+restores the original value. GDCP also checks that every declared file exists
+before publication. A failed check preserves any previous checkpoint.
 If different names resolve to the same directory on the checkpoint filesystem,
 the save fails on every rank before any tensor or rank-state payload is written.
 The GDCP manifest or HF completion marker lists the files saved for each key.

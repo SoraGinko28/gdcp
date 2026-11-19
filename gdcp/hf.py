@@ -132,14 +132,20 @@ def _tensor_files(assignment):
 
 
 class _CombinedAccessor(DTensorDataAccessor):
-    def __init__(self, routes):
+    def __init__(self, routes, observe=None):
         self.routes = routes
+        self._observe = observe
         self._active: DTensorDataAccessor | None = None
+
+    def _finish(self, accessor):
+        getattr(accessor, "finish", lambda: None)()
+        if self._observe is not None:
+            self._observe()
 
     def _call(self, method, rng, callback):
         accessor, key = self.routes[rng.global_tensor_id]
         if self._active is not accessor:
-            getattr(self._active, "finish", lambda: None)()
+            self._finish(self._active)
             self._active = accessor
         return getattr(accessor, method)(replace(rng, global_tensor_id=key), callback)
 
@@ -152,7 +158,7 @@ class _CombinedAccessor(DTensorDataAccessor):
     def finish(self):
         accessors = {id(accessor): accessor for accessor, _key in self.routes.values()}
         for accessor in accessors.values():
-            getattr(accessor, "finish", lambda: None)()
+            self._finish(accessor)
         self._active = None
 
 
@@ -169,7 +175,7 @@ def _combined_entry(component, named, available):
     return NamedDTensor(key, named.d_tensor, aliases)
 
 
-def _combined(state, available=None, *, optimizer_tensors=None):
+def _combined(state, available=None, *, optimizer_tensors=None, observe=None):
     entries, routes, logical, objects = [], {}, {}, {}
     other_keys = optimizer_keys = available
     if available is not None and optimizer_tensors is not None:
@@ -189,7 +195,9 @@ def _combined(state, available=None, *, optimizer_tensors=None):
             )
     if len(entries) != len(routes):
         raise ValueError("duplicate HF tensor name")
-    combined = Component("hf", DTensorTable(entries), _CombinedAccessor(routes))
+    combined = Component(
+        "hf", DTensorTable(entries), _CombinedAccessor(routes, observe)
+    )
     combined.logical_shapes = logical
     return combined, objects
 
@@ -338,8 +346,8 @@ def _group_storage_rows(combined, table):
     return combined, DTensorTable([row[1] for row in rows])
 
 
-def _save_prepare(path, state, ctx, max_shard_size):
-    combined, objects = _combined(state)
+def _save_prepare(path, state, ctx, max_shard_size, *, observe=None):
+    combined, objects = _combined(state, observe=observe)
     for component in state.components:
         if component.name == "optimizer":
             objects[_OPTIMIZER_TENSORS] = sorted(
@@ -395,18 +403,21 @@ def _finish_accessor(combined):
 
 
 def _save_staged(
-    transaction, state, ctx, rank_state, inventory, max_shard_size, write_metadata
+    transaction, state, agreement, inventory, max_shard_size, write_metadata
 ):
     path = transaction.stage
-    prepared = core._collective(
-        ctx, "HF prepare save", lambda: _save_prepare(path, state, ctx, max_shard_size)
+    ctx, rank_state = agreement.ctx, agreement.rank_state
+    prepared = agreement.phase(
+        "HF prepare save",
+        lambda: _save_prepare(
+            path, state, ctx, max_shard_size, observe=agreement.observe
+        ),
     )
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
     combined, objects, compute, storage = prepared.value
-    result = core._collective(
-        ctx,
+    result = agreement.phase(
         PREFLIGHT,
         lambda: _initialize(
             transaction,
@@ -419,25 +430,23 @@ def _save_staged(
     )
     if type(result) is Err:
         return result
-    result = core._collective(
-        ctx,
+    result = agreement.phase(
         "HF metadata",
         lambda: write_metadata(path) if write_metadata is not None else None,
     )
     if type(result) is Err:
         return result
-    result = core._collective(
-        ctx, "HF rank state", lambda: core._save_rank_state(path, rank_state, ctx)
+    result = agreement.phase(
+        "HF rank state", lambda: core._save_rank_state(path, rank_state, ctx)
     )
     if type(result) is Err:
         return result
-    result = core._collective(
-        ctx, "HF save", lambda: _save_io(ctx, combined, compute, storage)
+    result = agreement.phase(
+        "HF save", lambda: _save_io(ctx, combined, compute, storage)
     )
     if type(result) is Err:
         return result
-    return core._collective(
-        ctx,
+    return agreement.phase(
         "HF publish",
         lambda: _finalize(path, ctx, inventory),
     )
@@ -459,11 +468,10 @@ def save_state(path, state, ctx, *, max_shard_size=None, _write_metadata=None):
         path,
         state,
         ctx,
-        lambda transaction, agreed, rank_state, inventory: _save_staged(
+        lambda transaction, agreement, inventory: _save_staged(
             transaction,
             state,
-            agreed,
-            rank_state,
+            agreement,
             inventory,
             max_shard_size,
             _write_metadata,

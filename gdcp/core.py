@@ -5,6 +5,7 @@ import logging
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
+from secrets import randbits
 from typing import Any, Callable
 
 from gdtensor import Result
@@ -133,13 +134,33 @@ def _broadcast_value(ctx, operation, source, value) -> Result[Any]:
     return _collective(ctx, operation, lambda: json.loads(received))
 
 
+def _check_save_rank(ctx, operation, rank, token):
+    coordinator = ctx.coordinator
+    if coordinator.vote(ctx.rank != rank):
+        return _error(operation, ValueError(f"save is missing rank {rank}"))
+    # A boolean vote cannot count claimants. OR their independent save tokens
+    # and verify that every claimant contributed the same token as the result.
+    combined = sum(
+        1 << bit
+        for bit in range(128)
+        if not coordinator.vote(ctx.rank != rank or not (token >> bit & 1))
+    )
+    if not coordinator.vote(ctx.rank != rank or token == combined):
+        return _error(operation, ValueError(f"save has duplicate rank {rank}"))
+    return Ok(None)
+
+
 def _agree_save_context(ctx):
     operation = "agree on save rank configuration"
     coordinator = ctx.coordinator
     if coordinator is None:
         return _collective(ctx, operation, lambda: _validate_context(ctx))
-    if coordinator.vote(ctx.rank != 0):
-        return _error(operation, ValueError("save requires rank 0"))
+    token = _collective(ctx, operation, lambda: randbits(128))
+    if type(token) is Err:
+        return token
+    leader = _check_save_rank(ctx, operation, 0, token.value)
+    if type(leader) is Err:
+        return leader
     world = _broadcast_value(ctx, operation, 0, lambda: ctx.world_size)
     if type(world) is Err:
         return world
@@ -148,8 +169,9 @@ def _agree_save_context(ctx):
     if not coordinator.vote(0 <= ctx.rank < ctx.world_size):
         return _error(operation, ValueError("invalid rank or world size"))
     for rank in range(1, ctx.world_size):
-        if coordinator.vote(ctx.rank != rank):
-            return _error(operation, ValueError(f"save is missing rank {rank}"))
+        claimed = _check_save_rank(ctx, operation, rank, token.value)
+        if type(claimed) is Err:
+            return claimed
     return Ok(None)
 
 
@@ -224,7 +246,8 @@ def _compute_view(component, tensor_ids=None):
     )
 
 
-def _prepare_save(path, state, ctx, policy, backend):
+def _prepare_save(path, state, agreement, policy, backend):
+    ctx = agreement.ctx
     policy = PerRankPolicy() if policy is None else policy
     backend = SafeTensorsBackend() if backend is None else backend
     prepared = []
@@ -232,9 +255,11 @@ def _prepare_save(path, state, ctx, policy, backend):
         compute = _compute_view(component)
         _require(compute.check_constraints())
         table, layout = policy.plan(component, ctx.world_size)
+        agreement.observe()
         storage = backend.open(
             Path(path) / component.name, table, layout, ctx.coordinator
         )
+        agreement.observe()
         _require(storage.check_constraints())
         prepared.append((component, compute, storage))
     return prepared
@@ -291,7 +316,8 @@ def _rank_save(ctx, compute, storage):
             coordinator.vote(False)
 
 
-def _save_one(ctx, compute, storage):
+def _save_one(agreement, compute, storage):
+    ctx = agreement.ctx
     # The connector has no session leader for a completely empty component.
     # Its semantic tensor entries still live in GDCP's manifest.
     has_payload = _collective_choice(
@@ -307,6 +333,7 @@ def _save_one(ctx, compute, storage):
     result = _rank_save(ctx, compute, storage)
     _raise_io_interrupt(storage)
     if type(result) is Ok:
+        agreement.observe()
         getattr(compute.data_accessor, "finish", lambda: None)()
     return result
 
@@ -318,15 +345,15 @@ def _save_objects(path, component, ctx):
         )
 
 
-def _save_components(path, prepared, ctx):
+def _save_components(path, prepared, agreement):
+    ctx = agreement.ctx
     for component, compute, storage in prepared:
-        result = _collective(
-            ctx, f"save {component.name}", lambda: _save_one(ctx, compute, storage)
+        result = agreement.phase(
+            f"save {component.name}", lambda: _save_one(agreement, compute, storage)
         )
         if type(result) is Err:
             return result
-        result = _collective(
-            ctx,
+        result = agreement.phase(
             f"objects {component.name}",
             lambda: _save_objects(path, component, ctx),
         )
@@ -417,15 +444,15 @@ def _initialize_transaction(transaction, state, prepared, ctx, rank_state):
     _initialize_save(transaction.stage, state, ctx, rank_state)
 
 
-def _save_staged(transaction, state, ctx, rank_state, inventory, policy, backend):
+def _save_staged(transaction, state, agreement, inventory, policy, backend):
     path = transaction.stage
-    prepared = _collective(
-        ctx, "prepare save", lambda: _prepare_save(path, state, ctx, policy, backend)
+    ctx, rank_state = agreement.ctx, agreement.rank_state
+    prepared = agreement.phase(
+        "prepare save", lambda: _prepare_save(path, state, agreement, policy, backend)
     )
     if type(prepared) is Err:
         return prepared
-    initialized = _collective(
-        ctx,
+    initialized = agreement.phase(
         PREFLIGHT,
         lambda: _initialize_transaction(
             transaction, state, prepared.value, ctx, rank_state
@@ -433,16 +460,15 @@ def _save_staged(transaction, state, ctx, rank_state, inventory, policy, backend
     )
     if type(initialized) is Err:
         return initialized
-    result = _save_components(path, prepared.value, ctx)
+    result = _save_components(path, prepared.value, agreement)
     if type(result) is Err:
         return result
-    result = _collective(
-        ctx, "rank state", lambda: _save_rank_state(path, rank_state, ctx)
+    result = agreement.phase(
+        "rank state", lambda: _save_rank_state(path, rank_state, ctx)
     )
     if type(result) is Err:
         return result
-    return _collective(
-        ctx,
+    return agreement.phase(
         "checkpoint commit",
         lambda: _publish(path, state, prepared.value, ctx, inventory),
     )
@@ -459,37 +485,46 @@ def _validate_rank_state_inventory(path, inventory):
         _declared_rank_files(path, name, info)
 
 
-def _check_save_agreement(ctx, operation, check):
-    checked = _collective(ctx, operation, check)
-    if type(checked) is Err:
-        return checked
-    coordinator = ctx.coordinator
-    matches = checked.value if coordinator is None else coordinator.vote(checked.value)
-    if not matches:
-        return _error(operation, ValueError(f"{operation} changed during save"))
-    return Ok(None)
+class _SaveAgreement:
+    def __init__(self, state, context, ctx, rank_state):
+        self.state = state
+        self.context = context
+        self.ctx = ctx
+        self.rank_state = rank_state
+        self.configuration_changed = False
+        self.keys_changed = False
 
+    def observe(self):
+        # Accessors may run at different times on different ranks. Remember
+        # changes locally until all ranks reach the next common phase boundary.
+        self.configuration_changed |= (self.ctx.rank, self.ctx.world_size) != (
+            self.context.rank,
+            self.context.world_size,
+        )
+        self.keys_changed |= self.rank_state.keys() != self.state.rank_state.keys()
 
-def _check_save_inventory(path, state, ctx, context, rank_state, inventory):
-    configuration = _check_save_agreement(
-        ctx,
-        "rank configuration",
-        lambda: (ctx.rank, ctx.world_size) == (context.rank, context.world_size),
-    )
-    if type(configuration) is Err:
-        return configuration
-    keys = _check_save_agreement(
-        ctx,
-        "rank_state keys",
-        lambda: rank_state.keys() == state.rank_state.keys(),
-    )
-    if type(keys) is Err:
-        return keys
-    return _collective(
-        ctx,
-        "validate rank state inventory",
-        lambda: _validate_rank_state_inventory(path, inventory),
-    )
+    def check(self):
+        observed = _collective(self.ctx, "check save agreement", self.observe)
+        if type(observed) is Err:
+            return observed
+        coordinator = self.ctx.coordinator
+        same_configuration = not self.configuration_changed
+        unchanged = same_configuration and not self.keys_changed
+        if coordinator is not None:
+            unchanged = coordinator.vote(unchanged)
+        if unchanged:
+            return Ok(None)
+        if coordinator is not None:
+            same_configuration = coordinator.vote(same_configuration)
+        name = "rank_state keys" if same_configuration else "rank configuration"
+        return _error(name, ValueError(f"{name} changed during save"))
+
+    def phase(self, operation, action):
+        try:
+            result = _collective(self.ctx, operation, action)
+        finally:
+            checked = self.check()
+        return checked if type(checked) is Err else result
 
 
 def _transactional_save(path, state, context, action):
@@ -500,34 +535,41 @@ def _transactional_save(path, state, context, action):
         return validated
     assert validated.value is not None
     ctx, rank_state = validated.value
+    agreement = _SaveAgreement(state, context, ctx, rank_state)
     agreed = _agree_save_context(ctx)
     if type(agreed) is Err:
         return agreed
-    agreed = _agree_rank_state(rank_state, ctx)
+    agreed = agreement.phase(
+        "agree on rank state", lambda: _agree_rank_state(rank_state, ctx)
+    )
     if type(agreed) is Err:
         return agreed
-    agreed = _agree_components(state, ctx)
+    agreed = agreement.phase(
+        "agree on checkpoint components", lambda: _agree_components(state, ctx)
+    )
     if type(agreed) is Err:
         return agreed
-    inventory = _collective(
-        ctx,
+    inventory = agreement.phase(
         "prepare rank state inventory",
         lambda: _rank_state_inventory(rank_state, ctx),
     )
     if type(inventory) is Err:
         return inventory
-    created = _collective(
-        ctx, "prepare transaction", lambda: DirectoryTransaction(path, ctx.rank)
+    created = agreement.phase(
+        "prepare transaction", lambda: DirectoryTransaction(path, ctx.rank)
     )
     if type(created) is Err:
         return created
     transaction = created.value
     assert transaction is not None
     try:
-        result = action(transaction, ctx, rank_state, inventory.value)
+        result = action(transaction, agreement, inventory.value)
         if type(result) is Ok:
-            result = _check_save_inventory(
-                transaction.stage, state, ctx, context, rank_state, inventory.value
+            result = agreement.phase(
+                "validate rank state inventory",
+                lambda: _validate_rank_state_inventory(
+                    transaction.stage, inventory.value
+                ),
             )
         if type(result) is Ok:
             result = _collective(ctx, "checkpoint publish", transaction.publish)
@@ -553,8 +595,8 @@ def save(path, state, ctx, *, policy=None, backend=None) -> Result[None]:
         path,
         state,
         ctx,
-        lambda transaction, agreed, rank_state, inventory: _save_staged(
-            transaction, state, agreed, rank_state, inventory, policy, backend
+        lambda transaction, agreement, inventory: _save_staged(
+            transaction, state, agreement, inventory, policy, backend
         ),
     )
 

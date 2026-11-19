@@ -17,7 +17,13 @@ from gdtensor.builder import Err
 from gdtensor_conn.coord import ThreadCoordinator
 from gdtensor_conn.iobackend import FileIO
 from tests.support.gdcp import assert_ok
-from tests.support.gdcp_overwrite import _assert_generation, _fixture, _operation, _run
+from tests.support.gdcp_overwrite import (
+    _assert_generation,
+    _files,
+    _fixture,
+    _operation,
+    _run,
+)
 
 _PAYLOADS = [
     ("safetensors", "model/__0_0.safetensors"),
@@ -251,6 +257,115 @@ def test_save_agrees_on_world_before_staging(tmp_path, monkeypatch, fmt, worlds)
     assert "world size" in results[0].value.msg
     assert not started
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize(
+    "ranks, conflict", [((0, 1, 1), False), ((0, 1, 1), True), ((0, 1, 0), False)]
+)
+def test_save_rejects_duplicate_ranks_before_staging(
+    tmp_path, monkeypatch, fmt, ranks, conflict
+):
+    source = _fixture(world=len(ranks))
+    call, options = _operation(fmt, False, source)
+    for state in source.states:
+        state.components.clear()
+        state.rank_state.clear()
+    if conflict:
+        source.states[2].rank_state["extra"] = b"different keys"
+    root = tmp_path / "checkpoint"
+    started = []
+    begin = _transaction.DirectoryTransaction.begin
+    coordinator = ThreadCoordinator(len(ranks), timeout=2)
+
+    def track_begin(transaction, planned):
+        started.append(transaction.rank)
+        return begin(transaction, planned)
+
+    def save_participant(index):
+        ctx = RankContext(ranks[index], 2, coordinator)
+        return call(root, source.states[index], ctx, **options)
+
+    monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
+    with ThreadPoolExecutor(max_workers=len(ranks)) as pool:
+        results = list(pool.map(save_participant, range(len(ranks))))
+    assert not started
+    assert all(type(result) is Err for result in results), results
+    assert len({result.value.msg for result in results}) == 1
+    assert f"duplicate rank {ranks[-1]}" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("field", ["rank_state keys", "rank configuration"])
+def test_save_rejects_mismatch_restored_by_later_phase(
+    tmp_path, monkeypatch, fmt, field
+):
+    root = tmp_path / "checkpoint"
+    old, source = _fixture(), _fixture(shift=7)
+    assert_ok(_run(fmt, root, old))
+    original_files = _files(root)
+    call, options = _operation(fmt, False, source)
+    state = source.states[1]
+    coordinator = ThreadCoordinator(2, timeout=2)
+    contexts = [RankContext(rank, 2, coordinator) for rank in range(2)]
+    original_rank_state = dict(state.rank_state)
+    observed = []
+
+    def change():
+        observed.append("changed")
+        if field == "rank_state keys":
+            state.rank_state.clear()
+        else:
+            contexts[1].world_size = 3
+
+    def restore():
+        observed.append("restored")
+        state.rank_state.update(original_rank_state)
+        contexts[1].world_size = 2
+
+    def save_rank(rank):
+        rank_options = dict(options)
+        if fmt == "hf" and rank == 1:
+            rank_options["_write_metadata"] = lambda _path: change()
+        return call(root, source.states[rank], contexts[rank], **rank_options)
+
+    model, optimizer = state.components
+    if fmt != "hf":
+        monkeypatch.setattr(model.accessor, "finish", change, raising=False)
+    monkeypatch.setattr(optimizer.accessor, "finish", restore, raising=False)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(save_rank, range(2)))
+    assert observed == ["changed"]
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert field in results[0].value.msg
+    assert _files(root) == original_files
+    assert list(tmp_path.iterdir()) == [root]
+
+
+def test_hf_save_latches_mismatch_between_accessor_finishes(tmp_path, monkeypatch):
+    root = tmp_path / "checkpoint"
+    old, source = _fixture(), _fixture(shift=7)
+    assert_ok(_run("hf", root, old))
+    original_files = _files(root)
+    state = source.states[1]
+    original_rank_state = dict(state.rank_state)
+    model, optimizer = state.components
+    monkeypatch.setattr(model.accessor, "finish", state.rank_state.clear, raising=False)
+    monkeypatch.setattr(
+        optimizer.accessor,
+        "finish",
+        lambda: state.rank_state.update(original_rank_state),
+        raising=False,
+    )
+
+    results = _run("hf", root, source)
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "rank_state keys" in results[0].value.msg
+    assert _files(root) == original_files
+    assert list(tmp_path.iterdir()) == [root]
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
