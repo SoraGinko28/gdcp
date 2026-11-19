@@ -79,10 +79,11 @@ record the exact rank-state mapping.
 
 Save preflight and recovery read native DCP `.metadata` as data without invoking
 pickle constructors or importing modules named by the file. Unreadable,
-malformed, or unsupported native metadata establishes no ownership, so every
-entry in that candidate checkpoint is foreign. Such metadata cannot establish
-that a generation is complete for recovery. `inspect` reads only the JSON
-manifest. Native DCP loads also decode `.metadata` as data. They can use pickle
+unsupported, or malformed native metadata, including a truncated pickle frame,
+establishes no ownership, so every entry in that candidate checkpoint is foreign.
+Recovery leaves a backup in place when that metadata is needed to verify it.
+`inspect` reads only the JSON manifest. Native DCP loads also decode `.metadata`
+as data. They can use pickle
 for non-tensor objects after collective validation of metadata and tensor
 records. Manifest-backed DCP loads use pickle for component metadata. Only load
 DCP checkpoints you trust.

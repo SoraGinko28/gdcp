@@ -4,6 +4,7 @@ import builtins
 import json
 import os
 import pickle
+import pickletools
 from pathlib import Path
 
 import pytest
@@ -690,6 +691,62 @@ def test_recovery_preserves_unrecognized_native_dcp_backup(tmp_path, fmt):
     )
     assert _files(backup) == before
     assert not root.exists()
+
+
+def _native_dcp_with_truncated_frame(root):
+    if not os.environ.get("GDTENSOR_TORCH_TESTS"):
+        pytest.skip("set GDTENSOR_TORCH_TESTS=1")
+    import torch
+    from torch.distributed.checkpoint import save as native_save
+
+    native_save({"weight": torch.ones(2)}, checkpoint_id=root, no_dist=True)
+    metadata = root / ".metadata"
+    data = metadata.read_bytes()
+    size, offset = [
+        (arg, pos) for op, arg, pos in pickletools.genops(data) if op.name == "FRAME"
+    ][-1]
+    assert isinstance(size, int) and isinstance(offset, int)
+    # Keep the complete opcode stream, but declare one missing byte in its final frame.
+    start = offset + 1
+    damaged = data[:start] + (size + 1).to_bytes(8, "little") + data[start + 8 :]
+    with pytest.raises(pickle.UnpicklingError, match="truncated"):
+        pickle.loads(damaged)
+    metadata.write_bytes(damaged)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("component", [False, True], ids=["root", "component"])
+def test_truncated_dcp_frame_leaves_metadata_and_shards_foreign(
+    tmp_path, fmt, component
+):
+    root = tmp_path / "checkpoint"
+    _native_dcp_with_truncated_frame(root / "model" if component else root)
+    before = _files(root)
+    inodes = {name: (root / name).stat().st_ino for name in before}
+
+    results = _run(fmt, root, _fixture())
+
+    if component and fmt != "hf":
+        _assert_errors(results, "conflicts with foreign entry:")
+        assert _files(root) == before
+    else:
+        assert_ok(results)
+    for name, data in before.items():
+        assert (root / name).read_bytes() == data
+        assert (root / name).stat().st_ino == inodes[name]
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_recovery_retains_native_dcp_backup_with_truncated_frame(tmp_path, fmt):
+    root = tmp_path / "checkpoint"
+    backup = _transaction.DirectoryTransaction(root, 0).backup
+    _native_dcp_with_truncated_frame(backup)
+    before = _files(backup)
+
+    _assert_errors(_run(fmt, root, _fixture()), "unrecognized/incomplete directory")
+
+    assert _files(backup) == before
+    assert list(tmp_path.iterdir()) == [backup]
 
 
 def test_native_torch_dcp_metadata_still_establishes_ownership(tmp_path):

@@ -2,7 +2,7 @@
 
 import pickle
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import BinaryIO, NamedTuple
 
 _METADATA = "torch.distributed.checkpoint.metadata"
 _FILESYSTEM = "torch.distributed.checkpoint.filesystem"
@@ -93,6 +93,21 @@ class _StorageRecord(NamedTuple):
     length: int
 
 
+class _MetadataInput:
+    def __init__(self, handle: BinaryIO):
+        self._handle = handle
+
+    def readline(self) -> bytes:
+        return self._handle.readline()
+
+    def read(self, size: int) -> bytes:
+        data = self._handle.read(size)
+        # The Python unpickler can reach STOP after a short frame read.
+        if len(data) != size:
+            raise pickle.UnpicklingError("truncated native DCP metadata")
+        return data
+
+
 def _state(record, module, name):
     if (
         type(record) is not _Record
@@ -115,7 +130,7 @@ def _storage_record(record):
 
 def _read_metadata_state(root):
     with open(root / ".metadata", "rb") as handle:
-        metadata = _MetadataParser(handle).load()
+        metadata = _MetadataParser(_MetadataInput(handle)).load()
     state = _state(metadata, _METADATA, "Metadata")
     if (
         type(state["state_dict_metadata"]) is not dict

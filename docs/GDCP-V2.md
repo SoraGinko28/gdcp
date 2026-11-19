@@ -143,8 +143,9 @@ retained sibling. New HF completion markers also record exact rank-state file
 ownership; unrecorded legacy rank-state names remain foreign.
 
 Save preflight and recovery read native DCP `.metadata` as data. Unreadable,
-malformed, or unsupported metadata establishes no native DCP ownership or
-completeness for recovery. `inspect` reads only the JSON manifest. Native DCP
+unsupported, or malformed metadata, including a truncated pickle frame,
+establishes no native DCP ownership. Recovery leaves a backup in place when that
+metadata is needed to verify it. `inspect` reads only the JSON manifest. Native DCP
 loads also decode `.metadata` as data and can use pickle for non-tensor objects
 after collective validation of metadata and tensor records. Manifest-backed DCP
 loads use pickle for component metadata. Only load DCP checkpoints you trust.
