@@ -16,6 +16,13 @@ def _save_route(checkpoint_format, hf_dtype, max_shard_size):
     return route
 
 
+def _save_root(path, global_steps, ignore_append):
+    root = Path(path)
+    if global_steps is not None and not ignore_append:
+        return root / f"global_step_{global_steps}"
+    return root
+
+
 def _reject(options, defaults, kwargs):
     for name, value in options.items():
         if value != defaults.get(name):
@@ -81,9 +88,7 @@ class FSDP2Checkpointer:
         def preflight():
             _reject(options, defaults, kwargs)
             route = _save_route(checkpoint_format, hf_dtype, max_shard_size)
-            root = Path(path)
-            if global_steps is not None and not ignore_append_global_steps_to_folder:
-                root = root / f"global_step_{global_steps}"
+            root = _save_root(path, global_steps, ignore_append_global_steps_to_folder)
             return root, route
 
         _fsdp2_adapter(preflight).save_checkpoint(

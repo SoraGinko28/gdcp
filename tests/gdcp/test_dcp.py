@@ -139,11 +139,11 @@ def test_native_dcp_preflight_failure_votes_on_every_rank(
     is_file = Path.is_file
 
     def rank_local_is_file(path):
-        if path == manifest and rank_context.rank == 0:
-            if failure == "lookup":
-                raise OSError("injected manifest lookup failure")
-            return failure == "mixed_formats"
-        return is_file(path)
+        if path != manifest or rank_context.rank != 0:
+            return is_file(path)
+        if failure == "lookup":
+            raise OSError("injected manifest lookup failure")
+        return failure == "mixed_formats"
 
     if failure == "rank_state":
         target.states[0].rank_state["extra_state"] = b""
@@ -156,13 +156,14 @@ def test_native_dcp_preflight_failure_votes_on_every_rank(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(load_rank, range(2)))
-    assert all(type(result) is Err for result in results), results
+    rank_zero, rank_one = results
+    assert type(rank_zero) is Err and type(rank_one) is Err, results
     expected = {
         "rank_state": "native DCP has no GDCP per-rank extra_state",
         "lookup": "injected manifest lookup failure",
         "mixed_formats": "disagree on DCP load format",
     }
-    assert expected[failure] in results[0].value.msg
+    assert expected[failure] in rank_zero.value.msg
 
 
 def test_dcp_save_close_failure_votes_on_every_rank(tmp_path, monkeypatch):
@@ -185,8 +186,9 @@ def test_dcp_save_close_failure_votes_on_every_rank(tmp_path, monkeypatch):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(save_rank, range(2)))
-    assert all(type(result) is Err for result in results), results
-    assert "injected DCP close failure" in results[0].value.msg
+    rank_zero, rank_one = results
+    assert type(rank_zero) is Err and type(rank_one) is Err, results
+    assert "injected DCP close failure" in rank_zero.value.msg
     assert not root.exists()
 
 
@@ -206,21 +208,22 @@ def test_invalid_dcp_component_map_votes_on_every_rank(tmp_path):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(save_rank, range(2)))
-    assert all(type(result) is Err for result in results), results
-    assert "name" in results[0].value.msg
+    rank_zero, rank_one = results
+    assert type(rank_zero) is Err and type(rank_one) is Err, results
+    assert "name" in rank_zero.value.msg
     assert not list(tmp_path.iterdir())
 
 
 @contextmanager
 def _torch_rank(rank, world):
-    import torch.distributed as dist
+    from torch.distributed import destroy_process_group, init_process_group
     from torch.testing._internal.distributed.fake_pg import FakeStore
 
-    dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=world)
+    init_process_group("fake", store=FakeStore(), rank=rank, world_size=world)
     try:
         yield
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _torch_shard(dense, rank, world):
@@ -373,6 +376,7 @@ def test_native_dcp_load_uneven_shards_with_interior_empty(tmp_path):
     from torch.distributed.checkpoint.metadata import (
         ChunkStorageMetadata,
         MetadataIndex,
+        TensorStorageMetadata,
     )
     from gdcp.adapters.dcp import read_metadata
 
@@ -389,7 +393,10 @@ def test_native_dcp_load_uneven_shards_with_interior_empty(tmp_path):
         )
     metadata = read_metadata(root)
     item = metadata.state_dict_metadata["weight"]
-    empty = metadata.state_dict_metadata.pop("empty").chunks[0]
+    empty_item = metadata.state_dict_metadata.pop("empty")
+    assert isinstance(item, TensorStorageMetadata)
+    assert isinstance(empty_item, TensorStorageMetadata)
+    empty = empty_item.chunks[0]
     offset = torch.Size([1, 0])
     item.chunks.insert(1, ChunkStorageMetadata(offset, empty.sizes))
     metadata.storage_data[MetadataIndex("weight", offset)] = metadata.storage_data.pop(

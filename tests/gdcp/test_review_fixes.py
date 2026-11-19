@@ -4,6 +4,8 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import local
+from types import SimpleNamespace
 
 import pytest
 
@@ -238,6 +240,34 @@ def test_load_rejects_missing_declared_rank_file(tmp_path, fmt, world):
         assert state.rank_state == {"extra_state": f"7-{rank}".encode()}
     for name, fabric in target.fabrics.items():
         fabric.assert_values(target.values[name])
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_extra_missing_worker_rejects_same_world_load(tmp_path, monkeypatch, fmt):
+    torch = pytest.importorskip("torch")
+    from gdcp.adapters import fsdp2
+    from tests.gdcp import fsdp2_worker
+
+    source = tmp_path / "source"
+    assert_ok(_run(fmt, source, _fixture()))
+    for rank in range(2):
+        torch.save(
+            {"rank": rank}, source / "extra_state" / f"extra_state_rank_{rank}.pt"
+        )
+    args = SimpleNamespace(path=source, output=tmp_path / "missing")
+    current = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(fsdp2_worker, "get_rank", lambda: current.ctx.rank)
+    monkeypatch.setattr(fsdp2_worker, "barrier", lambda: current.ctx.coordinator.wait())
+    monkeypatch.setattr(
+        fsdp2_worker, "GlooCoordinator", lambda: current.ctx.coordinator
+    )
+
+    def run_worker(ctx):
+        current.ctx = ctx
+        fsdp2_worker.extra_missing(args)
+
+    _parallel(run_worker)
 
 
 def test_hf_metadata_hook_uses_the_same_vote_on_every_rank(tmp_path):

@@ -655,11 +655,12 @@ def test_native_dcp_metadata_read_errors_leave_all_entries_foreign(
     original_open, original_import = builtins.open, builtins.__import__
 
     def open_file(path, *args, **kwargs):
-        if path == metadata:
-            reads.append(path)
-            # Inject the OS error so the test works with elevated privileges.
-            if failure == "unreadable":
-                raise PermissionError("unreadable metadata")
+        if path != metadata:
+            return original_open(path, *args, **kwargs)
+        reads.append(path)
+        # Inject the OS error so the test works with elevated privileges.
+        if failure == "unreadable":
+            raise PermissionError("unreadable metadata")
         return original_open(path, *args, **kwargs)
 
     def import_module(name, *args, **kwargs):

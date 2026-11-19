@@ -105,7 +105,7 @@ def _validate_state(state):
             raise TypeError(f"rank_state {name} must contain bytes")
 
 
-def _broadcast_names(ctx, operation, source, names):
+def _broadcast_names(ctx, operation, source, names) -> Result[list[str]]:
     coordinator = ctx.coordinator
     assert coordinator is not None
     prepared = _collective(
@@ -116,6 +116,7 @@ def _broadcast_names(ctx, operation, source, names):
     if type(prepared) is Err:
         return prepared
     data = prepared.value
+    assert data is not None
     received = bytearray()
     # The coordinator's boolean AND can broadcast one bit at a time from source.
     while coordinator.vote(ctx.rank != source or len(received) < len(data)):
@@ -138,19 +139,27 @@ def _agree_rank_state(state, ctx):
     names = _collective(ctx, operation, lambda: set(state.rank_state))
     if type(names) is Err or coordinator.vote(not names.value):
         return names
-    reference = _broadcast_names(ctx, operation, 0, lambda: sorted(names.value))
+    keys = names.value
+    assert keys is not None
+    reference = _broadcast_names(ctx, operation, 0, lambda: sorted(keys))
     if type(reference) is Err:
         return reference
-    difference = _collective(ctx, operation, lambda: names.value ^ set(reference.value))
+    reference_keys = reference.value
+    assert reference_keys is not None
+    difference = _collective(ctx, operation, lambda: keys ^ set(reference_keys))
     if type(difference) is Err or coordinator.vote(not difference.value):
         return difference
+    differing_keys = difference.value
+    assert differing_keys is not None
     for source in range(1, ctx.world_size):
-        if not coordinator.vote(ctx.rank != source or not difference.value):
+        if not coordinator.vote(ctx.rank != source or not differing_keys):
             break
-    mismatch = _broadcast_names(ctx, operation, source, lambda: [min(difference.value)])
+    mismatch = _broadcast_names(ctx, operation, source, lambda: [min(differing_keys)])
     if type(mismatch) is Err:
         return mismatch
-    (key,) = mismatch.value
+    mismatch_keys = mismatch.value
+    assert mismatch_keys is not None
+    (key,) = mismatch_keys
     return _error(
         operation,
         ValueError(f"rank_state keys disagree for {key!r} (ranks 0 and {source})"),

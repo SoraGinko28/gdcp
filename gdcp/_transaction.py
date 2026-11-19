@@ -61,8 +61,12 @@ def _sync_tree(root):
 def _mount_points():
     if sys.platform != "linux":
         return set()
+    return _parse_mount_points(Path("/proc/self/mountinfo").read_text())
+
+
+def _parse_mount_points(mountinfo):
     points = set()
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+    for line in mountinfo.splitlines():
         name = line.split()[4]
         for escaped, value in (
             (r"\040", " "),
@@ -554,8 +558,7 @@ class DirectoryTransaction:
         journal = self.root / JOURNAL_NAME
         try:
             self._check(self.root, self.new_identity)
-            if os.path.lexists(journal):
-                _remove_verified(journal, self.journal_identity)
+            self._remove_journal(journal)
             _sync_directory(self.root)
         except Exception as exc:
             _LOG.warning(
@@ -563,6 +566,10 @@ class DirectoryTransaction:
                 journal,
                 exc,
             )
+
+    def _remove_journal(self, journal):
+        if os.path.lexists(journal):
+            _remove_verified(journal, self.journal_identity)
 
     def _remove_obsolete(self, path, expected):
         if expected is None or not os.path.lexists(path):

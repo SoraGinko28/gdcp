@@ -428,9 +428,10 @@ class FSDP2Adapter:
         )
         self.optimizer_state = values
         if self.loading:
+            slots = cast(dict[str, dict], values["state"])
             self.optimizer_state = {
                 "param_groups": values["param_groups"],
-                "state": {fqn: dict(fields) for fqn, fields in values["state"].items()},
+                "state": {fqn: dict(fields) for fqn, fields in slots.items()},
             }
         _validate_optimizer_tensors(model, self.optimizer_state)
         tensors, objects, self.optimizer_paths = _optimizer_values(self.optimizer_state)

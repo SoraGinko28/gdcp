@@ -17,7 +17,7 @@ class _InterruptIO(FileIO):
     """Remember interrupts that connector commit converts to an error Result."""
 
     def __init__(self, delegate):
-        self.interrupt = None
+        self.interrupt: BaseException | None = None
         self.tracer = delegate.tracer
         self.fds = delegate.fds
         # Payload access stays bound directly to the original/custom backend.
@@ -33,6 +33,14 @@ class _InterruptIO(FileIO):
         self.write_all = delegate.write_all
 
 
+def _remember_io_interrupt(io: FileIO, exc: BaseException) -> None:
+    if isinstance(exc, Exception):
+        return
+    assert isinstance(io, _InterruptIO)
+    if io.interrupt is None:
+        io.interrupt = exc
+
+
 def _raise_io_interrupt(storage):
     io = getattr(storage.data_accessor, "io", None)
     if isinstance(io, _InterruptIO) and io.interrupt is not None:
@@ -44,8 +52,7 @@ class _CoordinatedSaveSession(SafeTensorsSaveSession):
         try:
             action()
         except BaseException as exc:
-            if not isinstance(exc, Exception) and self.io.interrupt is None:
-                self.io.interrupt = exc
+            _remember_io_interrupt(self.io, exc)
             return exc
         return None
 

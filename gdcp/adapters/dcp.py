@@ -581,6 +581,15 @@ def _read_strided(chunk, start, end):
         return view.flat[start // chunk.itemsize : end // chunk.itemsize].view(np.uint8)
 
 
+def _overlapping_chunks(chunks, start, end):
+    first = bisect_right(chunks, start, key=lambda chunk: chunk.end)
+    for index in range(first, len(chunks)):
+        chunk = chunks[index]
+        if chunk.start >= end:
+            break
+        yield chunk
+
+
 class _NativeAccessor(DTensorDataAccessor):
     """Read each virtual tensor file across its native DCP payload ranges."""
 
@@ -593,11 +602,7 @@ class _NativeAccessor(DTensorDataAccessor):
         start = global_range.contiguous_payload_offset
         end = start + global_range.size
         chunks = self.ranges[global_range.file_path]
-        first = bisect_right(chunks, start, key=lambda chunk: chunk.end)
-        for index in range(first, len(chunks)):
-            chunk = chunks[index]
-            if chunk.start >= end:
-                break
+        for chunk in _overlapping_chunks(chunks, start, end):
             self._read_chunk(
                 chunk, max(start, chunk.start), min(end, chunk.end), read_to_buffer
             )

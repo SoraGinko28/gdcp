@@ -40,8 +40,9 @@ class _CastAccessor(DTensorDataAccessor):
         if key != self.current:
             self.finish()
             tensor = self.tensors[key]
-            if tensor.is_floating_point():
-                tensor = tensor.to(dtype=self.dtype)
+            tensor = (
+                tensor.to(dtype=self.dtype) if tensor.is_floating_point() else tensor
+            )
             self.current = key
             self.accessor = TorchAccessor(
                 {key: tensor}, self.ctx.rank, self.ctx.world_size

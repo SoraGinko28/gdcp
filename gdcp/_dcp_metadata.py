@@ -43,8 +43,28 @@ class _Record:
     state: object = None
 
 
+def _load_record(parser: object, /) -> None:
+    assert isinstance(parser, _MetadataParser)
+    args = parser.stack.pop()
+    kind = parser.stack[-1]
+    if type(kind) is not _Global or type(args) is not tuple:
+        raise pickle.UnpicklingError("invalid DCP metadata record")
+    parser.stack[-1] = _Record(kind)
+
+
+def _load_state(parser: object, /) -> None:
+    assert isinstance(parser, _MetadataParser)
+    state = parser.stack.pop()
+    record = parser.stack[-1]
+    if type(record) is not _Record or type(state) not in (dict, tuple):
+        raise pickle.UnpicklingError("invalid DCP metadata record state")
+    record.state = state
+
+
 class _MetadataParser(pickle._Unpickler):
-    # The Python implementation lets us replace construction and state opcodes.
+    # The Python unpickler initializes this stack in load().
+    stack: list[object]
+
     # Globals stay symbolic, even for torch classes with custom pickle hooks.
     def find_class(self, module, name):
         if name not in _GLOBALS.get(module, ()):
@@ -59,23 +79,10 @@ class _MetadataParser(pickle._Unpickler):
             "pickle extensions are unsupported in DCP metadata"
         )
 
-    def load_record(self):
-        args = self.stack.pop()
-        kind = self.stack[-1]
-        if type(kind) is not _Global or type(args) is not tuple:
-            raise pickle.UnpicklingError("invalid DCP metadata record")
-        self.stack[-1] = _Record(kind)
-
-    def load_state(self):
-        state = self.stack.pop()
-        record = self.stack[-1]
-        if type(record) is not _Record or type(state) not in (dict, tuple):
-            raise pickle.UnpicklingError("invalid DCP metadata record state")
-        record.state = state
-
+    # Replace the opcodes that construct objects or apply their state.
     dispatch = pickle._Unpickler.dispatch.copy()
-    dispatch[pickle.NEWOBJ[0]] = dispatch[pickle.REDUCE[0]] = load_record
-    dispatch[pickle.BUILD[0]] = load_state
+    dispatch[pickle.NEWOBJ[0]] = dispatch[pickle.REDUCE[0]] = _load_record
+    dispatch[pickle.BUILD[0]] = _load_state
     del dispatch[pickle.INST[0]], dispatch[pickle.OBJ[0]], dispatch[pickle.NEWOBJ_EX[0]]
 
 

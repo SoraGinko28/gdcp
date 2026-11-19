@@ -716,6 +716,14 @@ def _load_rank_only(path, state, ctx, *, optional):
     return _load_rank_state(root, state, ctx, optional=optional)
 
 
+def _validate_load_objects(state, objects, preflight):
+    for component in state.components:
+        if not isinstance(objects.get(component.name, {}), dict):
+            raise ValueError(f"HF objects for {component.name} must contain a mapping")
+    if preflight is not None:
+        return preflight(objects)
+
+
 def load_state(path, state, ctx, *, _preflight=None, _optional_rank_state=False):
     """Load native HF headers directly, including an optional optimizer sidecar."""
     agreed = core._agree_components(state, ctx)
@@ -737,20 +745,11 @@ def load_state(path, state, ctx, *, _preflight=None, _optional_rank_state=False)
     assert prepared.value is not None
     combined, compute, storage, objects, headers, duplicates = prepared.value
 
-    def validate_objects():
-        for component in state.components:
-            if not isinstance(objects.get(component.name, {}), dict):
-                raise ValueError(
-                    f"HF objects for {component.name} must contain a mapping"
-                )
-        if _preflight is not None:
-            return _preflight(objects)
-
     result = core._load_payloads(
         [(combined.name, compute, storage)],
         ctx,
         lambda: _load_rank_state(path, state, ctx, optional=_optional_rank_state),
-        preflight=validate_objects,
+        preflight=lambda: _validate_load_objects(state, objects, _preflight),
         validate=lambda: _validate_alias_payloads(path, headers, duplicates),
     )
     if type(result) is Err:

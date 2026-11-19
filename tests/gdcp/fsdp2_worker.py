@@ -233,24 +233,23 @@ def global_steps(args):
 
 def extra_missing(args):
     destination = Path(args.output)
+    filename = "extra_state_rank_1.pt"
     if get_rank() == 0:
         shutil.copytree(args.path, destination)
-        (destination / "extra_state" / "extra_state_rank_1.pt").unlink()
+        (destination / "extra_state" / filename).unlink()
     barrier()
-    captured = io.StringIO()
-    handler = logging.StreamHandler(captured)
-    handler.setLevel(logging.WARNING)
-    logging.getLogger().addHandler(handler)
-    common = {"extra_state": None}
-    try:
-        FSDP2Checkpointer.load(destination, common, load_common_state_only=True)
-    finally:
-        logging.getLogger().removeHandler(handler)
-    assert common["extra_state"] == extra_for(0)
-    if get_rank() == 1:
-        assert captured.getvalue(), "missing own extra-state file must warn"
+    sentinel = object()
+    common = {"extra_state": sentinel}
+    error = _must_raise(
+        lambda: FSDP2Checkpointer.load(
+            destination, common, load_common_state_only=True
+        ),
+        "missing declared extra-state file",
+    )
+    assert isinstance(error, RuntimeError) and filename in str(error), error
+    assert common == {"extra_state": sentinel}
     print(
-        f"ACCEPTANCE 9 PASS rank={get_rank()} missing own file falls back to rank0",
+        f"ACCEPTANCE 9 PASS rank={get_rank()} missing declared file rejected with state unchanged",
         flush=True,
     )
 
