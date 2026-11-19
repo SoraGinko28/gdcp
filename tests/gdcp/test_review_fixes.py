@@ -15,6 +15,7 @@ from gdcp.state import RankContext
 from gdtensor.builder import Err
 from gdtensor_conn.coord import ThreadCoordinator
 from gdtensor_conn.iobackend import FileIO
+from tests.support import gdcp as fixtures
 from tests.support.gdcp import assert_ok
 from tests.support.gdcp_overwrite import (
     _assert_generation,
@@ -40,6 +41,180 @@ def _parallel(call, worlds=(2, 2)):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         return list(pool.map(invoke, range(2)))
+
+
+class _CountingCoordinator(ThreadCoordinator):
+    def __init__(self, world):
+        super().__init__(world, timeout=5)
+        self.calls = local()
+        self.counts = [0] * world
+
+    def vote(self, ok):
+        self.counts[self.calls.rank] += 1
+        return super().vote(ok)
+
+
+def _counted_operation(fmt, root, fixture, *, loading):
+    call, options = _operation(fmt, loading, fixture)
+    if fmt == "dcp":
+        from gdcp.adapters import dcp
+
+        call, options = (dcp.load if loading else dcp.save), {}
+    coordinator = _CountingCoordinator(len(fixture.states))
+
+    def invoke(rank):
+        coordinator.calls.rank = rank
+        ctx = RankContext(rank, len(fixture.states), coordinator)
+        return call(root, fixture.states[rank], ctx, **options)
+
+    with ThreadPoolExecutor(max_workers=len(fixture.states)) as pool:
+        assert_ok(list(pool.map(invoke, range(len(fixture.states)))))
+    assert len(set(coordinator.counts)) == 1
+    return coordinator.counts[0]
+
+
+def _long_names_fixture(monkeypatch, world):
+    monkeypatch.setattr(
+        fixtures, "SPECS", [(name * 10, *spec) for name, *spec in fixtures.SPECS]
+    )
+    fixture = fixtures.numpy_checkpoint(
+        world, initialized=True, names=("model" * 10, "optimizer" * 10)
+    )
+    for rank, state in enumerate(fixture.states):
+        state.rank_state = {
+            "extra_state" * 10 + str(key): bytes([rank]) for key in range(10)
+        }
+    return fixture
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_full_state_votes_are_independent_of_names_and_world(
+    tmp_path, monkeypatch, fmt
+):
+    def roundtrip(root, fixture):
+        saved = _counted_operation(fmt, root, fixture, loading=False)
+        loaded = _counted_operation(fmt, root, fixture, loading=True)
+        assert not list(root.parent.glob(".*gdcp*vote"))
+        return saved, loaded
+
+    standard = roundtrip(tmp_path / "standard", _fixture())
+    with monkeypatch.context() as patch:
+        longer = roundtrip(tmp_path / "longer", _long_names_fixture(patch, 2))
+    with monkeypatch.context() as patch:
+        larger = roundtrip(tmp_path / "larger", _long_names_fixture(patch, 3))
+    assert standard == longer == larger
+    assert standard == {"safetensors": (58, 15), "dcp": (59, 17), "hf": (43, 15)}[fmt]
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("fault", ["unreadable", "tampered", "interrupt"])
+@pytest.mark.parametrize("loading", [False, True])
+def test_agreement_record_failure_precedes_payloads(
+    tmp_path, monkeypatch, fmt, fault, loading
+):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture(shift=7)
+    if loading:
+        assert_ok(_run(fmt, root, _fixture()))
+    original = _files(root)
+    call, options = _operation(fmt, loading, fixture)
+    scratch = ".gdcp-load-vote" if loading else ".checkpoint.gdcp-vote"
+    read = Path.read_bytes
+    current = local()
+    faults = []
+    payload_io = []
+
+    def read_record(path):
+        data = read(path)
+        is_reference = path.parent.name == scratch and path.name == "rank-0"
+        if not is_reference or current.rank != 1:
+            return data
+        faults.append(path.name)
+        if fault == "unreadable":
+            raise PermissionError("injected agreement read failure")
+        if fault == "interrupt":
+            raise KeyboardInterrupt("injected agreement interrupt")
+        return data.replace(b"optimizer", b"tampering")
+
+    def run(ctx):
+        current.rank = ctx.rank
+        try:
+            return call(root, fixture.states[ctx.rank], ctx, **options)
+        except KeyboardInterrupt as exc:
+            return exc
+
+    monkeypatch.setattr(Path, "read_bytes", read_record)
+    io_method = "pread" if loading else "pwrite"
+    monkeypatch.setattr(FileIO, io_method, lambda *args: payload_io.append(args))
+    results = _parallel(run)
+    assert faults
+    assert not payload_io
+    assert type(results[0]) is Err
+    assert "agreement record" in results[0].value.msg
+    if fault == "interrupt":
+        assert isinstance(results[1], KeyboardInterrupt)
+    else:
+        assert type(results[1]) is Err
+        assert results[0].value.msg == results[1].value.msg
+    assert _files(root) == original
+    assert list(tmp_path.iterdir()) == ([root] if loading else [])
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("loading", [False, True])
+def test_agreement_recovers_owned_records(tmp_path, fmt, loading):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture()
+    if loading:
+        assert_ok(_run(fmt, root, fixture))
+    scratch = tmp_path / (".gdcp-load-vote" if loading else ".checkpoint.gdcp-vote")
+    scratch.mkdir()
+    (scratch / ".owner").write_bytes(b"GDCP rank agreement v1\n")
+    (scratch / "rank-1").write_bytes(b"partial record from interrupted process")
+    (scratch / "duplicate-1").touch()
+
+    assert_ok(_run(fmt, root, fixture, loading=loading))
+    assert list(tmp_path.iterdir()) == [root]
+
+
+def test_agreement_preserves_unrecognized_sibling(tmp_path):
+    root = tmp_path / "checkpoint"
+    scratch = tmp_path / ".checkpoint.gdcp-vote"
+    scratch.mkdir()
+    foreign = scratch / "rank-0"
+    foreign.write_bytes(b"foreign file")
+
+    results = _run("safetensors", root, _fixture())
+    assert all(type(result) is Err for result in results)
+    assert "unrecognized agreement directory" in results[0].value.msg
+    assert not root.exists()
+    assert _files(scratch) == {"rank-0": b"foreign file"}
+
+
+def test_agreement_cleanup_finishes_after_interrupt(tmp_path, monkeypatch):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture()
+    unlink = Path.unlink
+    interrupt = KeyboardInterrupt("interrupted agreement cleanup")
+
+    def unlink_owner(path, *args, **kwargs):
+        result = unlink(path, *args, **kwargs)
+        if path.parent.name == ".checkpoint.gdcp-vote" and path.name == ".owner":
+            raise interrupt
+        return result
+
+    def save(ctx):
+        try:
+            return core.save(root, fixture.states[ctx.rank], ctx)
+        except KeyboardInterrupt as exc:
+            return exc
+
+    monkeypatch.setattr(Path, "unlink", unlink_owner)
+    leader, peer = _parallel(save)
+    assert leader is interrupt
+    assert type(peer) is Err
+    assert "agreement record" in peer.value.msg
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
@@ -296,7 +471,9 @@ def test_save_rejects_duplicate_ranks_before_staging(
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize("field", ["rank_state keys", "rank configuration"])
+@pytest.mark.parametrize(
+    "field", ["rank_state keys", "rank configuration", "checkpoint component sequence"]
+)
 def test_save_rejects_mismatch_restored_by_later_phase(
     tmp_path, monkeypatch, fmt, field
 ):
@@ -309,19 +486,23 @@ def test_save_rejects_mismatch_restored_by_later_phase(
     coordinator = ThreadCoordinator(2, timeout=2)
     contexts = [RankContext(rank, 2, coordinator) for rank in range(2)]
     original_rank_state = dict(state.rank_state)
+    original_components = list(state.components)
     observed = []
 
     def change():
         observed.append("changed")
         if field == "rank_state keys":
             state.rank_state.clear()
-        else:
+        elif field == "rank configuration":
             contexts[1].world_size = 3
+        else:
+            state.components.reverse()
 
     def restore():
         observed.append("restored")
         state.rank_state.update(original_rank_state)
         contexts[1].world_size = 2
+        state.components[:] = original_components
 
     def save_rank(rank):
         rank_options = dict(options)

@@ -58,7 +58,8 @@ component validates its keys and aliases against the tensors it owns before any
 tensor is copied. Model keys beginning with `optimizer.` are still model keys
 unless the inventory lists them. The framework-neutral HF loader supports
 model-only, optimizer-only, full, and rank-state-only restores from full-state
-checkpoints, including older files. With an older optimizer sidecar that lacks
+checkpoints. Some older sidecars limit which restores work.
+With an older optimizer sidecar that lacks
 the inventory, GDCP matches requested keys and aliases first, then uses the
 saved parameter groups to recognize remaining slots in
 `optimizer.state.<fqn>.<field>`. A model-only restore skips these slots and
@@ -80,8 +81,12 @@ produces an error naming the tensor. The nonempty chunks must cover the tensor
 along dimension 0. GDCP reports a chunk geometry error for overlaps, gaps, and
 sharding along another dimension.
 
-All three formats require the same rank-state keys and ordered component list on
-every rank before staging a save. Names that resolve to the same directory on the
+All three formats check rank IDs, the live world size, rank-state keys and the
+ordered component list before payload I/O on saves and loads. Coordinated
+operations need a writable shared target parent with cross-node advisory locks
+and read-after-fsync visibility. See [GDCP filesystem requirements](GDCP.md) and
+the [known limitations](GDCP.md#known-limitations).
+Names that resolve to the same directory on the
 checkpoint filesystem fail preflight on all ranks before any payload is written.
 FSDP2 validates save options collectively and requires every rank to select the
 same format and HF export mode. A descriptor close failure during a save aborts

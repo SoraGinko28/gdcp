@@ -798,7 +798,7 @@ def load_state(
     _optional_rank_state=False,
 ):
     """Load native HF headers directly, including an optional optimizer sidecar."""
-    agreed = core._agree_components(state, ctx)
+    agreed = core._agree_load(path, state, ctx)
     if type(agreed) is Err:
         return agreed
     if not state.components:

@@ -41,6 +41,27 @@ All ranks must use the same FSDP2 save format and agree on whether an HF save
 exports weights only or full state. All three formats require the same ordered
 component list on every rank during load and before staging a save.
 
+When a coordinator is present, GDCP checks the live world size, unique rank
+IDs, ordered component names, and rank-state keys before payload I/O. Each rank
+creates a claim and compares its checksummed description with rank 0's. Saves
+use the reserved `.NAME.gdcp-vote` directory beside the resolved target. Loads
+use `.gdcp-load-vote` in the resolved target's parent so ranks can load from
+rank-local copies with different names under that parent. Loads compare the
+requested state, which also works for partial restores and native checkpoints.
+The number of collective votes in this phase is independent of the number of
+ranks and the data being compared.
+
+Coordinated saves and loads need a writable shared target parent. The filesystem
+must provide exclusive file creation, advisory file locks across participating
+nodes, and visibility of fsynced files and directory entries to all ranks after
+a coordinator vote. A rank that cannot read or verify a record votes to fail the
+operation. Rank 0 holds the agreement directory's owner lock through cleanup.
+Overlapping load agreement phases in one parent directory can report that the
+directory is in use. GDCP removes its records before proceeding to payload I/O
+and cleans up when it catches a failure or interrupt during agreement. After
+process death, the next operation that acquires the owner lock removes recognized
+stale records. An unrecognized directory is preserved and reported as an error.
+
 Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
 Integer and boolean buffers round-trip bit for bit into targets of the same dtype.
 This includes `uint16`, `uint32`, and `uint64` buffers and `int16` buffers sharded
@@ -190,7 +211,8 @@ only load trusted checkpoints. Before staging a save, GDCP checks that each
 rank ID is claimed once and that all participants agree on the world size and
 the set of rank-state keys. If keys differ at that point, every rank reports
 the same error naming a differing key. GDCP writes each rank's snapshot of its
-rank state and checks the rank configuration and key sets between save phases.
+rank state and checks the rank configuration, component sequence, and key sets
+between save phases.
 A detected change returns the same error on every rank, even if a callback
 restores the original value. GDCP also checks that every declared file exists
 before publication. A failed check preserves any previous checkpoint.
@@ -266,3 +288,19 @@ environment and exact verification commands are recorded in the task report.
   from a GDCP marker can make the checkpoint unloadable.
 - If another process truncates a payload file while it is memory-mapped for a
   native DCP read, the reading process can terminate.
+- A legacy HF-layout checkpoint without an optimizer tensor inventory can fail
+  a model-only restore if its optimizer sidecar lists parameter IDs as integers
+  and the checkpoint contains optimizer tensors. The neutral HF loader can
+  restore model and optimizer together when both tensor inventories match.
+  FSDP2 requires named optimizer groups. For that path, use a reader that can
+  restore the original checkpoint and re-save it with the current version.
+- Without an optimizer tensor inventory, the HF loader can classify an
+  unmatched model tensor named `optimizer.state.<parameter name>.<field>` as
+  optimizer state if the legacy sidecar lists that parameter by name. The
+  loader matches requested model keys and aliases before applying this rule.
+- The native DCP reader does not support lazily negated tensors whose serialized
+  byte order differs from the host's. Such a load can terminate the process.
+  PyTorch's own DCP reader handles the byte-order conversion.
+- Save agreement is checked at phase boundaries and at selected accessor hooks.
+  A rank's rank-state keys or world size can change and change back between two
+  tensor reads without detection if neither check observes the change.

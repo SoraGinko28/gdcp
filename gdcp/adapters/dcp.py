@@ -1044,11 +1044,6 @@ def _native_optimizer_objects(root, metadata, component, validate_groups):
 def _prepare_native(path, state, ctx, validate_groups):
     core._validate_context(ctx)
     core._validate_state(state)
-    if state.rank_state:
-        key = min(state.rank_state)
-        raise ValueError(
-            f"native DCP has no GDCP per-rank extra_state (requested {key!r})"
-        )
     root = Path(path)
     metadata = {c.name: _read_native_metadata(root / c.name) for c in state.components}
     optimizer_objects = None
@@ -1117,7 +1112,18 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
             _preflight=_preflight,
             _validate_groups=_validate_groups,
         )
-    agreed = core._agree_components(state, ctx)
+    unsupported = core._error(
+        "validate native DCP rank state",
+        ValueError("native DCP has no GDCP per-rank extra_state"),
+    )
+    rank_state = core._collective(
+        ctx,
+        "validate native DCP rank state",
+        lambda: unsupported if state.rank_state else None,
+    )
+    if type(rank_state) is Err:
+        return unsupported
+    agreed = core._agree_load(path, state, ctx)
     if type(agreed) is Err:
         return agreed
     metadata = core._collective(
