@@ -373,9 +373,9 @@ def _save_io(ctx, combined, compute, storage):
         _finish_accessor(combined)
 
 
-def _initialize(transaction, state, ctx, objects, assignment, write_metadata):
+def _initialize(transaction, rank_state, ctx, objects, assignment, write_metadata):
     planned = {Path(name) for name in _tensor_files(assignment)}
-    planned.update(core._planned_rank_files(state, ctx))
+    planned.update(core._planned_rank_files(rank_state, ctx))
     planned.update({Path(_OBJECTS), Path(_COMMITTED)})
     # A foreign index would take precedence over the newly written single file.
     planned.add(Path(HF_INDEX_NAME))
@@ -386,7 +386,7 @@ def _initialize(transaction, state, ctx, objects, assignment, write_metadata):
         root = transaction.stage
         root.mkdir(parents=True, exist_ok=True)
         desc.atomic_write(root / desc.PENDING_NAME, b"HF save in progress\n")
-        core._initialize_directories(root, state.rank_state)
+        core._initialize_directories(root, rank_state)
         desc.write_objects(root / _OBJECTS, objects)
 
 
@@ -394,7 +394,9 @@ def _finish_accessor(combined):
     combined.accessor.finish()
 
 
-def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
+def _save_staged(
+    transaction, state, ctx, rank_state, inventory, max_shard_size, write_metadata
+):
     path = transaction.stage
     prepared = core._collective(
         ctx, "HF prepare save", lambda: _save_prepare(path, state, ctx, max_shard_size)
@@ -408,7 +410,7 @@ def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
         PREFLIGHT,
         lambda: _initialize(
             transaction,
-            state,
+            rank_state,
             ctx,
             objects,
             _file_assignment(storage.d_tensor_table, max_shard_size),
@@ -425,7 +427,7 @@ def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
     if type(result) is Err:
         return result
     result = core._collective(
-        ctx, "HF rank state", lambda: core._save_rank_state(path, state, ctx)
+        ctx, "HF rank state", lambda: core._save_rank_state(path, rank_state, ctx)
     )
     if type(result) is Err:
         return result
@@ -437,16 +439,16 @@ def _save_staged(transaction, state, ctx, max_shard_size, write_metadata):
     return core._collective(
         ctx,
         "HF publish",
-        lambda: _finalize(path, state, ctx),
+        lambda: _finalize(path, ctx, inventory),
     )
 
 
-def _finalize(path, state, ctx):
+def _finalize(path, ctx, inventory):
     if ctx.rank != 0:
         return
     marker = Path(path) / _COMMITTED
     saved = json.loads(marker.read_bytes())
-    saved["rank_state"] = core._rank_state_inventory(state, ctx)
+    saved["rank_state"] = inventory
     desc.atomic_write(marker, desc.json_bytes(saved))
     (Path(path) / desc.PENDING_NAME).unlink()
 
@@ -457,8 +459,14 @@ def save_state(path, state, ctx, *, max_shard_size=None, _write_metadata=None):
         path,
         state,
         ctx,
-        lambda transaction: _save_staged(
-            transaction, state, ctx, max_shard_size, _write_metadata
+        lambda transaction, agreed, rank_state, inventory: _save_staged(
+            transaction,
+            state,
+            agreed,
+            rank_state,
+            inventory,
+            max_shard_size,
+            _write_metadata,
         ),
     )
 

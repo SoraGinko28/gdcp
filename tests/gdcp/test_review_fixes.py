@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from gdcp import _transaction, core, desc, hf
+from gdcp.backend import SafeTensorsBackend
+from gdcp.policy import PerRankPolicy
 from gdcp.state import RankContext
 from gdtensor.builder import Err
 from gdtensor_conn.coord import ThreadCoordinator
@@ -25,11 +27,11 @@ _PAYLOADS = [
 _FORMATS = [fmt for fmt, _ in _PAYLOADS]
 
 
-def _parallel(call):
+def _parallel(call, worlds=(2, 2)):
     coordinator = ThreadCoordinator(2, timeout=2)
 
     def invoke(rank):
-        return call(RankContext(rank, 2, coordinator))
+        return call(RankContext(rank, worlds[rank], coordinator))
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         return list(pool.map(invoke, range(2)))
@@ -223,6 +225,161 @@ def test_rank_state_inventory_and_larger_world_fallback(tmp_path, caplog, fmt):
         source.states[rank].rank_state for rank in (0, 1, 0)
     ]
     assert "extra_state rank 2" in caplog.text
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("worlds", [(3, 2), (1, 2)])
+def test_save_agrees_on_world_before_staging(tmp_path, monkeypatch, fmt, worlds):
+    source = _fixture()
+    call, options = _operation(fmt, False, source)
+    for state in source.states:
+        state.components.clear()
+    root = tmp_path / "checkpoint"
+    started = []
+    begin = _transaction.DirectoryTransaction.begin
+
+    def track_begin(transaction, planned):
+        started.append(transaction.rank)
+        return begin(transaction, planned)
+
+    monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
+    results = _parallel(
+        lambda ctx: call(root, source.states[ctx.rank], ctx, **options), worlds
+    )
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "world size" in results[0].value.msg
+    assert not started
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_save_rejects_keys_changed_by_accessor(tmp_path, monkeypatch, fmt):
+    root = tmp_path / "checkpoint"
+    old, source = _fixture(), _fixture(shift=7)
+    assert_ok(_run(fmt, root, old))
+    state = source.states[1]
+    monkeypatch.setattr(
+        state.components[0].accessor, "finish", state.rank_state.clear, raising=False
+    )
+    results = _run(fmt, root, source)
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "rank_state keys" in results[0].value.msg
+    _assert_generation(fmt, root, old, world=2)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_save_uses_agreed_rank_state_bytes(tmp_path, monkeypatch, fmt):
+    root = tmp_path / "checkpoint"
+    source = _fixture()
+    initialize = core._initialize_directories
+
+    def change_values(path, names):
+        initialize(path, names)
+        for state in source.states:
+            state.rank_state["extra_state"] = b"changed after agreement"
+
+    monkeypatch.setattr(core, "_initialize_directories", change_values)
+    assert_ok(_run(fmt, root, source))
+    for rank in range(2):
+        payload = root / "extra_state" / f"extra_state_rank_{rank}.pt"
+        assert payload.read_bytes() == f"0-{rank}".encode()
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_save_rejects_incomplete_rank_state_inventory(tmp_path, monkeypatch, fmt):
+    root = tmp_path / "checkpoint"
+    source = _fixture()
+    write = desc.atomic_write
+    missing = "extra_state_rank_1.pt"
+
+    def discard_rank_file(path, data):
+        result = write(path, data)
+        if path.name == missing:
+            path.unlink()
+        return result
+
+    monkeypatch.setattr(desc, "atomic_write", discard_rank_file)
+    results = _run(fmt, root, source)
+    assert all(type(result) is Err for result in results), results
+    assert all(missing in result.value.msg for result in results)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("truth", [False, None])
+def test_core_uses_supplied_options_without_testing_truth(tmp_path, truth):
+    root = tmp_path / "checkpoint"
+    source, target = _fixture(), _fixture(shift=7)
+    plans, opens = [], []
+
+    def option_truth(self):
+        if truth is None:
+            raise OSError("injected option truth-value failure")
+        return truth
+
+    class Policy(PerRankPolicy):
+        __bool__ = option_truth
+
+        def plan(self, component, world_size):
+            plans.append(component.name)
+            return super().plan(component, world_size)
+
+    class Backend(SafeTensorsBackend):
+        __bool__ = option_truth
+
+        def open(self, root, storage_table, layout, coordinator=None):
+            opens.append(root.name)
+            return super().open(root, storage_table, layout, coordinator)
+
+    def save(ctx):
+        return core.save(
+            root,
+            source.states[ctx.rank],
+            ctx,
+            policy=Policy() if ctx.rank == 0 else None,
+            backend=Backend() if ctx.rank == 0 else None,
+        )
+
+    assert_ok(_parallel(save))
+    assert plans == opens == ["model", "optimizer"]
+    opens.clear()
+    assert_ok(
+        _parallel(
+            lambda ctx: core.load(
+                root,
+                target.states[ctx.rank],
+                ctx,
+                backend=Backend() if ctx.rank == 0 else None,
+            )
+        )
+    )
+    assert opens == ["model", "optimizer"]
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_core_votes_on_option_preparation_failure(tmp_path, monkeypatch, loading):
+    root = tmp_path / "checkpoint"
+    source = _fixture()
+    if loading:
+        assert_ok(_run("safetensors", root, source))
+    call = core.load if loading else core.save
+
+    def fail_backend():
+        raise OSError("injected option preparation failure")
+
+    monkeypatch.setattr(core, "SafeTensorsBackend", fail_backend)
+    results = _parallel(
+        lambda ctx: call(
+            root,
+            source.states[ctx.rank],
+            ctx,
+            backend=None if ctx.rank == 0 else SafeTensorsBackend(),
+        )
+    )
+    assert all(type(result) is Err for result in results), results
+    assert "injected option preparation failure" in results[0].value.msg
+    assert root.exists() == loading
 
 
 @pytest.mark.parametrize("fmt", [fmt for fmt, _ in _PAYLOADS])

@@ -22,6 +22,7 @@ from . import desc
 from ._transaction import PREFLIGHT, DirectoryTransaction
 from .backend import SafeTensorsBackend, _raise_io_interrupt
 from .policy import PerRankPolicy
+from .state import RankContext
 
 _LOG = logging.getLogger(__name__)
 
@@ -94,24 +95,25 @@ def _validate_context(ctx):
         raise ValueError("multiple ranks require a coordinator")
 
 
-def _validate_state(state):
+def _validate_state(state, *, rank_state=None):
+    rank_state = state.rank_state if rank_state is None else rank_state
     names = [component.name for component in state.components]
     if len(set(names)) != len(names):
         raise ValueError("duplicate component name")
-    for name in names + list(state.rank_state):
+    for name in names + list(rank_state):
         desc._safe_relative(name)
-    for name, data in state.rank_state.items():
+    for name, data in rank_state.items():
         if not isinstance(data, bytes):
             raise TypeError(f"rank_state {name} must contain bytes")
 
 
-def _broadcast_names(ctx, operation, source, names) -> Result[list[str]]:
+def _broadcast_value(ctx, operation, source, value) -> Result[Any]:
     coordinator = ctx.coordinator
     assert coordinator is not None
     prepared = _collective(
         ctx,
         operation,
-        lambda: json.dumps(names()).encode() if ctx.rank == source else b"",
+        lambda: json.dumps(value()).encode() if ctx.rank == source else b"",
     )
     if type(prepared) is Err:
         return prepared
@@ -131,17 +133,37 @@ def _broadcast_names(ctx, operation, source, names) -> Result[list[str]]:
     return _collective(ctx, operation, lambda: json.loads(received))
 
 
-def _agree_rank_state(state, ctx):
+def _agree_save_context(ctx):
+    operation = "agree on save rank configuration"
+    coordinator = ctx.coordinator
+    if coordinator is None:
+        return _collective(ctx, operation, lambda: _validate_context(ctx))
+    if coordinator.vote(ctx.rank != 0):
+        return _error(operation, ValueError("save requires rank 0"))
+    world = _broadcast_value(ctx, operation, 0, lambda: ctx.world_size)
+    if type(world) is Err:
+        return world
+    if not coordinator.vote(ctx.world_size == world.value):
+        return _error(operation, ValueError("ranks disagree on save world size"))
+    if not coordinator.vote(0 <= ctx.rank < ctx.world_size):
+        return _error(operation, ValueError("invalid rank or world size"))
+    for rank in range(1, ctx.world_size):
+        if coordinator.vote(ctx.rank != rank):
+            return _error(operation, ValueError(f"save is missing rank {rank}"))
+    return Ok(None)
+
+
+def _agree_rank_state(rank_state, ctx):
     coordinator = ctx.coordinator
     if ctx.world_size == 1 or coordinator is None:
         return Ok(None)
     operation = "agree on rank state"
-    names = _collective(ctx, operation, lambda: set(state.rank_state))
+    names = _collective(ctx, operation, lambda: set(rank_state))
     if type(names) is Err or coordinator.vote(not names.value):
         return names
     keys = names.value
     assert keys is not None
-    reference = _broadcast_names(ctx, operation, 0, lambda: sorted(keys))
+    reference = _broadcast_value(ctx, operation, 0, lambda: sorted(keys))
     if type(reference) is Err:
         return reference
     reference_keys = reference.value
@@ -154,7 +176,7 @@ def _agree_rank_state(state, ctx):
     for source in range(1, ctx.world_size):
         if not coordinator.vote(ctx.rank != source or not differing_keys):
             break
-    mismatch = _broadcast_names(ctx, operation, source, lambda: [min(differing_keys)])
+    mismatch = _broadcast_value(ctx, operation, source, lambda: [min(differing_keys)])
     if type(mismatch) is Err:
         return mismatch
     mismatch_keys = mismatch.value
@@ -176,7 +198,7 @@ def _agree_components(state, ctx):
     )
     if type(names) is Err or coordinator.vote(not names.value):
         return names
-    reference = _broadcast_names(ctx, operation, 0, lambda: names.value)
+    reference = _broadcast_value(ctx, operation, 0, lambda: names.value)
     if type(reference) is Err:
         return reference
 
@@ -203,6 +225,8 @@ def _compute_view(component, tensor_ids=None):
 
 
 def _prepare_save(path, state, ctx, policy, backend):
+    policy = PerRankPolicy() if policy is None else policy
+    backend = SafeTensorsBackend() if backend is None else backend
     prepared = []
     for component in state.components:
         compute = _compute_view(component)
@@ -216,13 +240,13 @@ def _prepare_save(path, state, ctx, policy, backend):
     return prepared
 
 
-def _initialize_save(path, state, ctx):
+def _initialize_save(path, state, ctx, rank_state):
     if ctx.rank != 0:
         return
     root = Path(path)
     root.mkdir(parents=True, exist_ok=True)
     desc.atomic_write(root / desc.PENDING_NAME, b"GDCP save in progress\n")
-    names = [component.name for component in state.components] + list(state.rank_state)
+    names = [component.name for component in state.components] + list(rank_state)
     _initialize_directories(root, names)
 
 
@@ -315,22 +339,22 @@ def _rank_state_path(root, name, rank):
     return Path(root) / name / f"{name}_rank_{rank}.pt"
 
 
-def _save_rank_state(path, state, ctx):
-    for name, data in state.rank_state.items():
+def _save_rank_state(path, rank_state, ctx):
+    for name, data in rank_state.items():
         desc.atomic_write(_rank_state_path(path, name, ctx.rank), data)
 
 
-def _rank_state_inventory(state, ctx):
+def _rank_state_inventory(rank_state, ctx):
     return {
         name: {
             "ranks": list(range(ctx.world_size)),
             "pattern": name.replace("{", "{{").replace("}", "}}") + "_rank_{rank}.pt",
         }
-        for name in state.rank_state
+        for name in rank_state
     }
 
 
-def _publish(path, state, prepared, ctx):
+def _publish(path, state, prepared, ctx, inventory):
     if ctx.rank != 0:
         return
     components = {}
@@ -349,24 +373,24 @@ def _publish(path, state, prepared, ctx):
         "world_size": ctx.world_size,
         "global_steps": state.global_steps,
         "components": components,
-        "rank_state": _rank_state_inventory(state, ctx),
+        "rank_state": inventory,
     }
     desc.write_manifest(path, manifest)
     (Path(path) / desc.PENDING_NAME).unlink()
 
 
-def _planned_rank_files(state, ctx):
+def _planned_rank_files(rank_state, ctx):
     return {
-        Path(name) / f"{name}_rank_{rank}.pt"
-        for name in state.rank_state
+        _rank_state_path(".", name, rank)
+        for name in rank_state
         for rank in range(ctx.world_size)
     }
 
 
-def _planned_files(state, prepared, ctx):
+def _planned_files(state, prepared, ctx, rank_state):
     files = {Path(desc.MANIFEST_NAME), Path(desc.PENDING_NAME)}
     files.update(Path(component.name) for component in state.components)
-    files.update(_planned_rank_files(state, ctx))
+    files.update(_planned_rank_files(rank_state, ctx))
     for component, _compute, storage in prepared:
         prefix = Path(component.name)
         saved = desc.describe_component(
@@ -387,13 +411,13 @@ def _planned_files(state, prepared, ctx):
     return files
 
 
-def _initialize_transaction(transaction, state, prepared, ctx):
-    planned = _planned_files(state, prepared, ctx) if ctx.rank == 0 else ()
+def _initialize_transaction(transaction, state, prepared, ctx, rank_state):
+    planned = _planned_files(state, prepared, ctx, rank_state) if ctx.rank == 0 else ()
     transaction.begin(planned)
-    _initialize_save(transaction.stage, state, ctx)
+    _initialize_save(transaction.stage, state, ctx, rank_state)
 
 
-def _save_staged(transaction, state, ctx, policy, backend):
+def _save_staged(transaction, state, ctx, rank_state, inventory, policy, backend):
     path = transaction.stage
     prepared = _collective(
         ctx, "prepare save", lambda: _prepare_save(path, state, ctx, policy, backend)
@@ -403,36 +427,95 @@ def _save_staged(transaction, state, ctx, policy, backend):
     initialized = _collective(
         ctx,
         PREFLIGHT,
-        lambda: _initialize_transaction(transaction, state, prepared.value, ctx),
+        lambda: _initialize_transaction(
+            transaction, state, prepared.value, ctx, rank_state
+        ),
     )
     if type(initialized) is Err:
         return initialized
     result = _save_components(path, prepared.value, ctx)
     if type(result) is Err:
         return result
-    result = _collective(ctx, "rank state", lambda: _save_rank_state(path, state, ctx))
+    result = _collective(
+        ctx, "rank state", lambda: _save_rank_state(path, rank_state, ctx)
+    )
     if type(result) is Err:
         return result
     return _collective(
-        ctx, "checkpoint commit", lambda: _publish(path, state, prepared.value, ctx)
+        ctx,
+        "checkpoint commit",
+        lambda: _publish(path, state, prepared.value, ctx, inventory),
     )
 
 
 def _validate_save(state, ctx):
-    _validate_context(ctx)
-    _validate_state(state)
+    rank_state = dict(state.rank_state)
+    _validate_state(state, rank_state=rank_state)
+    return RankContext(ctx.rank, ctx.world_size, ctx.coordinator), rank_state
 
 
-def _transactional_save(path, state, ctx, action):
-    validated = _collective(ctx, "validate save", lambda: _validate_save(state, ctx))
+def _validate_rank_state_inventory(path, inventory):
+    for name, info in inventory.items():
+        _declared_rank_files(path, name, info)
+
+
+def _check_save_agreement(ctx, operation, check):
+    checked = _collective(ctx, operation, check)
+    if type(checked) is Err:
+        return checked
+    coordinator = ctx.coordinator
+    matches = checked.value if coordinator is None else coordinator.vote(checked.value)
+    if not matches:
+        return _error(operation, ValueError(f"{operation} changed during save"))
+    return Ok(None)
+
+
+def _check_save_inventory(path, state, ctx, context, rank_state, inventory):
+    configuration = _check_save_agreement(
+        ctx,
+        "rank configuration",
+        lambda: (ctx.rank, ctx.world_size) == (context.rank, context.world_size),
+    )
+    if type(configuration) is Err:
+        return configuration
+    keys = _check_save_agreement(
+        ctx,
+        "rank_state keys",
+        lambda: rank_state.keys() == state.rank_state.keys(),
+    )
+    if type(keys) is Err:
+        return keys
+    return _collective(
+        ctx,
+        "validate rank state inventory",
+        lambda: _validate_rank_state_inventory(path, inventory),
+    )
+
+
+def _transactional_save(path, state, context, action):
+    validated = _collective(
+        context, "validate save", lambda: _validate_save(state, context)
+    )
     if type(validated) is Err:
         return validated
-    agreed = _agree_rank_state(state, ctx)
+    assert validated.value is not None
+    ctx, rank_state = validated.value
+    agreed = _agree_save_context(ctx)
+    if type(agreed) is Err:
+        return agreed
+    agreed = _agree_rank_state(rank_state, ctx)
     if type(agreed) is Err:
         return agreed
     agreed = _agree_components(state, ctx)
     if type(agreed) is Err:
         return agreed
+    inventory = _collective(
+        ctx,
+        "prepare rank state inventory",
+        lambda: _rank_state_inventory(rank_state, ctx),
+    )
+    if type(inventory) is Err:
+        return inventory
     created = _collective(
         ctx, "prepare transaction", lambda: DirectoryTransaction(path, ctx.rank)
     )
@@ -441,7 +524,11 @@ def _transactional_save(path, state, ctx, action):
     transaction = created.value
     assert transaction is not None
     try:
-        result = action(transaction)
+        result = action(transaction, ctx, rank_state, inventory.value)
+        if type(result) is Ok:
+            result = _check_save_inventory(
+                transaction.stage, state, ctx, context, rank_state, inventory.value
+            )
         if type(result) is Ok:
             result = _collective(ctx, "checkpoint publish", transaction.publish)
     except BaseException as exc:
@@ -462,13 +549,13 @@ def _transactional_save(path, state, ctx, action):
 
 def save(path, state, ctx, *, policy=None, backend=None) -> Result[None]:
     """Save to a sibling, then publish collectively without damaging the old save."""
-    policy = policy or PerRankPolicy()
-    backend = backend or SafeTensorsBackend()
     return _transactional_save(
         path,
         state,
         ctx,
-        lambda transaction: _save_staged(transaction, state, ctx, policy, backend),
+        lambda transaction, agreed, rank_state, inventory: _save_staged(
+            transaction, state, agreed, rank_state, inventory, policy, backend
+        ),
     )
 
 
@@ -536,6 +623,7 @@ def _load_objects(path, component, saved, strict, validate_groups=None):
 
 
 def _prepare_load(path, state, ctx, backend, strict, validate_groups):
+    backend = SafeTensorsBackend() if backend is None else backend
     _validate_context(ctx)
     _validate_state(state)
     if strict is not True:
@@ -772,7 +860,6 @@ def load(
     agreed = _agree_components(state, ctx)
     if type(agreed) is Err:
         return agreed
-    backend = backend or SafeTensorsBackend()
     prepared = _collective(
         ctx,
         "prepare load",
