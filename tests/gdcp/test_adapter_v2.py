@@ -19,7 +19,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Shard
 
-from gdcp import FSDP2Checkpointer, desc, hf, load_hf, save_hf
+from gdcp import FSDP2Checkpointer, core, desc, hf, load_hf, save_hf
 from gdcp.adapters import dcp, fsdp2, torch_access
 from gdcp.adapters import hf as hf_adapter
 from gdcp.adapters.torch_access import TorchAccessor
@@ -473,6 +473,154 @@ def test_hf_model_only_load_distinguishes_weights_from_optimizer_slots(mesh, tmp
     match = fully_shard(match, mesh=mesh)
     FSDP2Checkpointer.load(tmp_path, {"model": match})
     assert _values(match) == _values(source)
+
+
+def _use_legacy_hf_metadata(path):
+    # e471fa1 used the same tensor layout without either of these inventories.
+    sidecar = path / "optimizer.json"
+    objects = desc.read_objects(sidecar)
+    del objects["/optimizer_tensors"]
+    desc.write_objects(sidecar, objects)
+    marker = path / desc.HF_COMMITTED_NAME
+    completion = json.loads(marker.read_bytes())
+    del completion["rank_state"]
+    marker.write_bytes(desc.json_bytes(completion))
+
+
+@pytest.mark.parametrize("fmt", (*_FORMATS, "legacy_hf"))
+@pytest.mark.parametrize(
+    "parts",
+    [(), ("model",), ("optimizer",), ("model", "optimizer")],
+    ids=["empty", "model", "optimizer", "both"],
+)
+def test_full_checkpoint_restores_requested_components(tmp_path, fmt, parts):
+    ctx = RankContext(0, 1)
+    source, target = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
+    saved_optimizer, optimizer = _optimizer(source, 0.01), _optimizer(target, 0.25)
+    for fields in saved_optimizer.state.values():
+        fields["step"].fill_(7)
+    save, load = {
+        "safetensors": (core.save, core.load),
+        "dcp": (dcp.save, dcp.load),
+        "hf": (hf.save_state, hf.load_state),
+        "legacy_hf": (hf.save_state, hf.load_state),
+    }[fmt]
+    saved = CheckpointState(
+        [
+            fsdp2._component("model", source.state_dict(), {}, ctx),
+            _adamw_checkpoint_component(source, saved_optimizer, ctx),
+        ],
+        {"extra_state": b"saved"},
+    )
+    assert type(save(tmp_path, saved, ctx)) is Ok
+    if fmt == "legacy_hf":
+        _use_legacy_hf_metadata(tmp_path)
+
+    targets = {
+        "model": fsdp2._component("model", target.state_dict(), {}, ctx),
+        "optimizer": _adamw_checkpoint_component(target, optimizer, ctx),
+    }
+    expected = _values(
+        source if "model" in parts else target,
+        saved_optimizer if "optimizer" in parts else optimizer,
+    )
+    requested = CheckpointState([targets[name] for name in parts], {"extra_state": b""})
+    result = load(tmp_path, requested, ctx)
+    assert type(result) is Ok, result
+    assert requested.rank_state == saved.rank_state
+    assert _values(target, optimizer) == expected
+    if "optimizer" in parts:
+        assert targets["optimizer"].objects == saved.components[1].objects
+
+
+def _adamw_checkpoint_component(model, optimizer, ctx):
+    tensors, objects, _ = fsdp2._optimizer_values(
+        get_optimizer_state_dict(model, optimizer)
+    )
+    return fsdp2._component("optimizer", tensors, objects, ctx)
+
+
+def test_legacy_hf_model_only_still_validates_model_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    source = torch.nn.Linear(2, 2)
+    FSDP2Checkpointer.save(
+        tmp_path,
+        {"model": source, "optimizer": _optimizer(source, 0.01)},
+        checkpoint_format="hf",
+    )
+    _use_legacy_hf_metadata(tmp_path)
+    target = torch.nn.Linear(2, 2, bias=False)
+    before = _values(target)
+    with pytest.raises(RuntimeError, match="HF unexpected key bias"):
+        FSDP2Checkpointer.load(tmp_path, {"model": target})
+    assert _values(target) == before
+
+
+@pytest.fixture
+def hf_component_checkpoint(tmp_path):
+    ctx = RankContext(0, 1)
+    model = {"weight": torch.ones(2), "optimizer.bias": torch.full((2,), 2.0)}
+    optimizer = {"step": torch.full((2,), 3.0)}
+    state = CheckpointState(
+        [
+            fsdp2._component("model", model, {}, ctx),
+            fsdp2._component("optimizer", optimizer, {}, ctx),
+        ]
+    )
+    assert type(hf.save_state(tmp_path, state, ctx)) is Ok
+    return tmp_path, ctx
+
+
+def test_hf_optimizer_only_ignores_optimizer_prefixed_model_key(
+    hf_component_checkpoint,
+):
+    path, ctx = hf_component_checkpoint
+    step = torch.zeros(2)
+    target = CheckpointState([fsdp2._component("optimizer", {"step": step}, {}, ctx)])
+    result = hf.load_state(path, target, ctx)
+    assert type(result) is Ok, result
+    assert torch.equal(step, torch.full((2,), 3.0))
+
+
+@pytest.mark.parametrize("both", [False, True])
+@pytest.mark.parametrize("owner", ["model", "optimizer"])
+def test_hf_rejects_tensor_from_wrong_component(hf_component_checkpoint, both, owner):
+    path, ctx = hf_component_checkpoint
+    model = {"weight": torch.zeros(2)}
+    optimizer = {}
+    if owner == "optimizer":
+        optimizer = {"step": torch.zeros(2), "bias": torch.zeros(2)}
+    else:
+        model["optimizer.bias"] = torch.zeros(2)
+        model["optimizer.step"] = torch.zeros(2)
+    tensors = {"model": model, "optimizer": optimizer}
+    parts = tuple(tensors) if both else (owner,)
+    target = CheckpointState(
+        [fsdp2._component(name, tensors[name], {}, ctx) for name in parts]
+    )
+    result = hf.load_state(path, target, ctx)
+    assert type(result) is Err, result
+    key = "optimizer.bias" if owner == "optimizer" else "optimizer.step"
+    assert f"HF missing key {key}" in result.value.msg
+    assert all(torch.equal(tensor, torch.zeros(2)) for tensor in model.values())
+    assert all(torch.equal(tensor, torch.zeros(2)) for tensor in optimizer.values())
+
+
+def test_hf_model_alias_resolves_within_recorded_ownership(hf_component_checkpoint):
+    path, ctx = hf_component_checkpoint
+    bias, step = torch.zeros(2), torch.zeros(2)
+    model = {"weight": torch.zeros(2), "optimizer.step": bias}
+    aliases = {"aliases": {"optimizer.bias": "optimizer.step"}}
+    target = CheckpointState(
+        [
+            fsdp2._component("model", model, aliases, ctx),
+            fsdp2._component("optimizer", {"step": step}, {}, ctx),
+        ]
+    )
+    result = hf.load_state(path, target, ctx)
+    assert type(result) is Ok, result
+    assert torch.equal(bias, torch.full((2,), 2.0))
+    assert torch.equal(step, torch.full((2,), 3.0))
 
 
 @pytest.mark.parametrize(

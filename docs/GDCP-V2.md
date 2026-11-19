@@ -51,12 +51,15 @@ CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:ncc
 
 HF full state uses model HF keys, `optimizer.state.<fqn>.<field>` tensor keys,
 and a typed JSON `optimizer.json` sidecar preserving param groups and aliases.
-New full-state sidecars list the exact optimizer tensor keys, so model-only
-loads can skip optimizer tensors while validating every model key. Model keys
-beginning with `optimizer.` receive the same strict validation as other keys.
-Older full-state files without an optimizer tensor list can be loaded with both
-components or in common-only mode. A model-only load rejects extra keys when
-their optimizer ownership is unknown.
+The optimizer tensor inventory is authoritative when present. Each requested
+component validates its keys and aliases against the tensors it owns before any
+tensor is copied. Model keys beginning with `optimizer.` are still model keys
+unless the inventory lists them. The framework-neutral HF loader supports
+model-only, optimizer-only, full, and rank-state-only restores from full-state
+checkpoints, including older files. With an older optimizer sidecar that lacks
+the inventory, model-only restore matches requested model keys and aliases
+first and treats remaining `optimizer.` keys as optimizer tensors. It still
+rejects other unexpected model keys.
 An HF save with zero tensors writes a valid empty `model.safetensors`. Native
 HF loading builds storage from headers and an optional standard index. The
 header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and

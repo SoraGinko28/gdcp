@@ -195,9 +195,13 @@ all ranks must pass validation of the requested tensor keys, shapes, dtypes,
 recorded tied-parameter aliases, optimizer objects and group membership, storage
 metadata, and requested rank state. A failed validation leaves those targets
 unchanged. Missing and unexpected keys in requested components are errors.
-Unrequested components in a full checkpoint are allowed. HF model-only loads
-use the optimizer tensor list in `optimizer.json` to identify tensors they can
-skip. Optimizer restoration precedes model restoration.
+Unrequested components in a full checkpoint are allowed. HF loads use the
+optimizer tensor inventory in `optimizer.json` to distinguish optimizer slots
+from model weights, even when a model key starts with `optimizer.`. For older
+full-state HF checkpoints without this inventory, a model-only load matches
+the requested model keys and aliases first, then treats remaining `optimizer.`
+keys as optimizer tensors when the sidecar contains optimizer state.
+Optimizer restoration precedes model restoration.
 
 Optimizer groups are matched by their model parameter names. The target may
 reorder groups or parameters within a group. Load restores the saved group

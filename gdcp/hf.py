@@ -160,18 +160,26 @@ def _combined_entry(component, named, available):
     prefix = "" if component.name == "model" else component.name + "."
     key = prefix + named.global_tensor_id
     aliases = [prefix + alias for alias in named.alias]
-    if available is not None and key not in available:
-        found = [alias for alias in aliases if alias in available]
-        key = found[0] if found else key
+    if available is not None:
+        aliases = [alias for alias in aliases if alias in available]
+        if key not in available and aliases:
+            key = aliases[0]
+        if key not in available:
+            raise ValueError(f"HF missing key {key}")
     return NamedDTensor(key, named.d_tensor, aliases)
 
 
-def _combined(state, available=None):
+def _combined(state, available=None, *, optimizer_tensors=None):
     entries, routes, logical, objects = [], {}, {}, {}
+    other_keys = optimizer_keys = available
+    if available is not None and optimizer_tensors is not None:
+        other_keys = available - optimizer_tensors
+        optimizer_keys = available & optimizer_tensors
     for component in state.components:
         objects[component.name] = component.objects
+        keys = optimizer_keys if component.name == "optimizer" else other_keys
         for named in component.table.named_d_tensors:
-            entry = _combined_entry(component, named, available)
+            entry = _combined_entry(component, named, keys)
             key = entry.global_tensor_id
             entries.append(entry)
             routes[key] = component.accessor, named.global_tensor_id
@@ -579,11 +587,25 @@ def _payload_digest(path, entry):
     return digest.hexdigest()
 
 
-def _validate_keys(combined, headers, components):
+def _unexpected_keys(keys, components, optimizer_tensors, legacy_optimizer):
+    optimizer_keys = set()
+    if optimizer_tensors is not None:
+        if "optimizer" in components:
+            optimizer_keys = keys & optimizer_tensors
+        keys -= optimizer_tensors
+        components = components - {"optimizer"}
+    if "model" not in components:
+        prefixes = tuple(name + "." for name in components)
+        keys = {key for key in keys if key.startswith(prefixes)}
+    elif legacy_optimizer and "optimizer" not in components:
+        # Older optimizer sidecars did not list tensor keys. Apply the old
+        # prefix convention only after matching requested keys and aliases.
+        keys = {key for key in keys if not key.startswith("optimizer.")}
+    return keys | optimizer_keys
+
+
+def _validate_keys(combined, headers, components, optimizer_tensors, legacy_optimizer):
     expected = {named.global_tensor_id for named in combined.table.named_d_tensors}
-    missing = expected - headers.keys()
-    if missing:
-        raise ValueError(f"HF missing key {sorted(missing)[0]}")
     aliases = {
         alias: named.global_tensor_id
         for named in combined.table.named_d_tensors
@@ -597,10 +619,9 @@ def _validate_keys(combined, headers, components):
         if any(left[field] != right[field] for field in ("shape", "dtype", "itemsize")):
             raise ValueError(f"HF tied alias {alias} differs from {canonical}")
         duplicates.append((alias, canonical))
-    unexpected -= aliases.keys()
-    if "model" not in components:
-        prefixes = tuple(name + "." for name in components)
-        unexpected = {key for key in unexpected if key.startswith(prefixes)}
+    unexpected = _unexpected_keys(
+        unexpected - aliases.keys(), components, optimizer_tensors, legacy_optimizer
+    )
     if unexpected:
         raise ValueError(f"HF unexpected key {sorted(unexpected)[0]}")
     return duplicates
@@ -621,7 +642,9 @@ def _load_objects(path, components):
         raise ValueError("HF optimizer.json must contain a mapping")
     if "optimizer" in components and "optimizer" not in objects:
         raise ValueError("HF full-state checkpoint is missing optimizer.json")
-    optimizer_tensors = objects.pop(_OPTIMIZER_TENSORS, [])
+    if _OPTIMIZER_TENSORS not in objects:
+        return objects, None
+    optimizer_tensors = objects.pop(_OPTIMIZER_TENSORS)
     if (
         not isinstance(optimizer_tensors, list)
         or (optimizer_tensors and "optimizer" not in objects)
@@ -640,12 +663,15 @@ def _load_prepare(path, state, ctx):
     headers = read_headers(path)
     components = {component.name for component in state.components}
     objects, optimizer_tensors = _load_objects(path, components)
-    if "optimizer" not in components:
-        headers = {
-            key: info for key, info in headers.items() if key not in optimizer_tensors
-        }
-    combined, _objects = _combined(state, headers)
-    duplicates = _validate_keys(combined, headers, components)
+    legacy_optimizer = optimizer_tensors is None and isinstance(
+        objects.get("optimizer"), dict
+    )
+    combined, _objects = _combined(
+        state, headers.keys(), optimizer_tensors=optimizer_tensors
+    )
+    duplicates = _validate_keys(
+        combined, headers, components, optimizer_tensors, legacy_optimizer
+    )
     entries = []
     for named in combined.table.named_d_tensors:
         key, meta = named.global_tensor_id, named.d_tensor.global_tensor_meta
