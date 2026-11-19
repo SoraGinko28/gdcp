@@ -1,5 +1,8 @@
-"""Independent dense FSDP2 oracle and manifest/safetensors-only reader."""
+"""Shared FSDP2 acceptance helpers and independent dense oracle."""
 
+import shutil
+from collections.abc import Callable
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -7,6 +10,9 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
+
+from gdcp import FSDP2Checkpointer
+from gdcp.state import Coordinator
 
 
 class AcceptanceModel(torch.nn.Module):
@@ -107,6 +113,39 @@ def _assert_fields(actual, expected, rank, world, key):
 
 def extra_for(rank):
     return {"step": 2, "rank": rank, "nested": {"tuple": (3, "state")}, "blob": b"gdcp"}
+
+
+def assert_rank_failure(
+    coordinator: Coordinator, function: Callable[[], object], name: str
+) -> Exception | None:
+    error = None
+    try:
+        function()
+    except Exception as exc:
+        error = exc
+    assert coordinator.vote(error is not None), f"every rank must raise: {name}"
+    return error
+
+
+def assert_missing_extra_state_rejected(
+    source: Path, destination: Path, rank: int, coordinator: Coordinator
+) -> None:
+    filename = "extra_state_rank_1.pt"
+    if rank == 0:
+        shutil.copytree(source, destination)
+        (destination / "extra_state" / filename).unlink()
+    coordinator.wait()
+    sentinel = object()
+    common = {"extra_state": sentinel}
+    error = assert_rank_failure(
+        coordinator,
+        lambda: FSDP2Checkpointer.load(
+            destination, common, load_common_state_only=True
+        ),
+        "missing declared extra-state file",
+    )
+    assert isinstance(error, RuntimeError) and filename in str(error), error
+    assert common == {"extra_state": sentinel}
 
 
 def _oracle_tensor(tensor):

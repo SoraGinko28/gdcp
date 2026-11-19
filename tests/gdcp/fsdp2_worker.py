@@ -16,8 +16,10 @@ from gdcp import FSDP2Checkpointer
 from gdtensor_conn.coord import GlooCoordinator
 from gdtensor_conn.iobackend import FileIO
 from tests.support.gdcp_fsdp2 import (
+    assert_missing_extra_state_rejected,
     assert_model,
     assert_optimizer,
+    assert_rank_failure,
     dense_oracle,
     extra_for,
     local,
@@ -95,16 +97,6 @@ def load(args):
     )
 
 
-def _must_raise(function, name):
-    error = None
-    try:
-        function()
-    except Exception as exc:
-        error = exc
-    assert GlooCoordinator().vote(error is not None), f"every rank must raise: {name}"
-    return error
-
-
 def atomic(args):
     model, optimizer = trained(get_world_size())
     state = state_for(model, optimizer, get_rank())
@@ -118,12 +110,18 @@ def atomic(args):
         return original(self, rank, path, offset, data)
 
     with patch.object(FileIO, "pwrite", faulty):
-        _must_raise(
-            lambda: FSDP2Checkpointer.save(args.output, state), "rank-1 write fault"
+        assert_rank_failure(
+            GlooCoordinator(),
+            lambda: FSDP2Checkpointer.save(args.output, state),
+            "rank-1 write fault",
         )
     assert get_rank() != 1 or triggered
     assert not (Path(args.output) / "gdcp_manifest.json").exists()
-    _must_raise(lambda: FSDP2Checkpointer.load(args.output, state), "uncommitted load")
+    assert_rank_failure(
+        GlooCoordinator(),
+        lambda: FSDP2Checkpointer.load(args.output, state),
+        "uncommitted load",
+    )
     FSDP2Checkpointer.save(args.output, state)
     target, target_optimizer = poisoned(get_world_size())
     FSDP2Checkpointer.load(args.output, state_for(target, target_optimizer, get_rank()))
@@ -165,7 +163,8 @@ def _strict_case(args, variant):
         raise AssertionError("tensor payload touched during strict preflight")
 
     with patch.object(FileIO, "pread", blocked):
-        error = _must_raise(
+        error = assert_rank_failure(
+            GlooCoordinator(),
             lambda: FSDP2Checkpointer.load(
                 path, state_for(model, optimizer, get_rank())
             ),
@@ -232,22 +231,9 @@ def global_steps(args):
 
 
 def extra_missing(args):
-    destination = Path(args.output)
-    filename = "extra_state_rank_1.pt"
-    if get_rank() == 0:
-        shutil.copytree(args.path, destination)
-        (destination / "extra_state" / filename).unlink()
-    barrier()
-    sentinel = object()
-    common = {"extra_state": sentinel}
-    error = _must_raise(
-        lambda: FSDP2Checkpointer.load(
-            destination, common, load_common_state_only=True
-        ),
-        "missing declared extra-state file",
+    assert_missing_extra_state_rejected(
+        Path(args.path), Path(args.output), get_rank(), GlooCoordinator()
     )
-    assert isinstance(error, RuntimeError) and filename in str(error), error
-    assert common == {"extra_state": sentinel}
     print(
         f"ACCEPTANCE 9 PASS rank={get_rank()} missing declared file rejected with state unchanged",
         flush=True,
