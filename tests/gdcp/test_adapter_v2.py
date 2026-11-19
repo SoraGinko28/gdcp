@@ -488,14 +488,15 @@ def _use_legacy_hf_metadata(path):
 
 
 @pytest.mark.parametrize("fmt", (*_FORMATS, "legacy_hf"))
+@pytest.mark.parametrize("prefixed", [False, True], ids=["plain", "optimizer-prefix"])
 @pytest.mark.parametrize(
     "parts",
     [(), ("model",), ("optimizer",), ("model", "optimizer")],
     ids=["empty", "model", "optimizer", "both"],
 )
-def test_full_checkpoint_restores_requested_components(tmp_path, fmt, parts):
+def test_full_checkpoint_restores_requested_components(tmp_path, fmt, prefixed, parts):
     ctx = RankContext(0, 1)
-    source, target = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
+    source, target = _checkpoint_linear(prefixed), _checkpoint_linear(prefixed)
     saved_optimizer, optimizer = _optimizer(source, 0.01), _optimizer(target, 0.25)
     for fields in saved_optimizer.state.values():
         fields["step"].fill_(7)
@@ -540,18 +541,31 @@ def _adamw_checkpoint_component(model, optimizer, ctx):
     return fsdp2._component("optimizer", tensors, objects, ctx)
 
 
-def test_legacy_hf_model_only_still_validates_model_keys(tmp_path, monkeypatch):
+def _checkpoint_linear(prefixed, *, bias=True):
+    linear = torch.nn.Linear(2, 2, bias=bias)
+    if not prefixed:
+        return linear
+    model = torch.nn.Module()
+    model.add_module("optimizer", linear)
+    return model
+
+
+@pytest.mark.parametrize("prefixed", [False, True], ids=["plain", "optimizer-prefix"])
+def test_legacy_hf_model_only_still_validates_model_keys(
+    tmp_path, monkeypatch, prefixed
+):
     monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
-    source = torch.nn.Linear(2, 2)
+    source = _checkpoint_linear(prefixed)
     FSDP2Checkpointer.save(
         tmp_path,
         {"model": source, "optimizer": _optimizer(source, 0.01)},
         checkpoint_format="hf",
     )
     _use_legacy_hf_metadata(tmp_path)
-    target = torch.nn.Linear(2, 2, bias=False)
+    target = _checkpoint_linear(prefixed, bias=False)
     before = _values(target)
-    with pytest.raises(RuntimeError, match="HF unexpected key bias"):
+    key = r"optimizer\.bias" if prefixed else "bias"
+    with pytest.raises(RuntimeError, match=f"HF unexpected key {key}"):
         FSDP2Checkpointer.load(tmp_path, {"model": target})
     assert _values(target) == before
 
@@ -621,6 +635,30 @@ def test_hf_model_alias_resolves_within_recorded_ownership(hf_component_checkpoi
     assert type(result) is Ok, result
     assert torch.equal(bias, torch.full((2,), 2.0))
     assert torch.equal(step, torch.full((2,), 3.0))
+
+
+@pytest.mark.parametrize("dtype", ["bf16", None], ids=["explicit", "inferred"])
+def test_hf_load_uses_model_alias_for_dtype(tmp_path, dtype):
+    ctx = RankContext(0, 1)
+    bias = torch.full((2,), 2.0, dtype=torch.bfloat16)
+    saved = CheckpointState(
+        [
+            fsdp2._component("model", {"optimizer.bias": bias}, {}, ctx),
+            fsdp2._component("optimizer", {"step": torch.full((2,), 3.0)}, {}, ctx),
+        ]
+    )
+    assert type(hf.save_state(tmp_path, saved, ctx, max_shard_size=8)) is Ok
+
+    target = torch.nn.Module()
+    layer = torch.nn.Module()
+    target.add_module("optimizer", layer)
+    tied = torch.nn.Parameter(torch.zeros_like(bias))
+    layer.register_parameter("step", tied)
+    layer.register_parameter("bias", tied)
+
+    load_hf(tmp_path, target, dtype=dtype)
+    assert layer.step is layer.bias is tied
+    assert torch.equal(tied, bias)
 
 
 @pytest.mark.parametrize(

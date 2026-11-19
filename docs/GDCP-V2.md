@@ -32,7 +32,7 @@ gdcp.load_hf(path, model)
 
 `gdcp.save_hf(path, model_or_state, dtype="fp32", max_shard_size=None)` exports weights only. Inputs can be a module, tensor mapping, or a checkpoint dictionary containing `model` and optionally `optimizer`. The dtype strings `"fp32"` and `"bf16"` apply only to floating-point tensors. With an optimizer, fp32 exports use `master_param` for floating-point parameters. Integer and boolean tensors are stored with their original dtypes and values.
 
-`gdcp.load_hf(path, model_or_state, dtype=None)` loads weights into existing local tensor shards. When omitted, `dtype` is inferred from the requested floating-point tensors in the checkpoint. Floating-point targets must have the selected dtype. With an optimizer checkpoint dictionary, `dtype="fp32"` targets its fp32 master weights. Integer and boolean tensors are restored bit for bit into targets with matching dtypes. A target containing only integer and boolean tensors can load with `dtype=None`. This function does not infer or update missing Adam moments from a weights-only checkpoint.
+`gdcp.load_hf(path, model_or_state, dtype=None)` loads weights into existing local tensor shards. When omitted, `dtype` is inferred from the requested floating-point model tensors and their aliases. In full-state HF checkpoints with a recorded optimizer inventory, inference excludes every key owned by the optimizer. Floating-point targets must have the selected dtype. With an optimizer checkpoint dictionary, `dtype="fp32"` targets its fp32 master weights. Integer and boolean tensors are restored bit for bit into targets with matching dtypes. A target containing only integer and boolean tensors can load with `dtype=None`. This function does not infer or update missing Adam moments from a weights-only checkpoint.
 
 Per-rank safetensors, DCP, and HF all preserve `uint16`, `uint32`, and `uint64` buffers and `int16` buffers with `Shard(0)` placement. HF uses the native safetensors dtype codes `U16`, `U32`, `U64`, and `I16` in both export modes.
 
@@ -57,9 +57,12 @@ tensor is copied. Model keys beginning with `optimizer.` are still model keys
 unless the inventory lists them. The framework-neutral HF loader supports
 model-only, optimizer-only, full, and rank-state-only restores from full-state
 checkpoints, including older files. With an older optimizer sidecar that lacks
-the inventory, model-only restore matches requested model keys and aliases
-first and treats remaining `optimizer.` keys as optimizer tensors. It still
-rejects other unexpected model keys.
+the inventory, GDCP matches requested keys and aliases first, then uses the
+saved parameter groups to recognize remaining slots in
+`optimizer.state.<fqn>.<field>`. A model-only restore skips these slots and
+rejects unexpected model keys. An optimizer-only restore skips identifiable
+model keys. Generic legacy sidecars without parameter groups fall back to the
+`optimizer.` prefix for unmatched keys.
 An HF save with zero tensors writes a valid empty `model.safetensors`. Native
 HF loading builds storage from headers and an optional standard index. The
 header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and

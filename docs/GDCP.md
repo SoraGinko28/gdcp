@@ -198,9 +198,13 @@ unchanged. Missing and unexpected keys in requested components are errors.
 Unrequested components in a full checkpoint are allowed. HF loads use the
 optimizer tensor inventory in `optimizer.json` to distinguish optimizer slots
 from model weights, even when a model key starts with `optimizer.`. For older
-full-state HF checkpoints without this inventory, a model-only load matches
-the requested model keys and aliases first, then treats remaining `optimizer.`
-keys as optimizer tensors when the sidecar contains optimizer state.
+full-state HF checkpoints without this inventory, GDCP matches requested keys
+and aliases first. It classifies the remaining tensors using the saved parameter
+groups and the `optimizer.state.<fqn>.<field>` layout. A model-only load skips
+these optimizer slots and still rejects unexpected model keys such as
+`optimizer.bias`. An optimizer-only load skips tensors identified as model
+weights. Generic legacy optimizer sidecars without parameter groups use the
+`optimizer.` prefix for unmatched keys.
 Optimizer restoration precedes model restoration.
 
 Optimizer groups are matched by their model parameter names. The target may

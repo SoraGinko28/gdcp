@@ -587,24 +587,43 @@ def _payload_digest(path, entry):
     return digest.hexdigest()
 
 
-def _unexpected_keys(keys, components, optimizer_tensors, legacy_optimizer):
-    optimizer_keys = set()
-    if optimizer_tensors is not None:
-        if "optimizer" in components:
-            optimizer_keys = keys & optimizer_tensors
-        keys -= optimizer_tensors
-        components = components - {"optimizer"}
+def _legacy_optimizer_keys(keys, optimizer):
+    if not isinstance(optimizer, dict):
+        return set()
+    groups = optimizer.get("param_groups")
+    if not isinstance(groups, list) or any(
+        not isinstance(group, dict) or not isinstance(group.get("params"), list)
+        for group in groups
+    ):
+        # Generic legacy sidecars provide no parameter names.
+        return {key for key in keys if key.startswith("optimizer.")}
+    parameters = {
+        name for group in groups for name in group["params"] if isinstance(name, str)
+    }
+    prefixes = {f"optimizer.state.{name}." for name in parameters}
+    return {
+        key
+        for key in keys
+        if key.startswith("optimizer.state.")
+        and key not in parameters
+        and any(
+            key[: index + 1] in prefixes
+            for index, char in enumerate(key[:-1])
+            if char == "."
+        )
+    }
+
+
+def _unexpected_keys(keys, components, optimizer_tensors):
+    optimizer_keys = keys & optimizer_tensors if "optimizer" in components else set()
+    keys -= optimizer_tensors
     if "model" not in components:
-        prefixes = tuple(name + "." for name in components)
+        prefixes = tuple(name + "." for name in components - {"optimizer"})
         keys = {key for key in keys if key.startswith(prefixes)}
-    elif legacy_optimizer and "optimizer" not in components:
-        # Older optimizer sidecars did not list tensor keys. Apply the old
-        # prefix convention only after matching requested keys and aliases.
-        keys = {key for key in keys if not key.startswith("optimizer.")}
     return keys | optimizer_keys
 
 
-def _validate_keys(combined, headers, components, optimizer_tensors, legacy_optimizer):
+def _validate_keys(combined, headers, components, optimizer_tensors, optimizer_objects):
     expected = {named.global_tensor_id for named in combined.table.named_d_tensors}
     aliases = {
         alias: named.global_tensor_id
@@ -619,9 +638,10 @@ def _validate_keys(combined, headers, components, optimizer_tensors, legacy_opti
         if any(left[field] != right[field] for field in ("shape", "dtype", "itemsize")):
             raise ValueError(f"HF tied alias {alias} differs from {canonical}")
         duplicates.append((alias, canonical))
-    unexpected = _unexpected_keys(
-        unexpected - aliases.keys(), components, optimizer_tensors, legacy_optimizer
-    )
+    unexpected -= aliases.keys()
+    if optimizer_tensors is None:
+        optimizer_tensors = _legacy_optimizer_keys(unexpected, optimizer_objects)
+    unexpected = _unexpected_keys(unexpected, components, optimizer_tensors)
     if unexpected:
         raise ValueError(f"HF unexpected key {sorted(unexpected)[0]}")
     return duplicates
@@ -663,14 +683,11 @@ def _load_prepare(path, state, ctx):
     headers = read_headers(path)
     components = {component.name for component in state.components}
     objects, optimizer_tensors = _load_objects(path, components)
-    legacy_optimizer = optimizer_tensors is None and isinstance(
-        objects.get("optimizer"), dict
-    )
     combined, _objects = _combined(
         state, headers.keys(), optimizer_tensors=optimizer_tensors
     )
     duplicates = _validate_keys(
-        combined, headers, components, optimizer_tensors, legacy_optimizer
+        combined, headers, components, optimizer_tensors, objects.get("optimizer")
     )
     entries = []
     for named in combined.table.named_d_tensors:
@@ -813,7 +830,7 @@ def load_hf(path, model_or_state, dtype=None):
 
     ``dtype`` optionally selects ``'fp32'`` optimizer master tensors or
     ``'bf16'`` model parameters in a checkpoint mapping. With ``None`` it is
-    inferred from the file's requested floating-point tensors when needed.
+    inferred from the requested floating-point model tensors and aliases.
     Saved and target shapes and dtypes must match exactly.
     """
     from .adapters.hf import load_hf as load

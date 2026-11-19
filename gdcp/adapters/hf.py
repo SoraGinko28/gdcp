@@ -11,7 +11,7 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import DTensorTable, GlobalTensorMeta, NamedDTensor
 
-from ..hf import load_state, read_headers, save_state
+from ..hf import _load_objects, load_state, read_headers, save_state
 from ..state import CheckpointState
 from .fsdp2 import (
     _DTYPES as _TORCH_DTYPE_CODES,
@@ -222,10 +222,20 @@ def _load_dtype(headers, tensors, aliases, dtype):
     return "fp32" if floating == {"F32"} else "bf16"
 
 
+def _model_headers(path):
+    headers = read_headers(path)
+    _, optimizer_tensors = _load_objects(path, {"model"})
+    if not optimizer_tensors:
+        return headers
+    return {
+        key: entry for key, entry in headers.items() if key not in optimizer_tensors
+    }
+
+
 def load_hf(path, model_or_state, dtype=None):
     ctx = _context()
     _model, state = _collective(
         ctx,
-        lambda: _weights(model_or_state, dtype, ctx, headers=read_headers(path)),
+        lambda: _weights(model_or_state, dtype, ctx, headers=_model_headers(path)),
     )
     _unwrap(load_state(path, state, ctx))
