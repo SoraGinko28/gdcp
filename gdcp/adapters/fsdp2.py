@@ -571,6 +571,12 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
         adapter.prepare_restore(checkpoint_state, objects)
         return adapter.prepare_rank_state
 
+    optimizer = adapter.optimizer_state
+    validate_groups = (
+        partial(_validate_optimizer_groups, current=optimizer["param_groups"])
+        if optimizer is not None
+        else None
+    )
     fmt = _unwrap(
         core._collective_choice(
             ctx,
@@ -581,23 +587,27 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
     )
     if fmt == "hf":
         result = hf.load_state(
-            path, state, ctx, _preflight=preflight, _optional_rank_state=common_only
+            path,
+            state,
+            ctx,
+            _preflight=preflight,
+            _validate_groups=validate_groups,
+            _optional_rank_state=common_only,
         )
     elif fmt == "dcp":
         from . import dcp
 
-        optimizer = adapter.optimizer_state
-        validate_groups = (
-            partial(_validate_optimizer_groups, current=optimizer["param_groups"])
-            if optimizer is not None
-            else None
-        )
         result = dcp.load(
             path, state, ctx, _preflight=preflight, _validate_groups=validate_groups
         )
     else:
         result = core.load(
-            path, state, ctx, _preflight=preflight, _optional_rank_state=common_only
+            path,
+            state,
+            ctx,
+            _preflight=preflight,
+            _validate_groups=validate_groups,
+            _optional_rank_state=common_only,
         )
     if type(result) is Err and isinstance(result.value, core._LoadValidationError):
         raise result.value.cause

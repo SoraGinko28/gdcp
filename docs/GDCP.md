@@ -26,7 +26,10 @@ GDCP never assembles full tensors during save or load. Supported placements
 are `Shard(0)` and `Replicate` on a one-dimensional mesh containing all ranks.
 Native PyTorch DCP loads support uneven `Shard(0)` chunks and empty shards. GDCP
 honors the saved local strides, including transposed shards, when restoring at
-the same or a different world size.
+the same or a different world size. GDCP applies serialized tensor-view flags
+such as lazy negation with PyTorch's copy semantics. An unsupported flag or
+dtype, such as a conjugate view of a complex tensor, produces an error naming
+the tensor.
 
 All three formats support empty checkpoints, extra-state-only checkpoints,
 and model checkpoints with or without optimizer or extra state. Pass the keys
@@ -79,8 +82,9 @@ pickle constructors or importing modules named by the file. Unreadable,
 malformed, or unsupported native metadata establishes no ownership, so every
 entry in that candidate checkpoint is foreign. Such metadata cannot establish
 that a generation is complete for recovery. `inspect` reads only the JSON
-manifest. Explicit DCP loads use pickle for native metadata, as PyTorch does.
-Only load DCP checkpoints you trust.
+manifest. Native DCP loads also decode `.metadata` as data. They can use pickle
+for non-tensor objects after collective validation. Manifest-backed DCP loads
+use pickle for component metadata. Only load DCP checkpoints you trust.
 
 The old checkpoint receives no payload writes. After every rank completes the
 new generation, rank 0 syncs its directories and rescans the old target against
@@ -212,11 +216,12 @@ reorder groups or parameters within a group. Load restores the saved group
 options and order, and fills each group's `param_names` with the corresponding
 fully qualified model names in `params` order. This also applies to unnamed
 optimizers, and a subsequent save records the restored names. AdamW moments
-and steps follow their parameters. Incompatible or ambiguous group membership
-fails on all ranks before tensor or extra-state payload reads. When loading
-Torch-written native DCP, GDCP reads the group membership metadata first. Every
-rank must pass the group check before GDCP reads scalar optimizer state or
-separately stored group options.
+and steps follow their parameters. Per-rank safetensors, DCP, and HF report
+incompatible or ambiguous groups before checking requested tensor keys or
+reading tensor and extra-state payloads. For Torch-written native DCP, GDCP
+decodes membership with a restricted loader. Every rank must pass the group and
+tensor inventory checks before GDCP reads scalar optimizer state or separately
+stored group options.
 
 Tensor payloads are streamed into the target. An I/O error during those reads
 can leave tensors partially updated, and copied bytes are retained if a

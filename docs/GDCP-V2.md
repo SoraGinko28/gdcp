@@ -43,9 +43,10 @@ qualified model parameter name. Group and parameter order in the target may
 differ from the checkpoint. Load restores the saved order and group options,
 populates `param_names` to match `params` in every group, and restores moments
 and steps to their corresponding parameters. Incompatible or ambiguous groups
-fail before tensor or rank-state payload reads. For Torch-written native DCP,
-all ranks validate group membership before reading scalar optimizer state or
-separately stored group options.
+fail before requested tensor-key checks and before tensor or rank-state payload
+reads. For Torch-written native DCP, GDCP uses a restricted decoder for group
+membership. All ranks validate membership and tensor inventory before GDCP
+reads scalar optimizer state or separately stored group options.
 
 CPU jobs use Gloo. GPU jobs initialize the default group with `backend="cuda:nccl,cpu:gloo"`, so FSDP2 can use NCCL while votes and CPU state use Gloo. The GPU accessor stages one local tensor at a time, copies each save tensor to the host once, and writes back a load tensor once after all its ranges.
 
@@ -71,9 +72,12 @@ represent, the error names the dtype and key.
 
 Native PyTorch DCP loads accept uneven `Shard(0)` chunks and ignore empty
 shards at any row offset. GDCP reads each chunk in logical element order using
-its serialized strides, including for transposed local tensors. The nonempty
-chunks must cover the tensor along dimension 0. GDCP reports a chunk geometry
-error for overlaps, gaps, and sharding along another dimension.
+its serialized strides, including for transposed local tensors. GDCP applies
+serialized tensor-view flags such as lazy negation with PyTorch's copy semantics.
+An unsupported flag or dtype, such as a conjugate view of a complex tensor,
+produces an error naming the tensor. The nonempty chunks must cover the tensor
+along dimension 0. GDCP reports a chunk geometry error for overlaps, gaps, and
+sharding along another dimension.
 
 All three formats require the same rank-state keys and ordered component list on
 every rank before staging a save. Names that resolve to the same directory on the
@@ -139,9 +143,10 @@ ownership; unrecorded legacy rank-state names remain foreign.
 
 Save preflight and recovery read native DCP `.metadata` as data. Unreadable,
 malformed, or unsupported metadata establishes no native DCP ownership or
-completeness for recovery. `inspect` reads only the JSON manifest. Explicit DCP
-loads use pickle for native metadata, as PyTorch does. Only load DCP checkpoints
-you trust.
+completeness for recovery. `inspect` reads only the JSON manifest. Native DCP
+loads also decode `.metadata` as data and can use pickle for non-tensor objects
+after collective validation. Manifest-backed DCP loads use pickle for component
+metadata. Only load DCP checkpoints you trust.
 
 HF save groups rows with compatible storage columns before building its shared
 file layout. Rectangle count is bounded by the number of column groups rather

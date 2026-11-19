@@ -677,12 +677,17 @@ def _load_objects(path, components):
     return objects, set(optimizer_tensors)
 
 
-def _load_prepare(path, state, ctx):
+def _load_prepare(path, state, ctx, validate_groups):
     core._validate_context(ctx)
     core._validate_state(state)
     headers = read_headers(path)
     components = {component.name for component in state.components}
     objects, optimizer_tensors = _load_objects(path, components)
+    if validate_groups is not None:
+        optimizer = objects["optimizer"]
+        if not isinstance(optimizer, dict):
+            raise ValueError("HF objects for optimizer must contain a mapping")
+        core._validate_load_call(lambda: validate_groups(optimizer.get("param_groups")))
     combined, _objects = _combined(
         state, headers.keys(), optimizer_tensors=optimizer_tensors
     )
@@ -767,7 +772,15 @@ def _validate_load_objects(state, objects, preflight):
         return preflight(objects)
 
 
-def load_state(path, state, ctx, *, _preflight=None, _optional_rank_state=False):
+def load_state(
+    path,
+    state,
+    ctx,
+    *,
+    _preflight=None,
+    _validate_groups=None,
+    _optional_rank_state=False,
+):
     """Load native HF headers directly, including an optional optimizer sidecar."""
     agreed = core._agree_components(state, ctx)
     if type(agreed) is Err:
@@ -781,7 +794,9 @@ def load_state(path, state, ctx, *, _preflight=None, _optional_rank_state=False)
             _preflight,
         )
     prepared = core._collective(
-        ctx, "HF prepare load", lambda: _load_prepare(path, state, ctx)
+        ctx,
+        "HF prepare load",
+        lambda: _load_prepare(path, state, ctx, _validate_groups),
     )
     if type(prepared) is Err:
         return prepared

@@ -40,6 +40,7 @@ class _Global:
 @dataclass(eq=False, slots=True)
 class _Record:
     kind: _Global
+    args: tuple
     state: object = None
 
 
@@ -49,7 +50,7 @@ def _load_record(parser: object, /) -> None:
     kind = parser.stack[-1]
     if type(kind) is not _Global or type(args) is not tuple:
         raise pickle.UnpicklingError("invalid DCP metadata record")
-    parser.stack[-1] = _Record(kind)
+    parser.stack[-1] = _Record(kind, args)
 
 
 def _load_state(parser: object, /) -> None:
@@ -112,14 +113,21 @@ def _storage_record(record):
     return _StorageRecord(path, offset, length)
 
 
+def _read_metadata_state(root):
+    with open(root / ".metadata", "rb") as handle:
+        metadata = _MetadataParser(handle).load()
+    state = _state(metadata, _METADATA, "Metadata")
+    if (
+        type(state["state_dict_metadata"]) is not dict
+        or type(state["storage_data"]) is not dict
+    ):
+        raise ValueError("invalid native DCP metadata mappings")
+    return state
+
+
 def read_storage_records(root):
     try:
-        with open(root / ".metadata", "rb") as handle:
-            metadata = _MetadataParser(handle).load()
-        state = _state(metadata, _METADATA, "Metadata")
-        storage = state["storage_data"]
-        if type(state["state_dict_metadata"]) is not dict or type(storage) is not dict:
-            raise ValueError("invalid native DCP metadata mappings")
+        storage = _read_metadata_state(root)["storage_data"]
         for index in storage:
             _state(index, _METADATA, "MetadataIndex")
         return [_storage_record(record) for record in storage.values()]

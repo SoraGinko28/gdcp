@@ -14,7 +14,7 @@ import zipfile
 from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from math import prod
 from pathlib import Path
 from typing import IO, cast
@@ -59,7 +59,7 @@ from gdtensor_conn.access import StorageDataAccessor, call_buffer_callback
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
 
-from .. import core, desc
+from .. import _dcp_metadata, core, desc
 from ..backend import _collective_begin
 from ..policy import PerRankPolicy, storage_mesh
 
@@ -517,19 +517,41 @@ class _NativePayload:
     itemsize: int
     strides: tuple[int, ...] | None
     span: int
+    tensor_id: str
+    dtype: torch.dtype
+    negative: bool
+    conjugate: bool
+
+    def resolve_view(self, data):
+        if not (self.negative or self.conjugate):
+            return data
+        try:
+            source = torch.frombuffer(data, dtype=self.dtype)
+            source = source.conj() if self.conjugate else source
+            source = torch._neg_view(source) if self.negative else source
+            # Match FileSystemReader's same-dtype copy of the logical view.
+            return torch.empty_like(source).copy_(source).view(torch.uint8).numpy()
+        except RuntimeError as exc:
+            raise ValueError(
+                f"{self.tensor_id}: cannot apply DCP tensor view: {exc}"
+            ) from exc
 
 
 def _native_payload(root, tensor_id, start, shape, dtype, record):
     path = os.path.join(root, record.relative_path)
-    with open(path, "rb") as handle:
-        window = _Window(handle, record.offset, record.length)
-        offset, nbytes = _payload_record(window)
-        window.seek(0)
-        # DCP metadata describes the chunk geometry; torch.save stores its strides.
-        with FakeTensorMode():
+    try:
+        with open(path, "rb") as handle, FakeTensorMode():
+            window = _Window(handle, record.offset, record.length)
+            offset, nbytes = _payload_record(window)
+            window.seek(0)
+            # torch.save records the tensor's strides and lazy view flags.
             tensor = torch.load(
                 cast(IO[bytes], window), map_location="cpu", weights_only=True
             )
+    except (RuntimeError, pickle.UnpicklingError) as exc:
+        raise ValueError(
+            f"{tensor_id}: cannot decode DCP tensor record: {exc}"
+        ) from exc
     if (
         not isinstance(tensor, torch.Tensor)
         or tensor.layout != torch.strided
@@ -547,7 +569,7 @@ def _native_payload(root, tensor_id, start, shape, dtype, record):
         or storage_offset + span > nbytes
     ):
         raise ValueError(f"{tensor_id}: DCP tensor view exceeds its serialized storage")
-    return _NativePayload(
+    chunk = _NativePayload(
         start,
         start + prod(shape) * itemsize,
         path,
@@ -556,7 +578,14 @@ def _native_payload(root, tensor_id, start, shape, dtype, record):
         itemsize,
         None if tensor.is_contiguous() else strides,
         span,
+        tensor_id,
+        dtype,
+        tensor.is_neg(),
+        tensor.is_conj(),
     )
+    if chunk.negative or chunk.conjugate:
+        chunk.resolve_view(bytearray(itemsize))
+    return chunk
 
 
 def _read_strided(chunk, start, end):
@@ -612,7 +641,7 @@ class _NativeAccessor(DTensorDataAccessor):
             data = self._read_payload(chunk, start - chunk.start, end - chunk.start)
         except OSError as exc:
             raise io_error("read", str(exc), chunk.path) from None
-        call_buffer_callback(callback, data)
+        call_buffer_callback(callback, chunk.resolve_view(data))
 
     def _read_payload(self, chunk, start, end):
         if chunk.strides is not None:
@@ -693,6 +722,79 @@ def read_metadata(root):
     return metadata
 
 
+def _metadata_size(record):
+    if (
+        type(record) is not _dcp_metadata._Record
+        or record.kind != _dcp_metadata._Global("torch", "Size")
+        or len(record.args) != 1
+        or type(record.args[0]) is not tuple
+        or any(type(dim) is not int for dim in record.args[0])
+    ):
+        raise ValueError("invalid native DCP tensor size or offset")
+    return torch.Size(record.args[0])
+
+
+def _metadata_chunk(record):
+    state = _dcp_metadata._state(
+        record, _dcp_metadata._METADATA, "ChunkStorageMetadata"
+    )
+    return ChunkStorageMetadata(
+        _metadata_size(state["offsets"]), _metadata_size(state["sizes"])
+    )
+
+
+def _metadata_item(key, record):
+    module = _dcp_metadata._METADATA
+    if type(record) is _dcp_metadata._Record and record.kind == _dcp_metadata._Global(
+        module, "BytesStorageMetadata"
+    ):
+        return BytesStorageMetadata()
+    state = _dcp_metadata._state(record, module, "TensorStorageMetadata")
+    properties = state["properties"]
+    if (
+        type(properties) is not _dcp_metadata._Record
+        or properties.kind != _dcp_metadata._Global(module, "TensorProperties")
+        or type(properties.state) is not tuple
+        or not properties.state
+    ):
+        raise ValueError(f"{key}: invalid native DCP tensor properties")
+    dtype = properties.state[0]
+    if type(dtype) is not _dcp_metadata._Global or dtype.module != "torch":
+        raise ValueError(f"{key}: invalid native DCP dtype")
+    value = getattr(torch, dtype.name, None)
+    if not isinstance(value, torch.dtype):
+        raise ValueError(f"{key}: unsupported native DCP dtype torch.{dtype.name}")
+    return TensorStorageMetadata(
+        TensorProperties(dtype=value),
+        _metadata_size(state["size"]),
+        [_metadata_chunk(chunk) for chunk in state["chunks"]],
+    )
+
+
+def _metadata_index(record):
+    state = _dcp_metadata._state(record, _dcp_metadata._METADATA, "MetadataIndex")
+    offset = state.get("offset")
+    return MetadataIndex(
+        state["fqn"], None if offset is None else _metadata_size(offset)
+    )
+
+
+def _read_native_metadata(root):
+    # Project only the fields needed for loading from symbolic pickle records.
+    state = _dcp_metadata._read_metadata_state(Path(root))
+    return Metadata(
+        {
+            key: _metadata_item(key, item)
+            for key, item in state["state_dict_metadata"].items()
+        },
+        planner_data=state.get("planner_data"),
+        storage_data={
+            _metadata_index(index): _StorageInfo(*_dcp_metadata._storage_record(record))
+            for index, record in state["storage_data"].items()
+        },
+    )
+
+
 def save(path, state, ctx):
     backend = core._collective(
         ctx,
@@ -713,7 +815,11 @@ def _native_tensor(tensor_id, item, count, world):
     if count != world:
         mesh = SlicedMesh(mesh, [Slice(0, count)])
     placement = Replicate() if count == 1 else Shard(0)
-    dtype = _CODES[item.properties.dtype]
+    dtype = _CODES.get(item.properties.dtype)
+    if dtype is None:
+        raise ValueError(
+            f"{tensor_id}: unsupported native DCP dtype {item.properties.dtype}"
+        )
     meta = GlobalTensorMeta(
         shape, dtype, torch.empty((), dtype=item.properties.dtype).element_size()
     )
@@ -772,14 +878,14 @@ def _native_objects(root, metadata, component, flat=None):
     return objects
 
 
-def _read_object(root, record):
+def _read_object(root, record, *, weights_only=False):
     desc._safe_relative(record.relative_path)
     if record.length > 16 * 1024**2:
         raise ValueError("DCP non-tensor record exceeds the 16 MiB safety bound")
     with open(Path(root) / record.relative_path, "rb") as handle:
         return torch.load(
             cast(IO[bytes], _Window(handle, record.offset, record.length)),
-            weights_only=False,
+            weights_only=weights_only,
             map_location="cpu",
         )
 
@@ -835,10 +941,10 @@ def _validate_native_alias(metadata, key, owner, records, aliases):
         raise ValueError(f"native DCP tied parameter aliases differ for {key}")
 
 
-def read_component(root, component, *, metadata=None, load_objects=None):
+def read_component(root, component, *, metadata=None):
     """Build the storage table from native metadata, without a GDCP manifest."""
     if metadata is None:
-        metadata = read_metadata(root)
+        metadata = _read_native_metadata(root)
     wanted = {
         named.global_tensor_id: named for named in component.table.named_d_tensors
     }
@@ -876,15 +982,8 @@ def read_component(root, component, *, metadata=None, load_objects=None):
         paths[key]: _native_records(metadata, key, item, chunks[key])
         for key, item in items
     }
-    sidecar = Path(root) / "objects.json"
-    if load_objects is not None:
-        objects = load_objects()
-    elif sidecar.exists():
-        objects = desc.read_objects(sidecar)
-    else:
-        objects = _native_objects(root, metadata, component)
     logical = {key: [] for key, item in items if len(item.size) == 0}
-    return table, layout, objects, logical, world, records
+    return table, layout, logical, world, records
 
 
 def _native_records(metadata, key, item, chunks):
@@ -908,13 +1007,19 @@ def _native_membership_path(path):
     return path[0] == "param_groups" and (len(path) < 3 or path[2] == "params")
 
 
-def _native_optimizer_objects(root, component, validate_groups):
-    metadata = read_metadata(root)
+def _read_native_objects(root, metadata, component):
+    sidecar = root / "objects.json"
+    if sidecar.exists():
+        return desc.read_objects(sidecar)
+    return _native_objects(root, metadata, component)
+
+
+def _native_optimizer_objects(root, metadata, component, validate_groups):
     sidecar = root / "objects.json"
     if sidecar.exists():
         objects = desc.read_objects(sidecar)
         core._validate_load_call(lambda: validate_groups(objects.get("param_groups")))
-        return metadata, lambda: objects
+        return lambda: objects
 
     assert metadata.storage_data is not None
     paths = {
@@ -924,15 +1029,17 @@ def _native_optimizer_objects(root, component, validate_groups):
         and _native_membership_path(metadata.planner_data[key])
     }
     flat = {
-        key: _read_object(root, metadata.storage_data[MetadataIndex(key)])
+        key: _read_object(
+            root, metadata.storage_data[MetadataIndex(key)], weights_only=True
+        )
         for key in paths
     }
     groups = unflatten_state_dict(flat, paths).get("param_groups")
     core._validate_load_call(lambda: validate_groups(groups))
-    return metadata, lambda: _native_objects(root, metadata, component, flat)
+    return partial(_native_objects, root, metadata, component, flat)
 
 
-def _prepare_native_metadata(path, state, ctx, validate_groups):
+def _prepare_native(path, state, ctx, validate_groups):
     core._validate_context(ctx)
     core._validate_state(state)
     if state.rank_state:
@@ -940,38 +1047,48 @@ def _prepare_native_metadata(path, state, ctx, validate_groups):
         raise ValueError(
             f"native DCP has no GDCP per-rank extra_state (requested {key!r})"
         )
+    root = Path(path)
+    metadata = {c.name: _read_native_metadata(root / c.name) for c in state.components}
+    optimizer_objects = None
     if validate_groups is not None:
         optimizer = next(c for c in state.components if c.name == "optimizer")
-        return _native_optimizer_objects(
-            Path(path) / optimizer.name, optimizer, validate_groups
+        optimizer_objects = _native_optimizer_objects(
+            root / optimizer.name, metadata[optimizer.name], optimizer, validate_groups
         )
-    return None, None
-
-
-def _prepare_native(path, state, ctx, optimizer):
     prepared = []
     for component in state.components:
-        root = Path(path) / component.name
-        metadata, load_objects = (
-            optimizer if component.name == "optimizer" else (None, None)
+        name = component.name
+        prepared.append(
+            _prepare_native_component(
+                root / name,
+                component,
+                ctx,
+                metadata[name],
+                optimizer_objects if name == "optimizer" else None,
+            )
         )
-        table, layout, objects, logical, world, records = read_component(
-            root, component, metadata=metadata, load_objects=load_objects
-        )
-        saved = desc.describe_component(table, layout, world, logical_shapes=logical)
-        core._strict_tensors(component, saved, False)
-        compute = ComputeDTensorsView(
-            [named.global_tensor_id for named in component.table.named_d_tensors],
-            component.table,
-            component.accessor,
-        )
-        storage = DcpBackend().open(
-            root, table, layout, ctx.coordinator, native_records=records
-        )
-        core._require(compute.check_constraints())
-        core._require(storage.check_constraints())
-        prepared.append((component, compute, storage, objects))
     return prepared
+
+
+def _prepare_native_component(root, component, ctx, metadata, load_objects):
+    table, layout, logical, world, records = read_component(
+        root, component, metadata=metadata
+    )
+    saved = desc.describe_component(table, layout, world, logical_shapes=logical)
+    core._strict_tensors(component, saved, False)
+    compute = ComputeDTensorsView(
+        [named.global_tensor_id for named in component.table.named_d_tensors],
+        component.table,
+        component.accessor,
+    )
+    storage = DcpBackend().open(
+        root, table, layout, ctx.coordinator, native_records=records
+    )
+    core._require(compute.check_constraints())
+    core._require(storage.check_constraints())
+    if load_objects is None:
+        load_objects = partial(_read_native_objects, root, metadata, component)
+    return component, compute, storage, load_objects
 
 
 def _has_manifest(path):
@@ -986,23 +1103,34 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     if type(manifest) is Err:
         return manifest
     if manifest.value:
-        return core.load(path, state, ctx, backend=DcpBackend(), _preflight=_preflight)
+        return core.load(
+            path,
+            state,
+            ctx,
+            backend=DcpBackend(),
+            _preflight=_preflight,
+            _validate_groups=_validate_groups,
+        )
     agreed = core._agree_components(state, ctx)
     if type(agreed) is Err:
         return agreed
-    # Native DCP stores membership in byte records alongside optimizer state.
-    # Vote on membership before any rank deserializes the remaining records.
+    # Vote on membership and the tensor inventory before unrestricted object loads.
     checked = core._collective(
         ctx,
         "validate native DCP metadata",
-        lambda: _prepare_native_metadata(path, state, ctx, _validate_groups),
+        lambda: _prepare_native(path, state, ctx, _validate_groups),
     )
     if type(checked) is Err:
         return checked
+    components = checked.value
+    assert components is not None
     prepared = core._collective(
         ctx,
-        "prepare native DCP load",
-        lambda: _prepare_native(path, state, ctx, checked.value),
+        "load native DCP objects",
+        lambda: [
+            (component, compute, storage, load_objects())
+            for component, compute, storage, load_objects in components
+        ],
     )
     if type(prepared) is Err:
         return prepared

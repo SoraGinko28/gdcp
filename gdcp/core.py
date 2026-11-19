@@ -520,11 +520,13 @@ def _strict_tensor(component, tensor_id, named, saved):
         )
 
 
-def _load_objects(path, component, saved, strict):
+def _load_objects(path, component, saved, strict, validate_groups=None):
     objects = {}
     if saved["objects"] is not None:
         desc._safe_relative(saved["objects"])
         objects = desc.read_objects(Path(path) / component.name / saved["objects"])
+    if validate_groups is not None:
+        _validate_load_call(lambda: validate_groups(objects.get("param_groups")))
     missing = component.objects.keys() - objects.keys()
     unexpected = objects.keys() - component.objects.keys()
     if missing or (strict and unexpected):
@@ -533,7 +535,7 @@ def _load_objects(path, component, saved, strict):
     return objects
 
 
-def _prepare_load(path, state, ctx, backend, strict):
+def _prepare_load(path, state, ctx, backend, strict, validate_groups):
     _validate_context(ctx)
     _validate_state(state)
     if strict is not True:
@@ -542,21 +544,35 @@ def _prepare_load(path, state, ctx, backend, strict):
         )
     _require_not_pending(path)
     description = desc.read_manifest(path, _validate_components=bool(state.components))
+    optimizer_objects = None
+    if validate_groups is not None and "optimizer" in description.components:
+        optimizer = next(c for c in state.components if c.name == "optimizer")
+        optimizer_objects = _load_objects(
+            path,
+            optimizer,
+            description.components["optimizer"],
+            strict,
+            validate_groups,
+        )
     prepared = []
     for component in state.components:
+        objects = optimizer_objects if component.name == "optimizer" else None
         item = _prepare_load_component(
-            path, component, description, ctx, backend, strict
+            path, component, description, ctx, backend, strict, objects
         )
         prepared.append(item)
     return prepared, description
 
 
-def _prepare_load_component(path, component, description, ctx, backend, strict):
+def _prepare_load_component(
+    path, component, description, ctx, backend, strict, objects
+):
     if component.name not in description.components:
         raise ValueError(f"missing component {component.name}")
     saved = description.components[component.name]
     _strict_tensors(component, saved, strict)
-    objects = _load_objects(path, component, saved, strict)
+    if objects is None:
+        objects = _load_objects(path, component, saved, strict)
     compute = _compute_view(component)
     _require(compute.check_constraints())
     table, layout = desc.rebuild_component(saved, description.world_size)
@@ -749,6 +765,7 @@ def load(
     backend=None,
     strict=True,
     _preflight=None,
+    _validate_groups=None,
     _optional_rank_state=False,
 ) -> Result[None]:
     """Restore requested components after all strict metadata checks pass."""
@@ -757,7 +774,9 @@ def load(
         return agreed
     backend = backend or SafeTensorsBackend()
     prepared = _collective(
-        ctx, "prepare load", lambda: _prepare_load(path, state, ctx, backend, strict)
+        ctx,
+        "prepare load",
+        lambda: _prepare_load(path, state, ctx, backend, strict, _validate_groups),
     )
     if type(prepared) is Err:
         return prepared

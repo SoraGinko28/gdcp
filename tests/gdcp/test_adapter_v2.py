@@ -1032,13 +1032,19 @@ def _grouped_optimizer(model, orders, *, named=False, initialized=True):
         for index, order in enumerate(orders)
     ]
     optimizer = torch.optim.AdamW(groups, foreach=False)
-    if initialized:
-        for index, parameter in enumerate(parameters.values(), start=1):
-            optimizer.state[parameter] = {
-                "step": torch.tensor(float(index)),
-                "exp_avg": torch.full_like(parameter, 2 * index),
-                "exp_avg_sq": torch.full_like(parameter, 3 * index),
-            }
+    if not initialized:
+        return optimizer
+    optimized = {
+        parameter for group in optimizer.param_groups for parameter in group["params"]
+    }
+    for index, parameter in enumerate(parameters.values(), start=1):
+        if parameter not in optimized:
+            continue
+        optimizer.state[parameter] = {
+            "step": torch.tensor(float(index)),
+            "exp_avg": torch.full_like(parameter, 2 * index),
+            "exp_avg_sq": torch.full_like(parameter, 3 * index),
+        }
     return optimizer
 
 
@@ -1093,6 +1099,7 @@ def _assert_optimizer_slots(source, saved, parameters, optimizer):
     "saved_orders,target_orders,error",
     [
         (("ab", "cd"), ("ac", "bd"), "members do not match"),
+        pytest.param(("ab",), ("ac",), "members do not match", id="different-subsets"),
         (("abcd", "", ""), ("", "abcd", ""), "ambiguous"),
     ],
 )
@@ -1177,11 +1184,15 @@ def test_native_dcp_group_validation_precedes_payload_reads_on_every_rank(
     read_object = dcp._read_object
     reads = []
 
-    def record_read(path, record):
+    def record_read(path, record, *, weights_only=False):
         reads.append(
-            (context.value.rank, keys_by_record[record.relative_path, record.offset])
+            (
+                context.value.rank,
+                keys_by_record[record.relative_path, record.offset],
+                weights_only,
+            )
         )
-        return read_object(path, record)
+        return read_object(path, record, weights_only=weights_only)
 
     def unexpected_tensor_read(*args):
         pytest.fail("read native tensor record before validating optimizer groups")
@@ -1207,7 +1218,7 @@ def test_native_dcp_group_validation_precedes_payload_reads_on_every_rank(
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(load, range(2)))
     assert sorted(reads) == [
-        (rank, f"param_groups.{index}.params")
+        (rank, f"param_groups.{index}.params", True)
         for rank in range(2)
         for index in range(2)
     ]
@@ -1233,6 +1244,42 @@ def test_native_dcp_restores_reordered_optimizer_groups_and_scalar_state(
         torch.testing.assert_close(
             optimizer.state[target[name]], saved.state[param], rtol=0, atol=0
         )
+
+
+def test_native_dcp_validates_inventory_on_all_ranks_before_unrestricted_load(
+    native_optimizer_checkpoint, tmp_path, monkeypatch
+):
+    coordinator = ThreadCoordinator(2, timeout=10)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    unrestricted = []
+    torch_load, pickle_load = torch.load, dcp.pickle.load
+
+    def record_torch_load(file, *args, **kwargs):
+        if kwargs.get("weights_only") is not True:
+            unrestricted.append((context.value.rank, "torch.load"))
+        return torch_load(file, *args, **kwargs)
+
+    def record_pickle_load(file, *args, **kwargs):
+        if str(getattr(file, "name", "")).endswith(".metadata"):
+            unrestricted.append((context.value.rank, "pickle.load"))
+        return pickle_load(file, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", record_torch_load)
+    monkeypatch.setattr(dcp.pickle, "load", record_pickle_load)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        target, optimizer = _native_grouped_optimizer(9.0, ("ab", "cd"))
+        expected = "another rank failed"
+        if rank:
+            optimizer.state[target["a"]]["extra_moment"] = torch.zeros_like(target["a"])
+            expected = r"missing keys.*state\.a\.extra_moment"
+        _load_rejected(tmp_path, {"model": target, "optimizer": optimizer}, expected)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+    assert not unrestricted
 
 
 @pytest.mark.parametrize("fmt", ("safetensors", "dcp"))

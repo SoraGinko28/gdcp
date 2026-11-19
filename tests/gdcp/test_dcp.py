@@ -226,15 +226,16 @@ def _torch_rank(rank, world):
         destroy_process_group()
 
 
-def _torch_shard(dense, rank, world):
+def _torch_shard(dense, rank, world, view=None):
     import torch
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor import DTensor, Shard
 
     size, start = Shard.local_shard_size_and_offset(dense.size(0), world, rank)
     mesh = DeviceMesh("cpu", torch.arange(world))
+    local = dense[start : start + size].clone()
     return DTensor.from_local(
-        dense[start : start + size].clone(),
+        local if view is None else view(local),
         mesh,
         [Shard(0)],
         shape=dense.shape,
@@ -242,7 +243,7 @@ def _torch_shard(dense, rank, world):
     )
 
 
-def _torch_write_shards(root, dense, world):
+def _torch_write_shards(root, dense, world, *, view=None):
     from torch.distributed.checkpoint import DefaultSavePlanner, FileSystemWriter
 
     # Exercise torch's real planner and writer without a socket rendezvous.
@@ -252,7 +253,8 @@ def _torch_write_shards(root, dense, world):
         with _torch_rank(rank, world):
             planner = DefaultSavePlanner()
             planner.set_up_planner(
-                {"weight": _torch_shard(dense, rank, world)}, is_coordinator=rank == 0
+                {"weight": _torch_shard(dense, rank, world, view)},
+                is_coordinator=rank == 0,
             )
             planners.append(planner)
             plans.append(writer.prepare_local_plan(planner.create_local_plan()))
@@ -339,6 +341,43 @@ def test_native_dcp_load_transposed_torch_shards(tmp_path, world, rows, target_w
     native_load({"weight": restored}, checkpoint_id=root, no_dist=True)
     torch.testing.assert_close(restored, values, rtol=0, atol=0)
     _check_native_shard_load(tmp_path, values.numpy(), target_world)
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+def test_native_dcp_loads_lazy_negative_torch_shards_bit_for_bit(tmp_path, transposed):
+    torch = pytest.importorskip("torch")
+    from torch.distributed.checkpoint import load as native_load
+
+    values = torch.arange(15, dtype=torch.float32)
+    values[1:4] = torch.tensor([-0.0, float("nan"), float("inf")])
+    values = values.reshape(3, 5).t() if transposed else values.reshape(5, 3)
+    root = tmp_path / "model"
+    chunks = _torch_write_shards(root, values, 4, view=torch._neg_view)
+    assert [(chunk.offsets[0], chunk.sizes[0]) for chunk in chunks] == [
+        (0, 2),
+        (2, 2),
+        (4, 1),
+        (5, 0),
+    ]
+    restored = torch.zeros_like(values)
+    native_load({"weight": restored}, checkpoint_id=root, no_dist=True)
+    _check_native_shard_load(tmp_path, restored.numpy(), 3)
+
+
+def test_native_dcp_names_tensor_with_unsupported_conjugate_dtype(tmp_path):
+    torch = pytest.importorskip("torch")
+    from torch.distributed.checkpoint import save as native_save
+
+    from gdcp.adapters.dcp import load
+
+    tensor = torch.full((2, 3), 1 + 2j).conj()
+    native_save({"weight": tensor}, checkpoint_id=tmp_path / "model", no_dist=True)
+    target = _weight_checkpoint(
+        1, np.zeros((2, 3), dtype=np.float32), initialized=False
+    )
+    result = load(tmp_path, target.states[0], RankContext(0, 1))
+    assert type(result) is Err
+    assert "weight" in result.value.msg and "complex64" in result.value.msg
 
 
 @pytest.mark.parametrize("world,rows", _SHARD_SWEEP)
