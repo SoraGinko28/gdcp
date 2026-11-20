@@ -4,6 +4,7 @@ import logging
 import os
 from contextlib import ExitStack
 from dataclasses import replace
+from functools import cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
@@ -15,9 +16,11 @@ from gdtensor.builder import (
     Err,
     GDTensorIOError,
     Ok,
+    Shard,
     global_tensor_meta_of,
 )
 from gdtensor.io import rank_load, rank_save
+from gdtensor_conn._geometry import _mesh, naive_of
 
 from . import desc
 from ._transaction import PREFLIGHT, DirectoryTransaction
@@ -423,9 +426,48 @@ def _save_request(path, ctx, components, rank_keys, format_options):
         "world size": snapshot.world_size,
         "checkpoint component sequence": components,
         "rank_state keys": keys,
-        "resolved checkpoint save target": os.path.realpath(path),
+        "resolved checkpoint save target": os.path.realpath(desc.checkpoint_path(path)),
         "format options": format_options(),
     }
+
+
+def _tensor_schema(state):
+    # Record each distinct rank grid once, even for thousands of model tensors.
+    meshes = {}
+
+    @cache
+    def mesh_index(mesh):
+        cells = _mesh(mesh)
+        grid = (cells.shape, tuple(cells.ravel().tolist()))
+        return meshes.setdefault(grid, len(meshes))
+
+    def describe(named, logical_shapes):
+        tensor = naive_of(named)
+        meta = tensor.global_tensor_meta
+        shape = global_tensor_meta_of(named).global_shape
+        return {
+            "id": named.global_tensor_id,
+            "aliases": sorted(named.alias),
+            "shape": meta.global_shape,
+            "view": shape,
+            "logical_shape": logical_shapes.get(named.global_tensor_id, shape),
+            "dtype": meta.dtype,
+            "itemsize": meta.itemsize,
+            "placements": [
+                ("Shard", p.axis) if type(p) is Shard else (type(p).__name__,)
+                for p in tensor.placements
+            ],
+            "mesh": mesh_index(tensor.mesh),
+        }
+
+    tensors = [
+        [
+            describe(named, component.logical_shapes)
+            for named in component.table.named_d_tensors
+        ]
+        for component in state.components
+    ]
+    return {"components": tensors, "meshes": list(meshes)}
 
 
 def _prepare_save_agreement(path, state, ctx, format_options):
@@ -434,6 +476,7 @@ def _prepare_save_agreement(path, state, ctx, format_options):
     (snapshot, _, _), fields = _save_request(
         path, ctx, components, rank_state, format_options
     )
+    fields["ordered tensor schema"] = _tensor_schema(state)
     return (snapshot, rank_state, components), fields
 
 
@@ -564,7 +607,7 @@ def _save_agreed(path, agreement, *, policy=None, backend=None):
 
 
 def _require_not_pending(path):
-    if (Path(path) / desc.PENDING_NAME).exists():
+    if (desc.checkpoint_path(path) / desc.PENDING_NAME).exists():
         raise ValueError("GDCP checkpoint is incomplete: save is pending")
 
 

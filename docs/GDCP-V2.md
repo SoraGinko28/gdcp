@@ -81,10 +81,12 @@ produces an error naming the tensor. The nonempty chunks must cover the tensor
 along dimension 0. GDCP reports a chunk geometry error for overlaps, gaps, and
 sharding along another dimension.
 
-All three formats use the coordinator to compare a single digest of the live
+All three formats use the coordinator to compare a digest of the live
 world size, rank-state keys, the ordered component list, and format options,
 including FSDP2 dispatch, before payload I/O. Saves also check the resolved
-target. Loads write no files and can use read-only checkpoints. Independent
+target and the ordered per-tensor schema. FSDP2 checks the schema after
+extracting state and before staging. GDCP rejects ambiguous flattened AdamW
+fields and unsupported `hdfs://` paths. Loads write no files and can use read-only checkpoints. Independent
 loads and saves to distinct targets can overlap in one parent. See the
 [known limitations](GDCP.md#known-limitations).
 Names that resolve to the same directory on the

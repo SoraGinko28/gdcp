@@ -31,6 +31,16 @@ HF_COMMITTED_NAME = ".gdtensor_committed"
 PENDING_NAME = ".gdcp_pending"
 
 
+def checkpoint_path(path):
+    raw = os.fspath(path)
+    # pathlib collapses the double slash when the caller passes a Path.
+    if raw.lower().startswith("hdfs:/"):
+        raise ValueError(
+            "hdfs:// checkpoint paths are unsupported; use a shared filesystem path"
+        )
+    return Path(raw)
+
+
 @dataclass
 class CheckpointDesc:
     manifest: dict

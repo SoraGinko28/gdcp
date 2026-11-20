@@ -4,7 +4,6 @@ import io
 from collections import defaultdict
 from collections.abc import Callable
 from functools import partial
-from pathlib import Path
 from typing import cast
 
 import torch
@@ -172,6 +171,10 @@ def _optimizer_values(state):
 def _optimizer_fields(fqn, fields, tensors, objects, paths):
     for field, value in fields.items():
         key = f"state.{fqn}.{field}"
+        if key in paths:
+            raise ValueError(
+                f"optimizer state key collision for {key!r}: {paths[key]!r} and {(fqn, field)!r}"
+            )
         paths[key] = fqn, field
         target = tensors if isinstance(value, torch.Tensor) else objects
         target[key] = value
@@ -544,6 +547,16 @@ def save_checkpoint(
         ), metadata
 
     agreement, write_metadata = _collective(ctx, materialize)
+    if components and snapshot.coordinator is not None:
+        _unwrap(
+            core._agree(
+                snapshot,
+                lambda: (
+                    None,
+                    {"ordered tensor schema": core._tensor_schema(agreement.state)},
+                ),
+            )
+        )
     if route == "safetensors":
         result = core._save_agreed(root, agreement)
     elif route == "dcp":
@@ -578,7 +591,7 @@ def _save_agreement_options(route, max_shard_size, dtype):
 
 
 def _load_format(path, state):
-    root = Path(path)
+    root = desc.checkpoint_path(path)
     core._require_not_pending(root)
     marker = desc._completion_marker(root)
     if marker == desc.MANIFEST_NAME:
@@ -622,6 +635,7 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
     def prepare():
         if _preflight is not None:
             _preflight()
+        desc.checkpoint_path(path)
         return adapter.describe(checkpoint_state, ctx)
 
     state = _collective(ctx, prepare)

@@ -11,6 +11,7 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import DTensorTable, GlobalTensorMeta, NamedDTensor
 
+from ..desc import checkpoint_path
 from ..hf import _load_objects, load_state, read_headers, save_state
 from ..state import CheckpointState
 from .fsdp2 import (
@@ -183,9 +184,12 @@ def _write_config(path, model, dtype, ctx):
 
 def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
     ctx = _context()
-    state, write_metadata = _collective(
-        ctx, lambda: _prepare_save(model_or_state, dtype, ctx)
-    )
+
+    def prepare():
+        checkpoint_path(path)
+        return _prepare_save(model_or_state, dtype, ctx)
+
+    state, write_metadata = _collective(ctx, prepare)
     _unwrap(
         save_state(
             path,

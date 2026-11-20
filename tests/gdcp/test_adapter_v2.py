@@ -984,6 +984,22 @@ def _optimizer(model, lr, *, split=False, fresh=False):
     return optimizer
 
 
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_save_rejects_colliding_adamw_fields(mesh, tmp_path, fmt):
+    model = fully_shard(_model(1.0, "a"), mesh=mesh)
+    optimizer = _optimizer(model, 0.01)
+    fields = optimizer.state[model.a]
+    fields[1], fields["1"] = 10, 20
+    with pytest.raises(ValueError, match="optimizer state key collision"):
+        FSDP2Checkpointer.save(
+            tmp_path / "checkpoint",
+            {"model": model, "optimizer": optimizer},
+            checkpoint_format=fmt,
+        )
+    assert fields[1] == 10 and fields["1"] == 20
+    assert not list(tmp_path.iterdir())
+
+
 def _values(model, optimizer=None):
     tensors = list(model.state_dict().values())
     if optimizer is not None:

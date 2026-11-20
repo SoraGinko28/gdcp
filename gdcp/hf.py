@@ -576,7 +576,7 @@ def _read_completion_marker(root):
 
 def read_headers(path):
     """Describe native HF tensor byte ranges, with itemsize=None for packed dtypes."""
-    root = Path(path)
+    root = desc.checkpoint_path(path)
     if (root / desc.PENDING_NAME).exists():
         raise ValueError("HF checkpoint has an incomplete save (.gdcp_pending)")
     index_file = root / HF_INDEX_NAME

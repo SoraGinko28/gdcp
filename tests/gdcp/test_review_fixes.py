@@ -2,6 +2,7 @@
 
 import json
 import os
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, local
@@ -12,7 +13,8 @@ from gdcp import FSDP2Checkpointer, _transaction, core, desc, hf
 from gdcp.backend import SafeTensorsBackend
 from gdcp.policy import PerRankPolicy
 from gdcp.state import RankContext
-from gdtensor.builder import Err
+from gdtensor.builder import DTensorTable, Err, LiteralMesh, Replicate
+from gdtensor.tag import WorldSize
 from gdtensor_conn.coord import ThreadCoordinator
 from gdtensor_conn.iobackend import FileIO
 from tests.support import gdcp as fixtures
@@ -1190,3 +1192,154 @@ def test_rollback_collision_preserves_both_logs_and_propagates_interrupt(
     assert rank_zero is interrupt
     assert type(rank_one) is Err
     assert str(stage) in caplog.text and log.name in caplog.text
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize(
+    "change",
+    [
+        "order",
+        "id",
+        "shape",
+        "dtype",
+        "itemsize",
+        "placement",
+        "mesh",
+        "alias",
+        "logical shape",
+    ],
+)
+def test_save_rejects_tensor_schema_mismatch_before_staging(
+    tmp_path, monkeypatch, fmt, change
+):
+    root = tmp_path / "checkpoint"
+    original = _fixture()
+    assert_ok(_run(fmt, root, original))
+    source = _fixture(shift=7)
+    component = source.states[1].components[0]
+    entries = deepcopy(component.table.named_d_tensors)
+    first = entries[0]
+    tensor = first.d_tensor
+    if change == "order":
+        entries[-1], entries[-2] = entries[-2], entries[-1]
+    elif change == "id":
+        first.global_tensor_id = "different_weight"
+    elif change == "shape":
+        tensor.global_tensor_meta.global_shape[0] += 1
+    elif change == "dtype":
+        tensor.global_tensor_meta.dtype = "I32"
+    elif change == "itemsize":
+        tensor.global_tensor_meta.itemsize *= 2
+    elif change == "placement":
+        tensor.placements = [Replicate()]
+    elif change == "mesh":
+        tensor.mesh = LiteralMesh([1, 0], WorldSize(2))
+    elif change == "alias":
+        first.alias.append("tied_weight")
+    else:
+        component.logical_shapes["step"] = [1]
+    component.table = DTensorTable(entries)
+    before = _files(root)
+    monkeypatch.setattr(
+        core, "DirectoryTransaction", lambda *args: pytest.fail("opened a transaction")
+    )
+    results = _run(fmt, root, source)
+    assert all(
+        type(r) is Err and "ordered tensor schema" in r.value.msg for r in results
+    )
+    assert results[0].value.msg == results[1].value.msg
+    assert _files(root) == before
+    assert list(tmp_path.iterdir()) == [root]
+    _assert_generation(fmt, root, original)
+
+
+@pytest.mark.parametrize("fmt", [*_FORMATS, "HF weights"])
+def test_facade_checks_materialized_tensor_schema(tmp_path, monkeypatch, fmt):
+    pytest.importorskip("torch")
+    from gdcp.adapters import fsdp2
+
+    fixture = fixtures.numpy_checkpoint(2, initialized=True)
+    component = fixture.states[1].components[0]
+    component.table = DTensorTable(list(reversed(component.table.named_d_tensors)))
+    current = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(
+        fsdp2,
+        "_prepare_save_state",
+        lambda state, ctx, route, dtype: (fixture.states[ctx.rank], None),
+    )
+
+    def save(ctx):
+        current.ctx = ctx
+        opts = {"checkpoint_format": fmt}
+        if fmt == "HF weights":
+            opts = {"checkpoint_format": "hf", "hf_dtype": "fp32"}
+        with pytest.raises(RuntimeError, match="ordered tensor schema") as error:
+            FSDP2Checkpointer.save(tmp_path / "checkpoint", {"model": object()}, **opts)
+        return str(error.value)
+
+    leader, peer = _parallel(save)
+    assert leader == peer
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("dotted", [False, True])
+@pytest.mark.parametrize("kinds", ["objects", "tensors", "mixed"])
+def test_optimizer_rejects_flattened_field_collision(dotted, kinds):
+    torch = pytest.importorskip("torch")
+    from gdcp.adapters.fsdp2 import _optimizer_values
+
+    a = torch.tensor(10) if kinds != "objects" else 10
+    b = torch.tensor(20) if kinds == "tensors" else 20
+    fields = (
+        {"p": {"child.slot": a}, "p.child": {"slot": b}}
+        if dotted
+        else {"p": {1: a, "1": b}}
+    )
+    with pytest.raises(ValueError, match="optimizer state key collision") as error:
+        _optimizer_values({"param_groups": [], "state": fields})
+    names = (
+        (("p", "child.slot"), ("p.child", "slot")) if dotted else (("p", 1), ("p", "1"))
+    )
+    assert all(repr(name) in str(error.value) for name in names)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_collective_save_rejects_hdfs_path_before_staging(tmp_path, monkeypatch, fmt):
+    monkeypatch.chdir(tmp_path)
+    fixture = _fixture()
+    call, options = _operation(fmt, False, fixture)
+    results = _parallel(
+        lambda ctx: call(
+            ("local", "hdfs://cluster/checkpoint")[ctx.rank],
+            fixture.states[ctx.rank],
+            ctx,
+            **options,
+        )
+    )
+    assert all(type(r) is Err for r in results)
+    assert "hdfs://" in results[1].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "path", ["hdfs://cluster/checkpoint", Path("hdfs://cluster/checkpoint")]
+)
+def test_hdfs_paths_fail_in_public_checkpoint_apis(tmp_path, monkeypatch, path):
+    torch = pytest.importorskip("torch")
+    from gdcp import inspect, load_hf, save_hf
+
+    monkeypatch.chdir(tmp_path)
+    for fmt in _FORMATS:
+        with pytest.raises(ValueError, match="hdfs://"):
+            FSDP2Checkpointer.save(
+                path, {"extra_state": 1}, global_steps=3, checkpoint_format=fmt
+            )
+    with pytest.raises(ValueError, match="hdfs://"):
+        FSDP2Checkpointer.load(path, {"extra_state": None})
+    for call in (save_hf, load_hf):
+        with pytest.raises((ValueError, RuntimeError), match="hdfs://"):
+            call(path, {"weight": torch.ones(2)})
+    result = inspect(path)
+    assert type(result) is Err and "hdfs://" in result.value.msg
+    assert not list(tmp_path.iterdir())

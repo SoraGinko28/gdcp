@@ -1,6 +1,6 @@
 """Reference checkpointer parameter surface with explicit option validation."""
 
-from pathlib import Path
+from .desc import checkpoint_path
 
 _SAVE_FORMATS = ("safetensors", "dcp", "hf")
 
@@ -17,7 +17,7 @@ def _save_route(checkpoint_format, hf_dtype, max_shard_size):
 
 
 def _save_root(path, global_steps, ignore_append):
-    root = Path(path)
+    root = checkpoint_path(path)
     if global_steps is not None and not ignore_append:
         return root / f"global_step_{global_steps}"
     return root

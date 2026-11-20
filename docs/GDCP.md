@@ -41,17 +41,27 @@ All ranks must use the same FSDP2 save format and agree on whether an HF save
 exports weights only or full state. All three formats require the same ordered
 component list on every rank during load and before staging a save.
 
-Before payload I/O, coordinated saves and loads each use one digest to compare
-the live world size, ordered component names, rank-state keys, and built-in
-format options, including FSDP2 save and load dispatch. Saves also compare the
-resolved target. Loads compare the requested state and can read rank-local
-copies at different paths. Each rank hashes its canonical description with
-SHA-256, and the coordinator broadcasts
-the first 64 bits of rank 0's digest. Preparation, broadcast, and comparison
-take 66 votes regardless of name lengths, key counts, or world size. On a
-mismatch, all ranks report the fields compared and log their own description
-at debug level. FSDP2 compares the save request before extracting model or
-optimizer state. A disagreement leaves a fresh AdamW optimizer at its initial step.
+Coordinated saves and loads compare the live world size, ordered component
+names, rank-state keys, and built-in format options, including FSDP2 dispatch.
+Saves also compare the resolved target and each component's ordered tensor
+schema (names, aliases, global and logical shapes, dtype, item size, mesh and
+placements) before opening the checkpoint transaction. Loads compare the
+requested state and can read rank-local copies at different paths.
+
+Each rank hashes its canonical description with SHA-256. Preparation,
+broadcast of rank 0's 64-bit digest, and comparison take 66 votes regardless
+of tensor count or world size. The low-level save includes the schema in
+its existing digest. FSDP2 checks the request before extracting optimizer
+state, so disagreement on the target, components or format leaves a fresh
+AdamW at its initial step. For coordinated saves with model or optimizer
+components, FSDP2 then checks the extracted tensor schema in a second digest.
+On disagreement, ranks report the compared fields and log their own
+description at debug level.
+
+Checkpoint paths must be filesystem paths. GDCP rejects `hdfs://` on save and
+load. Use a shared mount visible to every rank. The FSDP2 adapter also rejects
+AdamW parameter and field names that produce the same flattened checkpoint
+key. The exception includes both source paths.
 
 Agreement does not write any files. Loads can read from a read-only checkpoint
 and parent. Independent jobs can load the same checkpoint or checkpoints in
