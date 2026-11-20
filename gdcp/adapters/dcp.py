@@ -16,6 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import lru_cache, partial
 from math import prod
+from contextlib import ExitStack
 from pathlib import Path
 from typing import IO, cast
 
@@ -1109,26 +1110,30 @@ def _load_storage_format(path):
 
 
 def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
-    agreed = core._agree_load(
-        state,
-        ctx,
-        lambda: core._load_options(
-            _load_storage_format(path),
-            _preflight,
-            _validate_groups,
-        ),
-    )
-    if type(agreed) is Err:
-        return agreed
-    assert agreed.value is not None
-    return _load_agreed(
-        path,
-        state,
-        ctx,
-        agreed.value["format"],
-        preflight=_preflight,
-        validate_groups=_validate_groups,
-    )
+    with ExitStack() as stack:
+        agreed = core._read_agreement(
+            stack,
+            path,
+            state,
+            ctx,
+            lambda local: core._load_options(
+                _load_storage_format(local),
+                _preflight,
+                _validate_groups,
+            ),
+        )
+        if type(agreed) is Err:
+            return agreed
+        assert agreed.value is not None
+        local, options = agreed.value
+        return _load_agreed(
+            local,
+            state,
+            ctx,
+            options["format"],
+            preflight=_preflight,
+            validate_groups=_validate_groups,
+        )
 
 
 def _load_agreed(path, state, ctx, storage_format, *, preflight, validate_groups):

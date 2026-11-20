@@ -13,6 +13,15 @@ conflicts = [[
 ]]
 
 [[package]]
+name = "argcomplete"
+version = "3.7.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/87/6f/5a73f04007ca950701765949209f068da628bd11f9c2da287278ce91e0ee/argcomplete-3.7.2.tar.gz", hash = "sha256:aad8b69a0b9969edb62db0d1752354c0d50717b10e0cbb00e2a958381b9fc6b9", size = 74473, upload-time = "2026-08-06T04:53:21.662Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/bd/551ee6af426af84ca33e02622be722925c196608e9127d731ef17c47f06e/argcomplete-3.7.2-py3-none-any.whl", hash = "sha256:6029205678bdd9c1c728a155f5f9ecf5812393f969eef58807641a2bc2aa5b19", size = 43294, upload-time = "2026-08-06T04:53:20.246Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -140,6 +149,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+hdfs = [
+    { name = "hdfs-native" },
+]
 torch = [
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" } },
 ]
@@ -158,13 +170,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hdfs-native", marker = "extra == 'hdfs'", specifier = ">=0.15.1,<0.16" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "safetensors", specifier = ">=0.4" },
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'torch-cpu'", specifier = ">=2.12", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "gdtensor", extra = "torch-cpu" } },
     { name = "torch", marker = "sys_platform != 'linux' and extra == 'torch-cpu'", specifier = ">=2.12" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.12" },
 ]
-provides-extras = ["torch", "torch-cpu"]
+provides-extras = ["hdfs", "torch", "torch-cpu"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -172,6 +185,29 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "ruff", specifier = ">=0.17.1" },
     { name = "ty", specifier = "==0.0.14" },
+]
+
+[[package]]
+name = "hdfs-native"
+version = "0.15.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "argcomplete" },
+    { name = "fsspec" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/61/88/32149f2330564c3845281fcae4c1c71be6600a6b84d3d4934303f2f7557e/hdfs_native-0.15.1.tar.gz", hash = "sha256:74a3ac56317eec08f7450e428cd6d7ac08f8d21af17585f0aa8fcfd31fb63cb5", size = 296331, upload-time = "2026-11-18T01:42:46.794Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/8a/4f0e3e6c7273b311ae5640616304cf964496ba8394cdc83139bf3f399d9c/hdfs_native-0.15.1-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:661e18499d9fb850b3bc7aa7d1e0a2341874ab2b21dd7a2c4cc35eca4369fc1b", size = 5991282, upload-time = "2026-11-18T01:42:31.623Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/77/6bd5f6e8bdcc449b7734bf574a9f25679a80a10475785168f5e98b5d1404/hdfs_native-0.15.1-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:8650c8d5c59815dcfd9bfacc9b8916d8cd903304ec79ab2d28fb0914bdee9db3", size = 5746615, upload-time = "2026-11-18T01:42:33.271Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/f0/b1d12c8edda809ac39976bec7b35b81f347f5041b5a5f6d8a8d6b38082f5/hdfs_native-0.15.1-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:253e0ea2da02912570370403af2844b210aba737a47b918fd93d58c3e68700b2", size = 6286891, upload-time = "2026-11-18T01:42:34.831Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/1b/f39e31dc41946bb91ff5309fbe227cd5fc4fd30253957ef9dcb0aa3558a8/hdfs_native-0.15.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:16b7e4a2ce629148495f252c3ddbd0797d50b02be95164498a7010d52991419f", size = 6301755, upload-time = "2026-11-18T01:42:36.485Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/06/a0bf168606e70e48b74f44013802279de872c0730f1c49df911f004568c1/hdfs_native-0.15.1-cp311-abi3-win_amd64.whl", hash = "sha256:2711452704d011669eff0a48c00bf127d95bf03e983470f0dd66dd5ed2c3226e", size = 5538546, upload-time = "2026-11-18T01:42:37.768Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/82/a7c9787ee2f46f6365a7c7ea6abfdf6137192a73843400774b56bb263649/hdfs_native-0.15.1-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:92b148a8a5126082574d0458b9696776967b5fdf874df625c2014cee074e9a63", size = 6005141, upload-time = "2026-11-18T01:42:39.276Z" },
+    { url = "https://files.pythonhosted.org/packages/47/c3/8b42f8d33da0a0483459396e5f621573f47b57429e217aaaab3a09079ea0/hdfs_native-0.15.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:3d14a0d73890ead7c634935e479b0fc4f6789ce3b4e2d3ab215e6d0b3a2a1325", size = 5736758, upload-time = "2026-11-18T01:42:40.548Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/70/d219b13f41acddd4ce9241e1fd0eb762684fa79a06ff428a60a1813a4ffe/hdfs_native-0.15.1-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4b60753060b811119fcf822ef81000e733bc9bf034654c0d7c051b28707e768f", size = 6274918, upload-time = "2026-11-18T01:42:42.102Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/65/42288b4d77004c72d39110f3d6e5bf793963e99f1dca390afdb96c08d438/hdfs_native-0.15.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:32519b3cdda9c806ef0e4f8dcd5852a58e84c0ba6eae4a5582a8ad71721b34de", size = 6296475, upload-time = "2026-11-18T01:42:43.675Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/19/4004cde6a36c39e94be6a5148c489a9e536dcfec260782b432e5bb4bcd00/hdfs_native-0.15.1-cp314-cp314t-win_amd64.whl", hash = "sha256:14c6a3e1d6d43b17ddb51b89925701931a4e47edae86699c45b4b051fd3bee07", size = 5529333, upload-time = "2026-11-18T01:42:45.584Z" },
 ]
 
 [[package]]

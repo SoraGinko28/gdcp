@@ -1305,7 +1305,9 @@ def test_optimizer_rejects_flattened_field_collision(dotted, kinds):
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-def test_collective_save_rejects_hdfs_path_before_staging(tmp_path, monkeypatch, fmt):
+def test_collective_save_rejects_mixed_local_and_hdfs_targets(
+    tmp_path, monkeypatch, fmt
+):
     monkeypatch.chdir(tmp_path)
     fixture = _fixture()
     call, options = _operation(fmt, False, fixture)
@@ -1318,14 +1320,12 @@ def test_collective_save_rejects_hdfs_path_before_staging(tmp_path, monkeypatch,
         )
     )
     assert all(type(r) is Err for r in results)
-    assert "hdfs://" in results[1].value.msg
+    assert "resolved checkpoint save target" in results[1].value.msg
     assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize(
-    "path", ["hdfs://cluster/checkpoint", Path("hdfs://cluster/checkpoint")]
-)
-def test_hdfs_paths_fail_in_public_checkpoint_apis(tmp_path, monkeypatch, path):
+def test_collapsed_hdfs_path_fails_in_public_checkpoint_apis(tmp_path, monkeypatch):
+    path = Path("hdfs://cluster/checkpoint")
     torch = pytest.importorskip("torch")
     from gdcp import inspect, load_hf, save_hf
 

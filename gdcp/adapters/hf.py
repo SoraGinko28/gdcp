@@ -11,7 +11,8 @@ from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import DTensorTable, GlobalTensorMeta, NamedDTensor
 
-from ..desc import checkpoint_path
+from contextlib import ExitStack
+from .._hdfs import checkpoint_path, localize
 from ..hf import _load_objects, load_state, read_headers, save_state
 from ..state import CheckpointState
 from .fsdp2 import (
@@ -243,8 +244,14 @@ def _model_headers(path):
 
 def load_hf(path, model_or_state, dtype=None):
     ctx = _context()
-    _model, state = _collective(
-        ctx,
-        lambda: _weights(model_or_state, dtype, ctx, headers=_model_headers(path)),
-    )
-    _unwrap(load_state(path, state, ctx, _dtype_option=dtype))
+    with ExitStack() as stack:
+
+        def prepare():
+            local, identity = localize(path, stack)
+            _, state = _weights(
+                model_or_state, dtype, ctx, headers=_model_headers(local)
+            )
+            return local, state, identity
+
+        local, state, identity = _collective(ctx, prepare)
+        _unwrap(load_state(local, state, ctx, _dtype_option=dtype, _source=identity))

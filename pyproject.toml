@@ -8,6 +8,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+hdfs = ["hdfs-native>=0.15.1,<0.16"]
 torch = [
     "torch>=2.12",
 ]

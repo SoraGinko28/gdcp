@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,12 +32,25 @@ HF_COMMITTED_NAME = ".gdtensor_committed"
 PENDING_NAME = ".gdcp_pending"
 
 
+STEP_DIRECTORY = re.compile(r"global_step_([0-9]+)")
+
+
+def numbered_generations(entries):
+    candidates = []
+    for entry in entries:
+        match = STEP_DIRECTORY.fullmatch(entry.name)
+        if match:
+            # Prefer the unpadded spelling when two names represent the same step.
+            candidates.append((int(match[1]), -len(entry.name), entry))
+    return [entry for _, _, entry in sorted(candidates, reverse=True)]
+
+
 def checkpoint_path(path):
     raw = os.fspath(path)
     # pathlib collapses the double slash when the caller passes a Path.
     if raw.lower().startswith("hdfs:/"):
         raise ValueError(
-            "hdfs:// checkpoint paths are unsupported; use a shared filesystem path"
+            "this local filesystem operation requires a staged path for hdfs://"
         )
     return Path(raw)
 

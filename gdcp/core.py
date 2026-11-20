@@ -2,6 +2,9 @@
 
 import logging
 import os
+import shutil
+import tempfile
+from uuid import uuid4
 from contextlib import ExitStack
 from dataclasses import replace
 from functools import cache
@@ -22,7 +25,7 @@ from gdtensor.builder import (
 from gdtensor.io import rank_load, rank_save
 from gdtensor_conn._geometry import _mesh, naive_of
 
-from . import desc
+from . import _hdfs, desc
 from ._transaction import PREFLIGHT, DirectoryTransaction
 from .backend import SafeTensorsBackend, _raise_io_interrupt
 from .policy import PerRankPolicy
@@ -176,6 +179,21 @@ def _agree_load(state, ctx, format_options):
         }
 
     return _agree(ctx, prepare)
+
+
+def _read_agreement(stack, path, state, ctx, options_for, *, latest=False):
+    local = None
+
+    def options():
+        nonlocal local
+        local, identity = _hdfs.localize(path, stack, latest=latest)
+        return {**options_for(local), **identity}
+
+    agreed = _agree_load(state, ctx, options)
+    if type(agreed) is Err:
+        return agreed
+    assert agreed.value is not None
+    return Ok((local, agreed.value))
 
 
 def _compute_view(component, tensor_ids=None):
@@ -422,11 +440,18 @@ def _save_request(path, ctx, components, rank_keys, format_options):
     _validate_context(ctx)
     snapshot = RankContext(ctx.rank, ctx.world_size, ctx.coordinator)
     keys = tuple(sorted(rank_keys))
+    target = _hdfs.checkpoint_path(path)
+    if isinstance(target, _hdfs.HdfsPath) and not target.path.name:
+        raise ValueError(
+            "choose a checkpoint directory below the hdfs:// filesystem root"
+        )
     return (snapshot, components, keys), {
         "world size": snapshot.world_size,
         "checkpoint component sequence": components,
         "rank_state keys": keys,
-        "resolved checkpoint save target": os.path.realpath(desc.checkpoint_path(path)),
+        "resolved checkpoint save target": str(target)
+        if isinstance(target, _hdfs.HdfsPath)
+        else os.path.realpath(target),
         "format options": format_options(),
     }
 
@@ -547,6 +572,75 @@ def _agree_save(path, state, context, format_options):
 
 
 def _transactional_save(path, agreement, action):
+    target = _hdfs.checkpoint_path(path)
+    if isinstance(target, _hdfs.HdfsPath):
+        return _hdfs_save(target, agreement, action)
+    return _local_transaction(target, agreement, action)
+
+
+def _hdfs_save(target, agreement, action):
+    ctx = agreement.ctx
+
+    # All writers must see the same private POSIX transaction directory.
+    # Only rank zero generates its name. Independent saves never share it.
+    def prepare():
+        base = Path(os.environ.get("GDCP_HDFS_STAGING_DIR") or tempfile.gettempdir())
+        client = _hdfs._client(target) if ctx.rank == 0 else None
+        return base, uuid4().int if ctx.rank == 0 else 0, client
+
+    prepared = _collective(ctx, "prepare HDFS staging", prepare)
+    if type(prepared) is Err:
+        return prepared
+    assert prepared.value is not None
+    base, token, client = prepared.value
+    if ctx.coordinator is not None:
+        token = sum(
+            1 << bit
+            for bit in range(128)
+            if ctx.coordinator.vote(ctx.rank != 0 or bool(token & (1 << bit)))
+        )
+    work = base / f".gdcp-hdfs-{token:032x}"
+    local = work / "checkpoint"
+
+    def create(stack):
+        if ctx.rank == 0:
+            work.mkdir(mode=0o700)
+            stack.callback(_remove_hdfs_stage, work)
+
+    def visible():
+        if not work.is_dir():
+            raise ValueError(
+                "GDCP_HDFS_STAGING_DIR must be visible to every saving rank"
+            )
+
+    with ExitStack() as stack:
+        made = _collective(ctx, "create HDFS staging", lambda: create(stack))
+        if type(made) is Err:
+            return made
+
+        checked = _collective(ctx, "check shared HDFS staging", visible)
+        if type(checked) is Err:
+            return checked
+        result = _local_transaction(local, agreement, action)
+        if type(result) is Err:
+            return result
+        return _collective(
+            ctx,
+            "publish HDFS checkpoint",
+            lambda: _hdfs.publish(client, target, local) if ctx.rank == 0 else None,
+        )
+
+
+def _remove_hdfs_stage(work):
+    try:
+        shutil.rmtree(work)
+    except OSError:
+        _LOG.warning(
+            "Could not remove local HDFS staging directory %s", work, exc_info=True
+        )
+
+
+def _local_transaction(path, agreement, action):
     ctx, rank_state = agreement.ctx, agreement.rank_state
     inventory = agreement.phase(
         "prepare rank state inventory",
@@ -614,8 +708,10 @@ def _require_not_pending(path):
 def inspect(path) -> Result[desc.CheckpointDesc]:
     """Read only the JSON manifest, without opening tensor or object files."""
     try:
-        _require_not_pending(path)
-        return Ok(desc.read_manifest(path))
+        with ExitStack() as stack:
+            local, _ = _hdfs.localize(path, stack, manifest_only=True)
+            _require_not_pending(local)
+            return Ok(desc.read_manifest(local))
     except Exception as exc:
         return _error("inspect", exc)
 
@@ -904,29 +1000,34 @@ def load(
     _optional_rank_state=False,
 ) -> Result[None]:
     """Restore requested components after all strict metadata checks pass."""
-    agreed = _agree_load(
-        state,
-        ctx,
-        lambda: _load_options(
-            _backend_format(backend),
-            _preflight,
-            _validate_groups,
-            optional=_optional_rank_state,
-            strict=strict is True,
-        ),
-    )
-    if type(agreed) is Err:
-        return agreed
-    return _load_agreed(
-        path,
-        state,
-        ctx,
-        backend=backend,
-        strict=strict,
-        preflight=_preflight,
-        validate_groups=_validate_groups,
-        optional_rank_state=_optional_rank_state,
-    )
+    with ExitStack() as stack:
+        agreed = _read_agreement(
+            stack,
+            path,
+            state,
+            ctx,
+            lambda local: _load_options(
+                _backend_format(backend),
+                _preflight,
+                _validate_groups,
+                optional=_optional_rank_state,
+                strict=strict is True,
+            ),
+        )
+        if type(agreed) is Err:
+            return agreed
+        assert agreed.value is not None
+        local, _ = agreed.value
+        return _load_agreed(
+            local,
+            state,
+            ctx,
+            backend=backend,
+            strict=strict,
+            preflight=_preflight,
+            validate_groups=_validate_groups,
+            optional_rank_state=_optional_rank_state,
+        )
 
 
 def _load_agreed(

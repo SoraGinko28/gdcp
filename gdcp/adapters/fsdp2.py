@@ -1,7 +1,7 @@
 """Real FSDP2 state dictionaries and per-rank torch serialization."""
 
 import io
-import re
+from contextlib import ExitStack
 from collections import defaultdict
 from collections.abc import Callable
 from functools import partial
@@ -32,7 +32,7 @@ from gdtensor.builder import (
 from gdtensor.tag import WorldSize
 from gdtensor_conn.coord import GlooCoordinator
 
-from .. import core, desc, hf
+from .. import _hdfs, core, desc, hf
 from ..checkpointer import _save_route
 from ..state import CheckpointState, Component, RankContext
 from .torch_access import TorchAccessor
@@ -530,6 +530,8 @@ def save_checkpoint(
 
     def materialize():
         # Reading a fresh AdamW state dict can call optimizer.step().
+        if isinstance(root, _hdfs.HdfsPath):
+            _hdfs.require_client()
         state, metadata = _prepare_save_state(
             checkpoint_state, snapshot, route, hf_dtype
         )
@@ -615,17 +617,8 @@ def _load_format(root, state):
     return None
 
 
-_STEP_DIR = re.compile(r"global_step_([0-9]+)")
-
-
 def _latest_step(root):
-    candidates = []
-    for entry in root.iterdir():
-        match = _STEP_DIR.fullmatch(entry.name)
-        if match:
-            # Prefer the unpadded spelling when two names represent the same step.
-            candidates.append((int(match[1]), -len(entry.name), entry))
-    for _, _, entry in sorted(candidates, reverse=True):
+    for entry in desc.numbered_generations(root.iterdir()):
         if entry.is_symlink() or (entry / desc.PENDING_NAME).exists():
             continue
         if desc._completion_marker(entry) is not None:
@@ -636,7 +629,7 @@ def _latest_step(root):
 def _load_agreement_options(path, state, preflight, validate_groups, common_only):
     fmt = _load_format(path, state)
     options = {}
-    if fmt is None and path.is_dir() and not _STEP_DIR.fullmatch(path.name):
+    if fmt is None and path.is_dir() and not desc.STEP_DIRECTORY.fullmatch(path.name):
         path = _latest_step(path)
         options["generation"] = path.name
         fmt = _load_format(path, state)
@@ -666,7 +659,7 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
     def prepare():
         if _preflight is not None:
             _preflight()
-        return desc.checkpoint_path(path), adapter.describe(checkpoint_state, ctx)
+        return _hdfs.checkpoint_path(path), adapter.describe(checkpoint_state, ctx)
 
     root, state = _collective(ctx, prepare)
 
@@ -680,46 +673,50 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
         if optimizer is not None
         else None
     )
-    options = _unwrap(
-        core._agree_load(
-            state,
-            ctx,
-            lambda: _load_agreement_options(
-                root, state, preflight, validate_groups, common_only
-            ),
+    with ExitStack() as stack:
+        (local, options) = _unwrap(
+            core._read_agreement(
+                stack,
+                root,
+                state,
+                ctx,
+                lambda local: _load_agreement_options(
+                    local, state, preflight, validate_groups, common_only
+                ),
+                latest=True,
+            )
         )
-    )
-    path = root / options.get("generation", "")
-    fmt = options["dispatch"]
-    if fmt == "hf":
-        result = hf._load_agreed(
-            path,
-            state,
-            ctx,
-            preflight=preflight,
-            validate_groups=validate_groups,
-            optional_rank_state=common_only,
-        )
-    elif fmt == "dcp":
-        from . import dcp
+        path = local / options.get("generation", "")
+        fmt = options["dispatch"]
+        if fmt == "hf":
+            result = hf._load_agreed(
+                path,
+                state,
+                ctx,
+                preflight=preflight,
+                validate_groups=validate_groups,
+                optional_rank_state=common_only,
+            )
+        elif fmt == "dcp":
+            from . import dcp
 
-        result = dcp._load_agreed(
-            path,
-            state,
-            ctx,
-            options["format"],
-            preflight=preflight,
-            validate_groups=validate_groups,
-        )
-    else:
-        result = core._load_agreed(
-            path,
-            state,
-            ctx,
-            preflight=preflight,
-            validate_groups=validate_groups,
-            optional_rank_state=common_only,
-        )
+            result = dcp._load_agreed(
+                path,
+                state,
+                ctx,
+                options["format"],
+                preflight=preflight,
+                validate_groups=validate_groups,
+            )
+        else:
+            result = core._load_agreed(
+                path,
+                state,
+                ctx,
+                preflight=preflight,
+                validate_groups=validate_groups,
+                optional_rank_state=common_only,
+            )
     if type(result) is Err and isinstance(result.value, core._LoadValidationError):
         raise result.value.cause
     _unwrap(result)

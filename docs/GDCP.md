@@ -68,8 +68,7 @@ components, FSDP2 then checks the extracted tensor schema in a second digest.
 On disagreement, ranks report the compared fields and log their own
 description at debug level.
 
-Checkpoint paths must be filesystem paths. GDCP rejects `hdfs://` on save and
-load. Use a shared mount visible to every rank. The FSDP2 adapter also rejects
+The FSDP2 adapter rejects
 AdamW parameter and field names that produce the same flattened checkpoint
 key. The exception includes both source paths.
 
@@ -78,6 +77,40 @@ and parent. Independent jobs can load the same checkpoint or checkpoints in
 the same parent concurrently. Independent saves to different targets in one
 parent do not share agreement state; each still needs a writable location for
 its own checkpoint transaction.
+
+### HDFS checkpoints
+
+Add `--extra hdfs` to the project's usual `uv sync --locked` command on
+each training host, or install `hdfs-native>=0.15.1,<0.16` in its existing environment. Supply the NameNode RPC address or a
+nameservice configured for the client in `HADOOP_CONF_DIR`. Pass the URI as a
+string so its scheme and authority are preserved.
+
+```python
+run = "hdfs://nameservice1/checkpoints/run"
+FSDP2Checkpointer.save(run, checkpoint_state, global_steps=100)
+FSDP2Checkpointer.load(run, checkpoint_state)  # latest published step
+FSDP2Checkpointer.load(run + "/global_step_100", checkpoint_state)
+```
+
+The three checkpoint formats use synchronous transfer. On save, GDCP first
+creates the checkpoint in a private POSIX staging directory. Single-host jobs
+use the system temporary directory by default. For multi-host jobs set
+`GDCP_HDFS_STAGING_DIR` to a writable POSIX directory shared by all saving
+ranks. Allow space for the complete checkpoint there. Rank zero streams the
+finished files to HDFS. On load, each rank downloads the selected checkpoint
+into its own system temporary directory. Allow one checkpoint's worth of
+temporary space per loading rank. An HDFS load only needs read access remotely.
+
+Each checkpoint directory contains immutable `.gdcp-revision-…` directories
+and a small `.gdcp-current` file naming the published revision. A single HDFS
+rename publishes the pointer after all payload files have closed. Readers pin
+that revision for the entire load. Published revisions are retained on
+same-path overwrites so active readers can finish. An interruption can also
+leave an unpublished revision. Retire whole checkpoint directories according
+to the training job's retention policy after readers finish. The selected
+revision contains the usual safetensors, DCP or HF directory layout; the HDFS
+URI loader expects this GDCP publication structure. For manifest-based
+formats `gdcp.inspect` reads only the selected revision's JSON manifest.
 
 Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
 Integer and boolean buffers round-trip bit for bit into targets of the same dtype.

@@ -1,6 +1,6 @@
 """Reference checkpointer parameter surface with explicit option validation."""
 
-from .desc import checkpoint_path
+from ._hdfs import checkpoint_path
 
 _SAVE_FORMATS = ("safetensors", "dcp", "hf")
 

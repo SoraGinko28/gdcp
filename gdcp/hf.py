@@ -11,6 +11,7 @@ import struct
 from dataclasses import replace
 from functools import partial
 from math import prod
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -815,29 +816,36 @@ def load_state(
     _validate_groups=None,
     _optional_rank_state=False,
     _dtype_option=None,
+    _source=None,
 ):
     """Load native HF headers directly, including an optional optimizer sidecar."""
-    agreed = core._agree_load(
-        state,
-        ctx,
-        lambda: core._load_options(
-            "hf",
-            _preflight,
-            _validate_groups,
-            optional=_optional_rank_state,
-            dtype=_dtype_option,
-        ),
-    )
-    if type(agreed) is Err:
-        return agreed
-    return _load_agreed(
-        path,
-        state,
-        ctx,
-        preflight=_preflight,
-        validate_groups=_validate_groups,
-        optional_rank_state=_optional_rank_state,
-    )
+    with ExitStack() as stack:
+        agreed = core._read_agreement(
+            stack,
+            path,
+            state,
+            ctx,
+            lambda local: core._load_options(
+                "hf",
+                _preflight,
+                _validate_groups,
+                optional=_optional_rank_state,
+                dtype=_dtype_option,
+                **(_source or {}),
+            ),
+        )
+        if type(agreed) is Err:
+            return agreed
+        assert agreed.value is not None
+        local, _ = agreed.value
+        return _load_agreed(
+            local,
+            state,
+            ctx,
+            preflight=_preflight,
+            validate_groups=_validate_groups,
+            optional_rank_state=_optional_rank_state,
+        )
 
 
 def _load_agreed(path, state, ctx, *, preflight, validate_groups, optional_rank_state):
