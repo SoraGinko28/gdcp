@@ -15,10 +15,20 @@ checkpoint_state = {
     "extra_state": {"step": 100, "rng": rng_state},
 }
 FSDP2Checkpointer.save("/checkpoints/run", checkpoint_state, global_steps=100)
-FSDP2Checkpointer.load("/checkpoints/run/global_step_100", checkpoint_state)
+FSDP2Checkpointer.load("/checkpoints/run", checkpoint_state)
 # model and optimizer are restored in place; extra_state is replaced.
 description = inspect("/checkpoints/run/global_step_100")  # GDTensor Result
 ```
+
+Pass the run directory to `FSDP2Checkpointer.load` to resume the highest
+numeric `global_step_N` with a GDCP completion marker. Discovery reads only
+immediate child directories, skips pending saves and symlinks, and works with
+existing checkpoints on read-only storage. All ranks must select the same
+generation. A load error in that generation is reported to the caller.
+Pass a checkpoint path such as `/checkpoints/run/global_step_100` to select
+a specific step. If the supplied directory itself is a checkpoint, it takes
+precedence. Native HF and DCP checkpoints without GDCP markers can be loaded
+by their explicit paths.
 
 The loading world size may differ from the saving world size. GDTensor moves
 the intersections of saved storage shards and live compute shards directly;

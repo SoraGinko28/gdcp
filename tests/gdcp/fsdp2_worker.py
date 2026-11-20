@@ -212,6 +212,9 @@ def global_steps(args):
     nested = root / "appended" / "global_step_123"
     assert (nested / "gdcp_manifest.json").is_file()
     assert not (root / "appended" / "gdcp_manifest.json").exists()
+    restored = {"extra_state": None}
+    FSDP2Checkpointer.load(root / "appended", restored)
+    assert restored["extra_state"] == extra_for(get_rank())
     FSDP2Checkpointer.save(
         root / "direct",
         state,

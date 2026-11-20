@@ -247,6 +247,90 @@ def test_sharded_int16_buffer_round_trip(tmp_path, sharded_world, mode):
         list(pool.map(round_trip, range(world)))
 
 
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_load_latest_numeric_committed_step(tmp_path, mesh, fmt):
+    root = tmp_path / "run"
+    for step in (10, 2):
+        source = fully_shard(_model(float(step), "a"), mesh=mesh)
+        FSDP2Checkpointer.save(
+            root,
+            {"model": source, "extra_state": step},
+            global_steps=step,
+            checkpoint_format=fmt,
+        )
+    (root / "global_step_20").mkdir()
+    (root / "global_step_20" / "model.safetensors").touch()
+    pending = root / "global_step_30"
+    pending.mkdir()
+    (pending / desc.PENDING_NAME).touch()
+    (pending / desc.MANIFEST_NAME).touch()
+    (root / "global_step_40").symlink_to(
+        root / "global_step_2", target_is_directory=True
+    )
+    (root / ".global_step_100.gdcp-stage").mkdir()
+    (root / "global_step_last").mkdir()
+    for path, expected in ((root, 10), (root / "global_step_2", 2)):
+        target = fully_shard(_model(0.0, "a"), mesh=mesh)
+        state = {"model": target, "extra_state": None}
+        FSDP2Checkpointer.load(path, state)
+        assert state["extra_state"] == expected
+        assert torch.all(target.a.to_local() == expected)
+
+
+def test_latest_failed_publish_preserves_previous_step(tmp_path, monkeypatch):
+    root = tmp_path / "run"
+    FSDP2Checkpointer.save(root, {"extra_state": 2}, global_steps=2)
+
+    def fail(transaction):
+        raise OSError("injected publish failure")
+
+    monkeypatch.setattr(core.DirectoryTransaction, "publish", fail)
+    with pytest.raises(RuntimeError, match="injected publish failure"):
+        FSDP2Checkpointer.save(root, {"extra_state": 3}, global_steps=3)
+    result = {"extra_state": None}
+    FSDP2Checkpointer.load(root, result)
+    assert result["extra_state"] == 2
+
+
+def test_latest_reports_missing_or_damaged_generation(tmp_path):
+    state = {"extra_state": "untouched"}
+    (tmp_path / "global_step_3").mkdir()
+    with pytest.raises(RuntimeError, match="no committed global_step_N"):
+        FSDP2Checkpointer.load(tmp_path, state)
+    FSDP2Checkpointer.save(tmp_path, {"extra_state": 1}, global_steps=1)
+    (tmp_path / "global_step_3" / desc.MANIFEST_NAME).write_text("{}")
+    with pytest.raises(RuntimeError):
+        FSDP2Checkpointer.load(tmp_path, state)
+    assert state["extra_state"] == "untouched"
+
+
+def test_latest_prefers_explicit_checkpoint_root(tmp_path):
+    FSDP2Checkpointer.save(tmp_path, {"extra_state": 1})
+    FSDP2Checkpointer.save(tmp_path, {"extra_state": 2}, global_steps=2)
+    state = {"extra_state": None}
+    FSDP2Checkpointer.load(tmp_path, state)
+    assert state["extra_state"] == 1
+
+
+def test_latest_agrees_on_step_across_rank_local_paths(tmp_path, monkeypatch):
+    roots = [tmp_path / str(rank) for rank in range(2)]
+    for rank, root in enumerate(roots):
+        FSDP2Checkpointer.save(root, {"extra_state": rank}, global_steps=rank + 10)
+    coordinator = ThreadCoordinator(2, timeout=5)
+    context = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+
+    def load(rank):
+        context.value = RankContext(rank, 2, coordinator)
+        state = {"extra_state": "untouched"}
+        with pytest.raises(RuntimeError, match="ranks disagree"):
+            FSDP2Checkpointer.load(roots[rank], state)
+        assert state["extra_state"] == "untouched"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(load, range(2)))
+
+
 def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
     FSDP2Checkpointer.save(tmp_path, {})
     coordinator = ThreadCoordinator(2, timeout=2)

@@ -1,6 +1,7 @@
 """Real FSDP2 state dictionaries and per-rank torch serialization."""
 
 import io
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from functools import partial
@@ -590,8 +591,7 @@ def _save_agreement_options(route, max_shard_size, dtype):
     return {"dispatch": route, **options}
 
 
-def _load_format(path, state):
-    root = desc.checkpoint_path(path)
+def _load_format(root, state):
     core._require_not_pending(root)
     marker = desc._completion_marker(root)
     if marker == desc.MANIFEST_NAME:
@@ -612,19 +612,50 @@ def _load_format(path, state):
         return "hf"
     if native_dcp:
         return "dcp"
-    raise ValueError("missing checkpoint completion marker or native format files")
+    return None
+
+
+_STEP_DIR = re.compile(r"global_step_([0-9]+)")
+
+
+def _latest_step(root):
+    candidates = []
+    for entry in root.iterdir():
+        match = _STEP_DIR.fullmatch(entry.name)
+        if match:
+            # Prefer the unpadded spelling when two names represent the same step.
+            candidates.append((int(match[1]), -len(entry.name), entry))
+    for _, _, entry in sorted(candidates, reverse=True):
+        if entry.is_symlink() or (entry / desc.PENDING_NAME).exists():
+            continue
+        if desc._completion_marker(entry) is not None:
+            return entry
+    raise ValueError(f"no committed global_step_N checkpoint in {root}")
 
 
 def _load_agreement_options(path, state, preflight, validate_groups, common_only):
     fmt = _load_format(path, state)
+    options = {}
+    if fmt is None and path.is_dir() and not _STEP_DIR.fullmatch(path.name):
+        path = _latest_step(path)
+        options["generation"] = path.name
+        fmt = _load_format(path, state)
+    if fmt is None:
+        raise ValueError(
+            f"missing checkpoint completion marker or native format files in {path}"
+        )
     if fmt == "dcp":
         from .dcp import _load_storage_format
 
         return core._load_options(
-            _load_storage_format(path), preflight, validate_groups, dispatch=fmt
+            _load_storage_format(path),
+            preflight,
+            validate_groups,
+            dispatch=fmt,
+            **options,
         )
     return core._load_options(
-        fmt, preflight, validate_groups, optional=common_only, dispatch=fmt
+        fmt, preflight, validate_groups, optional=common_only, dispatch=fmt, **options
     )
 
 
@@ -635,10 +666,9 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
     def prepare():
         if _preflight is not None:
             _preflight()
-        desc.checkpoint_path(path)
-        return adapter.describe(checkpoint_state, ctx)
+        return desc.checkpoint_path(path), adapter.describe(checkpoint_state, ctx)
 
-    state = _collective(ctx, prepare)
+    root, state = _collective(ctx, prepare)
 
     def preflight(objects):
         adapter.prepare_restore(checkpoint_state, objects)
@@ -655,10 +685,11 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
             state,
             ctx,
             lambda: _load_agreement_options(
-                path, state, preflight, validate_groups, common_only
+                root, state, preflight, validate_groups, common_only
             ),
         )
     )
+    path = root / options.get("generation", "")
     fmt = options["dispatch"]
     if fmt == "hf":
         result = hf._load_agreed(
