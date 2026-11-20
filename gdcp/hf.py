@@ -466,23 +466,34 @@ def save_state(
     path, state, ctx, *, max_shard_size=None, _write_metadata=None, _dtype_option=None
 ):
     """Save HF files in a sibling, preserving the old checkpoint on failure."""
+    agreed = core._agree_save(
+        path, state, ctx, lambda: _save_options(max_shard_size, _dtype_option)
+    )
+    if type(agreed) is Err:
+        return agreed
+    return _save_agreed(path, agreed.value, max_shard_size, _write_metadata)
+
+
+def _save_options(max_shard_size, dtype):
+    return {
+        "format": "hf",
+        "max_shard_size": shard_size_bytes(max_shard_size),
+        "dtype": dtype,
+    }
+
+
+def _save_agreed(path, agreement, max_shard_size, write_metadata):
     return core._transactional_save(
         path,
-        state,
-        ctx,
+        agreement,
         lambda transaction, agreement, inventory: _save_staged(
             transaction,
-            state,
+            agreement.state,
             agreement,
             inventory,
             max_shard_size,
-            _write_metadata,
+            write_metadata,
         ),
-        format_options=lambda: {
-            "format": "hf",
-            "max_shard_size": shard_size_bytes(max_shard_size),
-            "dtype": _dtype_option,
-        },
     )
 
 
@@ -819,18 +830,29 @@ def load_state(
     )
     if type(agreed) is Err:
         return agreed
+    return _load_agreed(
+        path,
+        state,
+        ctx,
+        preflight=_preflight,
+        validate_groups=_validate_groups,
+        optional_rank_state=_optional_rank_state,
+    )
+
+
+def _load_agreed(path, state, ctx, *, preflight, validate_groups, optional_rank_state):
     if not state.components:
         return core._load_components(
             [],
             ctx,
             state,
-            lambda: _load_rank_only(path, state, ctx, optional=_optional_rank_state),
-            _preflight,
+            lambda: _load_rank_only(path, state, ctx, optional=optional_rank_state),
+            preflight,
         )
     prepared = core._collective(
         ctx,
         "HF prepare load",
-        lambda: _load_prepare(path, state, ctx, _validate_groups),
+        lambda: _load_prepare(path, state, ctx, validate_groups),
     )
     if type(prepared) is Err:
         return prepared
@@ -840,8 +862,8 @@ def load_state(
     result = core._load_payloads(
         [(combined.name, compute, storage)],
         ctx,
-        lambda: _load_rank_state(path, state, ctx, optional=_optional_rank_state),
-        preflight=lambda: _validate_load_objects(state, objects, _preflight),
+        lambda: _load_rank_state(path, state, ctx, optional=optional_rank_state),
+        preflight=lambda: _validate_load_objects(state, objects, preflight),
         validate=lambda: _validate_alias_payloads(path, headers, duplicates),
     )
     if type(result) is Err:

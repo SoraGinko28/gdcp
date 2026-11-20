@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -186,11 +187,24 @@ def _salvage_entry(old, root, name, planned):
     _sync_directory(source.parent)
 
 
-def _remove_verified(entry, expected, *, directory=False):
+@contextmanager
+def _cleanup_workspace(stage, *, occupied=False):
+    if occupied:
+        workspace = Path(mkdtemp(prefix=".gdcp-cleanup-", dir=stage))
+    else:
+        workspace = stage
+        workspace.mkdir(mode=0o700)
+    try:
+        yield workspace
+    finally:
+        if not any(workspace.iterdir()):
+            workspace.rmdir()
+
+
+def _remove_verified(entry, expected, workspace, *, directory=False):
     # Claim the current entry before checking its identity. Deleting under a
     # private name cannot unlink a file recreated at the original pathname.
-    private = Path(mkdtemp(prefix=".gdcp-cleanup-", dir=entry.parent))
-    claimed = private / entry.name
+    claimed = workspace / entry.name
     try:
         entry.rename(claimed)
         if _entry_identity(claimed) != expected:
@@ -203,9 +217,6 @@ def _remove_verified(entry, expected, *, directory=False):
         if os.path.lexists(claimed):
             _restore_claimed_entry(claimed, entry)
         raise
-    finally:
-        if not os.path.lexists(claimed):
-            private.rmdir()
 
 
 def _restore_claimed_entry(claimed, entry):
@@ -215,7 +226,7 @@ def _restore_claimed_entry(claimed, entry):
         raise OSError(f"could not restore {entry}; retained {claimed}: {exc}") from exc
 
 
-def _clean_old(old, root, owned, planned):
+def _clean_old(old, root, owned, planned, stage):
     blocked = []
     for name in _foreign_entries(old, owned):
         try:
@@ -227,11 +238,19 @@ def _clean_old(old, root, owned, planned):
 
     # Delete only verified checkpoint files and empty directories. New entries
     # can still arrive in the old directory through an open directory handle.
+    with _cleanup_workspace(stage, occupied=old == stage) as workspace:
+        _remove_owned(old, owned, workspace)
+    old.rmdir()
+
+
+def _remove_owned(old, owned, workspace):
     for name, kind in _entries(old, owned):
+        entry = old / name
+        if entry == workspace:
+            continue
         if kind == "foreign":
             raise OSError(f"foreign entry appeared during cleanup: {name}")
-        _remove_verified(old / name, owned[name], directory=kind == "directory")
-    old.rmdir()
+        _remove_verified(entry, owned[name], workspace, directory=kind == "directory")
 
 
 def _collisions(root, foreign, planned):
@@ -368,7 +387,8 @@ class DirectoryTransaction:
             self._refuse_recovery()
         journal = self.stage / JOURNAL_NAME
         if not journal.is_file() and os.path.lexists(self.root / JOURNAL_NAME):
-            self._refuse_recovery()
+            self._recover_empty_cleanup_stage()
+            return
         try:
             proven = self._recover_foreign(journal) if journal.is_file() else False
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -382,6 +402,13 @@ class DirectoryTransaction:
         shutil.rmtree(self.stage)
         _sync_directory(self.stage.parent)
         _LOG.warning("removed unpublished checkpoint stage %s", self.stage)
+
+    def _recover_empty_cleanup_stage(self):
+        if any(self.stage.iterdir()):
+            self._refuse_recovery()
+        # Publication can recreate an empty stage for journal cleanup.
+        self.stage.rmdir()
+        self._recover_published_journal()
 
     def _foreign_record(self, item):
         name = Path(item["path"])
@@ -407,7 +434,7 @@ class DirectoryTransaction:
             self._refuse_recovery()
         for item in record["foreign"]:
             self._check_foreign_at_root(item)
-        _remove_verified(journal, (entry.st_dev, entry.st_ino))
+        self._remove_journal(journal, (entry.st_dev, entry.st_ino))
         _sync_directory(self.root)
         _LOG.warning("removed published checkpoint transaction journal %s", journal)
 
@@ -558,7 +585,7 @@ class DirectoryTransaction:
         journal = self.root / JOURNAL_NAME
         try:
             self._check(self.root, self.new_identity)
-            self._remove_journal(journal)
+            self._remove_journal(journal, self.journal_identity)
             _sync_directory(self.root)
         except Exception as exc:
             _LOG.warning(
@@ -567,9 +594,12 @@ class DirectoryTransaction:
                 exc,
             )
 
-    def _remove_journal(self, journal):
-        if os.path.lexists(journal):
-            _remove_verified(journal, self.journal_identity)
+    def _remove_journal(self, journal, expected):
+        if not os.path.lexists(journal):
+            return
+        with _cleanup_workspace(self.stage) as workspace:
+            _remove_verified(journal, expected, workspace)
+        _sync_directory(self.stage.parent)
 
     def _remove_obsolete(self, path, expected):
         if expected is None or not os.path.lexists(path):
@@ -588,7 +618,7 @@ class DirectoryTransaction:
     def _delete_obsolete(self, path):
         if self.accepted:
             self._check(self.root, self.new_identity)
-            _clean_old(path, self.root, self.old_owned, self.planned)
+            _clean_old(path, self.root, self.old_owned, self.planned, self.stage)
         else:
             shutil.rmtree(path)
 

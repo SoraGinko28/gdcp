@@ -8,7 +8,7 @@ from threading import Event, local
 
 import pytest
 
-from gdcp import _transaction, core, desc, hf
+from gdcp import FSDP2Checkpointer, _transaction, core, desc, hf
 from gdcp.backend import SafeTensorsBackend
 from gdcp.policy import PerRankPolicy
 from gdcp.state import RankContext
@@ -31,6 +31,7 @@ _PAYLOADS = [
     ("hf", "model.safetensors"),
 ]
 _FORMATS = [fmt for fmt, _ in _PAYLOADS]
+_FORMER_VOTE_NAMES = (".gdcp-save-vote", ".gdcp-load-vote")
 
 
 def _parallel(call, worlds=(2, 2)):
@@ -136,17 +137,23 @@ def test_independent_jobs_can_overlap(tmp_path, fmt, mode):
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-def test_filesystem_entries_during_save_and_load(tmp_path, fmt):
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_filesystem_entries_during_save_and_load(tmp_path, monkeypatch, fmt, overwrite):
     root = tmp_path / "checkpoint"
-    stage = tmp_path / ".checkpoint.gdcp-stage"
+    transaction = _transaction.DirectoryTransaction(root, 0)
+    stage, backup = transaction.stage, transaction.backup
     foreign = tmp_path / "unrelated"
     foreign.mkdir()
+    if overwrite:
+        assert_ok(_run(fmt, root, _fixture()))
+    # Exercise the portable rename even on systems that support exchange.
+    monkeypatch.setattr(_transaction, "_exchange", lambda *_: False)
 
     def listing(directory):
         return set(directory.rglob("*"))
 
     def snapshot():
-        return set(tmp_path.iterdir()), listing(root), listing(stage)
+        return set(tmp_path.iterdir()), listing(root), listing(stage), listing(backup)
 
     def record(samples):
         def observe(_vote):
@@ -155,24 +162,117 @@ def test_filesystem_entries_during_save_and_load(tmp_path, fmt):
         return observe
 
     before = snapshot()
-    assert before == ({foreign}, set(), set())
+    assert before == (
+        {foreign, root} if overwrite else {foreign},
+        listing(root),
+        set(),
+        set(),
+    )
+    cleanup = []
+    rename = Path.rename
+
+    def record_claim(path, target):
+        result = rename(path, target)
+        if root in path.parents or backup in path.parents:
+            cleanup.append((path, result, snapshot()))
+        return result
+
+    monkeypatch.setattr(Path, "rename", record_claim)
     saves = []
-    _counted_operation(fmt, root, _fixture(), loading=False, observe=record(saves))
+    _counted_operation(
+        fmt, root, _fixture(shift=7), loading=False, observe=record(saves)
+    )
     after = snapshot()
-    assert after == ({foreign, root}, listing(root), set())
+    assert after == ({foreign, root}, listing(root), set(), set())
     assert after[1]
     assert any(stage / _transaction.JOURNAL_NAME in sample[2] for sample in saves)
-    published = ({foreign, root}, after[1] | {root / _transaction.JOURNAL_NAME}, set())
+    journal = root / _transaction.JOURNAL_NAME
+    published = ({foreign, root}, after[1] | {journal}, set(), set())
+    assert any(source == journal for source, _, _ in cleanup)
+    assert any(source.is_relative_to(backup) for source, _, _ in cleanup) == overwrite
+    for _, claim, (parents, checkpoint, staged, obsolete) in cleanup:
+        assert claim in staged
+        assert parents <= {foreign, root, stage, backup}
+        assert checkpoint in (after[1], published[1])
+        assert obsolete <= {backup / name.relative_to(root) for name in before[1]}
 
     loads = []
     _counted_operation(fmt, root, _fixture(), loading=True, observe=record(loads))
     assert loads and all(sample == after for sample in loads)
     assert snapshot() == after
-    for parents, checkpoint, staged in saves:
-        if parents == {foreign, stage}:
-            assert not checkpoint
+    obsolete = {backup / name.relative_to(root) for name in before[1]}
+    for sample in saves:
+        parents, checkpoint, _, old_sibling = sample
+        if stage in parents:
+            assert parents == before[0] | {stage}
+            assert checkpoint == before[1]
+            assert not old_sibling
         else:
-            assert (parents, checkpoint, staged) in (before, published, after)
+            assert sample in (before, published, after) or (
+                overwrite
+                and sample == (published[0] | {backup}, published[1], set(), obsolete)
+            )
+
+
+@pytest.mark.parametrize(
+    ("loading", "formats"),
+    [
+        (False, ("safetensors", "dcp")),
+        (False, ("hf", "safetensors")),
+        (False, ("hf", "HF weights")),
+        (True, ("hf", "safetensors")),
+    ],
+)
+def test_fsdp2_dispatch_shares_initial_agreement(
+    tmp_path, monkeypatch, caplog, loading, formats
+):
+    pytest.importorskip("torch")
+    from gdcp.adapters import fsdp2
+
+    roots = (
+        [tmp_path / fmt for fmt in formats]
+        if loading
+        else [tmp_path / "checkpoint"] * 2
+    )
+    states = [{} if fmt == "HF weights" else {"extra_state": None} for fmt in formats]
+    if loading:
+        for root, fmt in zip(roots, formats, strict=True):
+            FSDP2Checkpointer.save(root, {"extra_state": 7}, checkpoint_format=fmt)
+    before = _files(tmp_path)
+    initial_states = [dict(state) for state in states]
+    current = local()
+    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+
+    def attempt(ctx):
+        current.ctx = ctx
+        rank = ctx.rank
+        fmt = formats[rank]
+        call = FSDP2Checkpointer.load if loading else FSDP2Checkpointer.save
+        options = {}
+        if not loading:
+            options = {"checkpoint_format": fmt}
+        if fmt == "HF weights":
+            options = {"checkpoint_format": "hf", "hf_dtype": "fp32"}
+        with pytest.raises(RuntimeError) as error:
+            call(roots[rank], states[rank], **options)
+        return str(error.value)
+
+    with caplog.at_level("DEBUG", logger=core.__name__):
+        leader, peer = _parallel(attempt)
+    assert leader == peer
+    assert "ranks disagree" in leader and "format options" in leader
+    records = [
+        record.getMessage() for record in caplog.records if record.name == core.__name__
+    ]
+    assert len(records) == 2
+    for message in records:
+        prefix, canonical = message.split(": ", 1)
+        rank = int(prefix.rsplit(" ", 1)[1])
+        fields = json.loads(canonical)
+        assert fields["world size"] == 2
+        assert fields["format options"]["dispatch"] == formats[rank]
+    assert states == initial_states
+    assert _files(tmp_path) == before
 
 
 def test_hf_save_agrees_on_shard_size_before_staging(tmp_path):
@@ -289,29 +389,42 @@ def test_agreement_digest_failure_precedes_payloads(
 @pytest.mark.parametrize("contents", ["empty", "file", "nested"])
 def test_save_load_preserve_unrelated_siblings(tmp_path, fmt, contents):
     root = tmp_path / "checkpoint"
-    sibling = tmp_path / ".other-directory"
-    sibling.mkdir()
+    save_vote, load_vote = [tmp_path / name for name in _FORMER_VOTE_NAMES]
+    save_vote.mkdir()
+    load_vote.mkdir()
     if contents == "file":
-        (sibling / "unrelated").write_bytes(b"foreign file")
+        for sibling in (save_vote, load_vote):
+            (sibling / "unrelated").write_bytes(b"foreign file")
     elif contents == "nested":
-        (sibling / "nested").mkdir()
-        (sibling / "nested" / "unrelated").write_bytes(b"foreign file")
-    inode = sibling.stat().st_ino
-    original = _files(sibling)
+        for sibling in (save_vote, load_vote):
+            (sibling / "nested").mkdir()
+            (sibling / "nested" / "unrelated").write_bytes(b"foreign file")
+    original = {
+        path: (path.stat().st_ino, _files(path)) for path in (save_vote, load_vote)
+    }
 
     assert_ok(_run(fmt, root, _fixture()))
     _assert_generation(fmt, root, _fixture(), world=2)
-    assert set(tmp_path.iterdir()) == {root, sibling}
-    assert sibling.stat().st_ino == inode
-    assert _files(sibling) == original
+    assert set(tmp_path.iterdir()) == {root, save_vote, load_vote}
+    for path, (inode, files) in original.items():
+        assert path.stat().st_ino == inode
+        assert _files(path) == files
 
 
-def test_unrelated_hidden_directory_can_be_checkpoint_target(tmp_path):
-    for name in (".hidden-a", ".hidden-b"):
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_unrelated_hidden_directory_can_be_checkpoint_target(tmp_path, fmt):
+    for name in _FORMER_VOTE_NAMES:
         root = tmp_path / name
-        assert_ok(_run("safetensors", root, _fixture()))
-        _assert_generation("safetensors", root, _fixture(), world=2)
-    assert {path.name for path in tmp_path.iterdir()} == {".hidden-a", ".hidden-b"}
+        assert_ok(_run(fmt, root, _fixture()))
+    for name in _FORMER_VOTE_NAMES:
+        _assert_generation(fmt, tmp_path / name, _fixture(), world=2)
+    root = tmp_path / "checkpoint"
+    assert_ok(_run(fmt, root, _fixture()))
+    _assert_generation(fmt, root, _fixture(), world=2)
+    assert {path.name for path in tmp_path.iterdir()} == {
+        *_FORMER_VOTE_NAMES,
+        root.name,
+    }
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
@@ -376,7 +489,7 @@ def test_operations_ignore_unrelated_empty_sibling(tmp_path, fmt, mode, empty_fi
     loading = mode == "load"
     if loading:
         assert_ok(_run(fmt, root, fixture))
-    sibling = tmp_path / ".unrelated"
+    sibling = tmp_path / _FORMER_VOTE_NAMES[loading]
     sibling.mkdir()
     if empty_file:
         (sibling / "empty").touch()
@@ -951,24 +1064,25 @@ def test_obsolete_file_replaced_during_cleanup(
     inode = replacement.stat().st_ino
     unlink, rename = Path.unlink, Path.rename
     injected = []
+    claims = []
 
     def replace():
         os.replace(replacement, old_file)
         injected.append(True)
 
     def unlink_file(path, *args, **kwargs):
-        if (
-            old_file.parent in path.parents
-            and path.name == old_file.name
-            and not injected
-        ):
+        if path in claims and not injected:
             replace()
         return unlink(path, *args, **kwargs)
 
     def move_file(path, target):
-        if path == old_file and replace_before_move and not injected:
+        if path != old_file:
+            return rename(path, target)
+        if replace_before_move and not injected:
             replace()
-        return rename(path, target)
+        claimed = rename(path, target)
+        claims.append(claimed)
+        return claimed
 
     monkeypatch.setattr(_transaction, "_exchange", lambda *_: False)
     monkeypatch.setattr(Path, "unlink", unlink_file)

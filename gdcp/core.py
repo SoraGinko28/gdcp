@@ -484,7 +484,7 @@ class _SaveAgreement:
         return checked if type(checked) is Err else result
 
 
-def _transactional_save(path, state, context, action, *, format_options):
+def _agree_save(path, state, context, format_options):
     agreed = _agree(
         context, lambda: _prepare_save_agreement(path, state, context, format_options)
     )
@@ -492,7 +492,11 @@ def _transactional_save(path, state, context, action, *, format_options):
         return agreed
     assert agreed.value is not None
     ctx, rank_state, components = agreed.value
-    agreement = _SaveAgreement(state, context, ctx, rank_state, components)
+    return Ok(_SaveAgreement(state, context, ctx, rank_state, components))
+
+
+def _transactional_save(path, agreement, action):
+    ctx, rank_state = agreement.ctx, agreement.rank_state
     inventory = agreement.phase(
         "prepare rank state inventory",
         lambda: _rank_state_inventory(rank_state, ctx),
@@ -535,14 +539,19 @@ def _transactional_save(path, state, context, action, *, format_options):
 
 def save(path, state, ctx, *, policy=None, backend=None) -> Result[None]:
     """Save to a sibling, then publish collectively without damaging the old save."""
+    agreed = _agree_save(path, state, ctx, lambda: {"format": _backend_format(backend)})
+    if type(agreed) is Err:
+        return agreed
+    return _save_agreed(path, agreed.value, policy=policy, backend=backend)
+
+
+def _save_agreed(path, agreement, *, policy=None, backend=None):
     return _transactional_save(
         path,
-        state,
-        ctx,
+        agreement,
         lambda transaction, agreement, inventory: _save_staged(
-            transaction, state, agreement, inventory, policy, backend
+            transaction, agreement.state, agreement, inventory, policy, backend
         ),
-        format_options=lambda: {"format": _backend_format(backend)},
     )
 
 

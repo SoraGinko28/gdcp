@@ -706,23 +706,23 @@ def test_fsdp2_save_routes_agree_before_dispatch(tmp_path, monkeypatch, options)
     coordinator = ThreadCoordinator(2, timeout=2)
     context = local()
     monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
-    described = []
-    describe = fsdp2.FSDP2Adapter.describe
+    dispatched = []
 
-    def track_describe(adapter, state, ctx):
-        described.append(ctx.rank)
-        return describe(adapter, state, ctx)
+    def track_dispatch(*args, **kwargs):
+        dispatched.append(True)
 
-    monkeypatch.setattr(fsdp2.FSDP2Adapter, "describe", track_describe)
+    monkeypatch.setattr(core, "_save_agreed", track_dispatch)
+    monkeypatch.setattr(dcp, "_save_agreed", track_dispatch)
+    monkeypatch.setattr(hf, "_save_agreed", track_dispatch)
 
     def save(rank):
         context.value = RankContext(rank, 2, coordinator)
-        with pytest.raises(RuntimeError, match="ranks disagree on checkpoint save"):
+        with pytest.raises(RuntimeError, match="ranks disagree on .*format options"):
             FSDP2Checkpointer.save(tmp_path / "checkpoint", {}, **options[rank])
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(save, range(2)))
-    assert not described
+    assert not dispatched
     assert not list(tmp_path.iterdir())
 
 

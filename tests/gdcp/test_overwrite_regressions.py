@@ -967,7 +967,10 @@ def test_same_device_bind_mount_is_rejected_from_mountinfo(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-def test_first_save_killed_after_publish_recovers_root_journal(tmp_path, fmt):
+@pytest.mark.parametrize("cleanup_started", [False, True])
+def test_first_save_killed_after_publish_recovers_root_journal(
+    tmp_path, fmt, cleanup_started
+):
     root = tmp_path / "checkpoint"
     old = _fixture()
     assert_ok(_run(fmt, root, old))
@@ -978,6 +981,8 @@ def test_first_save_killed_after_publish_recovers_root_journal(tmp_path, fmt):
         "foreign": [],
     }
     desc.atomic_write(root / ".gdcp_transaction", desc.json_bytes(journal))
+    if cleanup_started:
+        _transaction.DirectoryTransaction(root, 0).stage.mkdir()
     new = _fixture(shift=7)
     assert_ok(_run(fmt, root, new))
     assert not (root / ".gdcp_transaction").exists()

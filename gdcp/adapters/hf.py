@@ -182,21 +182,25 @@ def _write_config(path, model, dtype, ctx):
 
 
 def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
-    return _save_hf(path, model_or_state, dtype, max_shard_size, _context())
-
-
-def _save_hf(path, model_or_state, dtype, max_shard_size, ctx):
-    model, state = _collective(ctx, lambda: _weights(model_or_state, dtype, ctx))
+    ctx = _context()
+    state, write_metadata = _collective(
+        ctx, lambda: _prepare_save(model_or_state, dtype, ctx)
+    )
     _unwrap(
         save_state(
             path,
             state,
             ctx,
             max_shard_size=max_shard_size,
-            _write_metadata=lambda stage: _write_config(stage, model, dtype, ctx),
+            _write_metadata=write_metadata,
             _dtype_option=dtype,
         )
     )
+
+
+def _prepare_save(model_or_state, dtype, ctx):
+    model, state = _weights(model_or_state, dtype, ctx)
+    return state, lambda stage: _write_config(stage, model, dtype, ctx)
 
 
 def _load_dtype(headers, tensors, aliases, dtype):

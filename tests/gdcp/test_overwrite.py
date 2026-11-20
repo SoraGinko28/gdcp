@@ -221,20 +221,26 @@ def test_obsolete_cleanup_failure_keeps_new_checkpoint_and_old_sibling(
     original_files = _files(root)
     old_inode = root.stat().st_ino
     transaction = _transaction.DirectoryTransaction(root, 0)
-    original = Path.unlink
+    unlink, rename = Path.unlink, Path.rename
+    claims = set()
+
+    def track_claim(path, target):
+        moved = rename(path, target)
+        if {transaction.stage, transaction.backup}.intersection(path.parents):
+            claims.add(moved)
+        return moved
 
     def fail_cleanup(path, *args, **kwargs):
-        if any(
-            sibling in path.parents and sibling.stat().st_ino == old_inode
-            for sibling in (transaction.stage, transaction.backup)
-        ):
+        if path in claims:
             raise OSError("injected obsolete-generation cleanup failure")
-        return original(path, *args, **kwargs)
+        return unlink(path, *args, **kwargs)
 
+    monkeypatch.setattr(Path, "rename", track_claim)
     monkeypatch.setattr(Path, "unlink", fail_cleanup)
     assert_ok(_run("safetensors", root, new))
     _assert_generation("safetensors", root, new)
     retained = transaction.stage if transaction.stage.exists() else transaction.backup
+    assert retained.stat().st_ino == old_inode
     assert _files(retained) == original_files
     assert "retained sibling" in caplog.text
 

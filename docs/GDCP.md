@@ -43,9 +43,10 @@ component list on every rank during load and before staging a save.
 
 Before payload I/O, coordinated saves and loads each use one digest to compare
 the live world size, ordered component names, rank-state keys, and built-in
-format options. Saves also compare the resolved target; loads compare the
-requested state and can read rank-local copies at different paths. Each rank
-hashes its canonical description with SHA-256, and the coordinator broadcasts
+format options, including FSDP2 save and load dispatch. Saves also compare the
+resolved target. Loads compare the requested state and can read rank-local
+copies at different paths. Each rank hashes its canonical description with
+SHA-256, and the coordinator broadcasts
 the first 64 bits of rank 0's digest. Preparation, broadcast, and comparison
 take 66 votes regardless of name lengths, key counts, or world size. On a
 mismatch, all ranks report the fields compared and log their own description
@@ -134,10 +135,12 @@ single-file save, where an index would take precedence during load. A collision,
 reserved name, or failed move leaves the entry in the sibling and logs a warning
 naming the sibling and entry. The save returns success with the new checkpoint.
 
-Cleanup renames each deletion candidate into a private temporary directory and
-verifies its identity there before deleting it. A captured replacement goes back
-to its original name if available. If that name has been recreated, both entries
-are retained and the warning identifies the temporary path. Directory removal
+Cleanup renames each deletion candidate into a private workspace in the stage
+sibling and verifies its identity there before deleting it. Cleanup recreates
+the stage sibling for this purpose after the stage has been published. A captured
+replacement goes back to its original name if available. If that name has been
+recreated, both entries are retained and the warning identifies the temporary
+path. Directory removal
 requires an empty directory, so arrivals during deletion can also leave the
 obsolete sibling in place with a warning. The published journal stays until the
 sibling is removed. Its cleanup uses the identity recorded when the journal was
@@ -153,7 +156,7 @@ Hard termination has these exact namespace windows:
 | After Linux exchange | Target contains the complete new checkpoint and the carried entries. Stage contains the old checkpoint and any arrivals missed by the final scan. |
 | Portable old-to-backup, before stage-to-target | Target is absent. Backup contains the complete old checkpoint and any arrivals missed by the final scan. Stage contains the complete new checkpoint and the carried entries. |
 | After stage-to-target, before acceptance | Target contains the complete new checkpoint and the carried entries. Backup contains the old checkpoint and any arrivals missed by the final scan. |
-| Accepted obsolete-generation cleanup | Uncontested late entries move to the new target. An interrupted or blocked cleanup can retain the obsolete sibling and a private cleanup directory containing the entry being checked. After successful sibling removal, cleanup removes the verified journal. |
+| Accepted cleanup | Uncontested late entries move to the new target. An interrupted or blocked cleanup can retain the obsolete sibling and a claim in the stage sibling. After successful obsolete-generation cleanup, the journal is claimed in the stage sibling and removed. |
 
 A first save has no old-generation rename: before stage-to-target the target is
 absent; afterwards it contains the new checkpoint. Recovery does not infer a
@@ -169,7 +172,8 @@ path is running**. Concurrent saves and loads during overwrite remain unsupporte
 | Target present, backup present | Refuse and describe all three paths. Never automatically delete a backup. |
 | Target absent, complete backup present | Rename backup back to target and log a warning, then apply the stage rules. This restores the old checkpoint; a valid stage journal restores its foreign entries too. |
 | Target absent, incomplete/unrecognized backup | Refuse; retain everything for inspection. |
-| Stage without its own journal while a journal exists at target | Retain the stage and refuse recovery because it may be the old generation. |
+| Empty stage while a journal exists at target | Remove the empty stage and verify the published journal before removing it. |
+| Nonempty stage without its own journal while a journal exists at target | Retain the stage and refuse recovery because it may be the old generation. |
 | Empty stage, or only the initializing pending-marker temporary file | Remove the provably unpublished initialization with a warning and proceed. |
 | Pending stage without a journal (legacy attempt) | Remove with a warning and proceed. Legacy pending stages could only contain unpublished checkpoint output. |
 | Valid journal, target still has its recorded pre-save identity, stage pending or provably incomplete | Return each moved foreign entry to target, remove stage with a warning, then proceed. A journal created before the pending marker is also recoverable. |
@@ -185,7 +189,9 @@ a retained old stage is refused; after portable publication, a retained backup i
 refused. Recoverable cleanup failures log a warning and return success with the
 new checkpoint complete. If an error escapes transaction cleanup after acceptance,
 every rank reports a cleanup failure and the new checkpoint is already committed.
-An interrupt during obsolete cleanup also leaves the accepted new generation.
+An interrupt during cleanup also leaves the accepted new generation. If staging
+holds a claim that could not be restored or a hard termination leaves it in
+place, inspect the stage before removing it and retrying.
 Process death, failed coordination, power/device loss,
 or a filesystem that refuses rollback cannot promise a collective error return or
 restoration at the original pathname. Data and directory fsyncs retain their

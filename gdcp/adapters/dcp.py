@@ -798,16 +798,23 @@ def _read_native_metadata(root):
 
 
 def save(path, state, ctx):
+    agreed = core._agree_save(path, state, ctx, lambda: {"format": DcpBackend.format})
+    if type(agreed) is Err:
+        return agreed
+    return _save_agreed(path, agreed.value)
+
+
+def _save_agreed(path, agreement):
     backend = core._collective(
-        ctx,
+        agreement.ctx,
         "prepare DCP save",
         lambda: DcpBackend(
-            {component.name: component for component in state.components}
+            {component.name: component for component in agreement.state.components}
         ),
     )
     if type(backend) is Err:
         return backend
-    return core.save(path, state, ctx, policy=DcpPolicy(), backend=backend.value)
+    return core._save_agreed(path, agreement, policy=DcpPolicy(), backend=backend.value)
 
 
 def _native_tensor(tensor_id, item, count, world):
@@ -1097,12 +1104,16 @@ def _has_manifest(path):
     return (Path(path) / desc.MANIFEST_NAME).is_file()
 
 
+def _load_storage_format(path):
+    return "distcp" if _has_manifest(path) else "native DCP"
+
+
 def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     agreed = core._agree_load(
         state,
         ctx,
         lambda: core._load_options(
-            "distcp" if _has_manifest(path) else "native DCP",
+            _load_storage_format(path),
             _preflight,
             _validate_groups,
         ),
@@ -1110,14 +1121,25 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     if type(agreed) is Err:
         return agreed
     assert agreed.value is not None
-    if agreed.value["format"] == "distcp":
+    return _load_agreed(
+        path,
+        state,
+        ctx,
+        agreed.value["format"],
+        preflight=_preflight,
+        validate_groups=_validate_groups,
+    )
+
+
+def _load_agreed(path, state, ctx, storage_format, *, preflight, validate_groups):
+    if storage_format == "distcp":
         return core._load_agreed(
             path,
             state,
             ctx,
             backend=DcpBackend(),
-            preflight=_preflight,
-            validate_groups=_validate_groups,
+            preflight=preflight,
+            validate_groups=validate_groups,
         )
     unsupported = core._error(
         "validate native DCP rank state",
@@ -1133,7 +1155,7 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     metadata = core._collective(
         ctx,
         "validate native DCP metadata",
-        lambda: _prepare_native(path, state, ctx, _validate_groups),
+        lambda: _prepare_native(path, state, ctx, validate_groups),
     )
     if type(metadata) is Err:
         return metadata
@@ -1162,4 +1184,4 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     )
     if type(prepared) is Err:
         return prepared
-    return core._load_components(prepared.value, ctx, state, dict, _preflight)
+    return core._load_components(prepared.value, ctx, state, dict, preflight)

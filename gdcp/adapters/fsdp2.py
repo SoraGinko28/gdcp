@@ -33,7 +33,7 @@ from gdtensor.tag import WorldSize
 from gdtensor_conn.coord import GlooCoordinator
 
 from .. import core, desc, hf
-from ..checkpointer import _SAVE_FORMATS, _save_route
+from ..checkpointer import _save_route
 from ..state import CheckpointState, Component, RankContext
 from .torch_access import TorchAccessor
 
@@ -507,28 +507,49 @@ def save_checkpoint(
         return path, _save_route(checkpoint_format, hf_dtype, max_shard_size)
 
     root, route = _collective(ctx, prepare)
-    _unwrap(
-        core._agree_choice(
-            ctx, "checkpoint save route", route, (*_SAVE_FORMATS, "HF weights")
+    state, write_metadata = _collective(
+        ctx, lambda: _prepare_save_state(checkpoint_state, ctx, route, hf_dtype)
+    )
+    state.global_steps = global_steps
+    agreement = _unwrap(
+        core._agree_save(
+            root,
+            state,
+            ctx,
+            lambda: _save_agreement_options(route, max_shard_size, hf_dtype),
         )
     )
-    if route == "HF weights":
-        from .hf import _save_hf
-
-        return _save_hf(root, checkpoint_state, hf_dtype, max_shard_size, ctx)
-    adapter = FSDP2Adapter()
-    state = _collective(ctx, lambda: adapter.describe(checkpoint_state, ctx))
-    state.global_steps = global_steps
     if route == "safetensors":
-        result = core.save(root, state, ctx)
+        result = core._save_agreed(root, agreement)
     elif route == "dcp":
         from . import dcp
 
-        result = dcp.save(root, state, ctx)
+        result = dcp._save_agreed(root, agreement)
     else:
-        result = hf.save_state(root, state, ctx, max_shard_size=max_shard_size)
+        result = hf._save_agreed(root, agreement, max_shard_size, write_metadata)
     _unwrap(result)
-    _collective(ctx, lambda: _finish(state))
+    if route != "HF weights":
+        _collective(ctx, lambda: _finish(state))
+
+
+def _prepare_save_state(checkpoint_state, ctx, route, dtype):
+    if route == "HF weights":
+        from .hf import _prepare_save
+
+        return _prepare_save(checkpoint_state, dtype, ctx)
+    return FSDP2Adapter().describe(checkpoint_state, ctx), None
+
+
+def _save_agreement_options(route, max_shard_size, dtype):
+    if route in ("hf", "HF weights"):
+        options = hf._save_options(max_shard_size, dtype)
+    elif route == "dcp":
+        from .dcp import DcpBackend
+
+        options = {"format": DcpBackend.format}
+    else:
+        options = {"format": "safetensors"}
+    return {"dispatch": route, **options}
 
 
 def _load_format(path, state):
@@ -556,6 +577,19 @@ def _load_format(path, state):
     raise ValueError("missing checkpoint completion marker or native format files")
 
 
+def _load_agreement_options(path, state, preflight, validate_groups, common_only):
+    fmt = _load_format(path, state)
+    if fmt == "dcp":
+        from .dcp import _load_storage_format
+
+        return core._load_options(
+            _load_storage_format(path), preflight, validate_groups, dispatch=fmt
+        )
+    return core._load_options(
+        fmt, preflight, validate_groups, optional=common_only, dispatch=fmt
+    )
+
+
 def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=None):
     ctx = _context()
     adapter = FSDP2Adapter(loading=True, common_only=common_only)
@@ -577,37 +611,44 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
         if optimizer is not None
         else None
     )
-    fmt = _unwrap(
-        core._collective_choice(
+    options = _unwrap(
+        core._agree_load(
+            state,
             ctx,
-            "checkpoint load format",
-            lambda: _load_format(path, state),
-            ("safetensors", "dcp", "hf"),
+            lambda: _load_agreement_options(
+                path, state, preflight, validate_groups, common_only
+            ),
         )
     )
+    fmt = options["dispatch"]
     if fmt == "hf":
-        result = hf.load_state(
+        result = hf._load_agreed(
             path,
             state,
             ctx,
-            _preflight=preflight,
-            _validate_groups=validate_groups,
-            _optional_rank_state=common_only,
+            preflight=preflight,
+            validate_groups=validate_groups,
+            optional_rank_state=common_only,
         )
     elif fmt == "dcp":
         from . import dcp
 
-        result = dcp.load(
-            path, state, ctx, _preflight=preflight, _validate_groups=validate_groups
-        )
-    else:
-        result = core.load(
+        result = dcp._load_agreed(
             path,
             state,
             ctx,
-            _preflight=preflight,
-            _validate_groups=validate_groups,
-            _optional_rank_state=common_only,
+            options["format"],
+            preflight=preflight,
+            validate_groups=validate_groups,
+        )
+    else:
+        result = core._load_agreed(
+            path,
+            state,
+            ctx,
+            preflight=preflight,
+            validate_groups=validate_groups,
+            optional_rank_state=common_only,
         )
     if type(result) is Err and isinstance(result.value, core._LoadValidationError):
         raise result.value.cause
