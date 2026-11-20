@@ -81,12 +81,12 @@ produces an error naming the tensor. The nonempty chunks must cover the tensor
 along dimension 0. GDCP reports a chunk geometry error for overlaps, gaps, and
 sharding along another dimension.
 
-All three formats check rank IDs, the live world size, rank-state keys and the
-ordered component list before payload I/O on saves and loads. Saves also check
-the resolved target name. Coordinated operations use one agreement directory in
-the target's writable shared parent and require cross-node advisory locks and
-read-after-fsync visibility. See [GDCP filesystem requirements](GDCP.md) and
-the [known limitations](GDCP.md#known-limitations).
+All three formats use the coordinator to compare a single digest of the live
+world size, rank-state keys, the ordered component list, and format options
+before payload I/O. Saves also check the resolved target. Loads write no files
+and can use read-only checkpoints; independent loads and saves to distinct
+targets can overlap in one parent. See the
+[known limitations](GDCP.md#known-limitations).
 Names that resolve to the same directory on the
 checkpoint filesystem fail preflight on all ranks before any payload is written.
 FSDP2 validates save options collectively and requires every rank to select the

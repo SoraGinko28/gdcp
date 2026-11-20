@@ -9,7 +9,6 @@ from threading import Event, local
 import pytest
 
 from gdcp import _transaction, core, desc, hf
-from gdcp._agreement import AgreementRecords
 from gdcp.backend import SafeTensorsBackend
 from gdcp.policy import PerRankPolicy
 from gdcp.state import RankContext
@@ -45,23 +44,27 @@ def _parallel(call, worlds=(2, 2)):
 
 
 class _CountingCoordinator(ThreadCoordinator):
-    def __init__(self, world):
-        super().__init__(world, timeout=5)
+    def __init__(self, world, observe=None):
+        super().__init__(world, timeout=15)
         self.calls = local()
         self.counts = [0] * world
+        self.observe = observe
 
     def vote(self, ok):
-        self.counts[self.calls.rank] += 1
+        rank = self.calls.rank
+        self.counts[rank] += 1
+        if rank == 0 and self.observe is not None:
+            self.observe(self.counts[rank])
         return super().vote(ok)
 
 
-def _counted_operation(fmt, root, fixture, *, loading):
+def _counted_operation(fmt, root, fixture, *, loading, observe=None):
     call, options = _operation(fmt, loading, fixture)
     if fmt == "dcp":
         from gdcp.adapters import dcp
 
         call, options = (dcp.load if loading else dcp.save), {}
-    coordinator = _CountingCoordinator(len(fixture.states))
+    coordinator = _CountingCoordinator(len(fixture.states), observe)
 
     def invoke(rank):
         coordinator.calls.rank = rank
@@ -74,17 +77,129 @@ def _counted_operation(fmt, root, fixture, *, loading):
     return coordinator.counts[0]
 
 
-def _long_names_fixture(monkeypatch, world):
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_load_from_read_only_tree(tmp_path, fmt):
+    root = tmp_path / "checkpoint"
+    assert_ok(_run(fmt, root, _fixture()))
+    original = _files(root)
+    modes = {path: path.stat().st_mode for path in [*tmp_path.rglob("*"), tmp_path]}
+    try:
+        for path in modes:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        _assert_generation(fmt, root, _fixture(), world=2)
+    finally:
+        for path, mode in reversed(list(modes.items())):
+            path.chmod(mode)
+    assert _files(root) == original
+    assert list(tmp_path.iterdir()) == [root]
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+@pytest.mark.parametrize("mode", ["shared load", "sibling load", "sibling save"])
+def test_independent_jobs_can_overlap(tmp_path, fmt, mode):
+    loading = mode != "sibling save"
+    first = tmp_path / "first"
+    second = first if mode == "shared load" else tmp_path / "second"
+    if loading:
+        for root in {first, second}:
+            assert_ok(_run(fmt, root, _fixture()))
+    entered, release = Event(), Event()
+
+    def pause(vote):
+        if vote == 6:
+            entered.set()
+            assert release.wait(10)
+
+    def run_peers():
+        jobs = 3 if loading else 1
+        with ThreadPoolExecutor(max_workers=jobs) as concurrent:
+            peers = [
+                concurrent.submit(_run, fmt, second, _fixture(), loading=loading)
+                for _ in range(jobs)
+            ]
+            assert_ok([result for peer in peers for result in peer.result(timeout=8)])
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(
+            _counted_operation, fmt, first, _fixture(), loading=loading, observe=pause
+        )
+        try:
+            assert entered.wait(10)
+            run_peers()
+        finally:
+            release.set()
+        pending.result(timeout=8)
+    assert set(tmp_path.iterdir()) == {first, second}
+    if not loading:
+        for root in (first, second):
+            _assert_generation(fmt, root, _fixture(), world=2)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_filesystem_entries_during_save_and_load(tmp_path, fmt):
+    root = tmp_path / "checkpoint"
+    stage = tmp_path / ".checkpoint.gdcp-stage"
+    foreign = tmp_path / "unrelated"
+    foreign.mkdir()
+
+    def listing(directory):
+        return set(directory.rglob("*"))
+
+    def snapshot():
+        return set(tmp_path.iterdir()), listing(root), listing(stage)
+
+    def record(samples):
+        def observe(_vote):
+            samples.append(snapshot())
+
+        return observe
+
+    before = snapshot()
+    assert before == ({foreign}, set(), set())
+    saves = []
+    _counted_operation(fmt, root, _fixture(), loading=False, observe=record(saves))
+    after = snapshot()
+    assert after == ({foreign, root}, listing(root), set())
+    assert after[1]
+    assert any(stage / _transaction.JOURNAL_NAME in sample[2] for sample in saves)
+    published = ({foreign, root}, after[1] | {root / _transaction.JOURNAL_NAME}, set())
+
+    loads = []
+    _counted_operation(fmt, root, _fixture(), loading=True, observe=record(loads))
+    assert loads and all(sample == after for sample in loads)
+    assert snapshot() == after
+    for parents, checkpoint, staged in saves:
+        if parents == {foreign, stage}:
+            assert not checkpoint
+        else:
+            assert (parents, checkpoint, staged) in (before, published, after)
+
+
+def test_hf_save_agrees_on_shard_size_before_staging(tmp_path):
+    root = tmp_path / "checkpoint"
+    fixture = _fixture()
+
+    def save(ctx):
+        return hf.save_state(
+            root, fixture.states[ctx.rank], ctx, max_shard_size=(64, 128)[ctx.rank]
+        )
+
+    results = _parallel(save)
+    assert all(type(result) is Err for result in results), results
+    assert results[0].value.msg == results[1].value.msg
+    assert "format options" in results[0].value.msg
+    assert not list(tmp_path.iterdir())
+
+
+def _long_names_fixture(monkeypatch):
     monkeypatch.setattr(
         fixtures, "SPECS", [(name * 10, *spec) for name, *spec in fixtures.SPECS]
     )
     fixture = fixtures.numpy_checkpoint(
-        world, initialized=True, names=("model" * 10, "optimizer" * 10)
+        2, initialized=True, names=("model" * 10, "optimizer" * 10)
     )
     for rank, state in enumerate(fixture.states):
-        state.rank_state = {
-            "extra_state" * 10 + str(key): bytes([rank]) for key in range(10)
-        }
+        state.rank_state = {"extra_state" * 10: bytes([rank])}
     return fixture
 
 
@@ -95,23 +210,27 @@ def test_full_state_votes_are_independent_of_names_and_world(
     def roundtrip(root, fixture):
         saved = _counted_operation(fmt, root, fixture, loading=False)
         loaded = _counted_operation(fmt, root, fixture, loading=True)
-        assert not list(root.parent.glob(".*gdcp*vote"))
         return saved, loaded
 
-    standard = roundtrip(tmp_path / "standard", _fixture())
+    standard = roundtrip(tmp_path / "baseline", _fixture())
     with monkeypatch.context() as patch:
-        longer = roundtrip(tmp_path / "longer", _long_names_fixture(patch, 2))
-    with monkeypatch.context() as patch:
-        larger = roundtrip(tmp_path / "larger", _long_names_fixture(patch, 3))
-    assert standard == longer == larger
-    assert standard == {"safetensors": (58, 15), "dcp": (59, 17), "hf": (43, 15)}[fmt]
+        longer = roundtrip(tmp_path / ("baseline" * 10), _long_names_fixture(patch))
+    more_keys = _fixture()
+    for rank, state in enumerate(more_keys.states):
+        state.rank_state = {f"extra_stat{key}": bytes([rank]) for key in range(10)}
+    more = roundtrip(tmp_path / "morekeys", more_keys)
+    larger = roundtrip(tmp_path / "bigworld", _fixture(world=4))
+    assert standard == longer == more == larger
+    assert (
+        standard == {"safetensors": (115, 73), "dcp": (116, 73), "hf": (100, 73)}[fmt]
+    )
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize("fault", ["unreadable", "tampered", "interrupt"])
+@pytest.mark.parametrize("fault", ["hash failure", "different digest", "interrupt"])
 @pytest.mark.parametrize("loading", [False, True])
-def test_agreement_record_failure_precedes_payloads(
-    tmp_path, monkeypatch, fmt, fault, loading
+def test_agreement_digest_failure_precedes_payloads(
+    tmp_path, monkeypatch, caplog, fmt, fault, loading
 ):
     root = tmp_path / "checkpoint"
     fixture = _fixture(shift=7)
@@ -119,23 +238,19 @@ def test_agreement_record_failure_precedes_payloads(
         assert_ok(_run(fmt, root, _fixture()))
     original = _files(root)
     call, options = _operation(fmt, loading, fixture)
-    scratch = ".gdcp-load-vote" if loading else ".gdcp-save-vote"
-    read = Path.read_bytes
+    sha256 = core.sha256
     current = local()
-    faults = []
-    payload_io = []
+    faults, payload_io = [], []
 
-    def read_record(path):
-        data = read(path)
-        is_reference = path.parent.name == scratch and path.name == "rank-0"
-        if not is_reference or current.rank != 1:
-            return data
-        faults.append(path.name)
-        if fault == "unreadable":
-            raise PermissionError("injected agreement read failure")
+    def hash_description(data):
+        if current.rank != 1:
+            return sha256(data)
+        faults.append(data)
+        if fault == "hash failure":
+            raise OSError("injected digest preparation failure")
         if fault == "interrupt":
-            raise KeyboardInterrupt("injected agreement interrupt")
-        return data.replace(b"optimizer", b"tampering")
+            raise KeyboardInterrupt("injected digest preparation interrupt")
+        return sha256(data + b"changed")
 
     def run(ctx):
         current.rank = ctx.rank
@@ -144,107 +259,59 @@ def test_agreement_record_failure_precedes_payloads(
         except KeyboardInterrupt as exc:
             return exc
 
-    monkeypatch.setattr(Path, "read_bytes", read_record)
+    monkeypatch.setattr(core, "sha256", hash_description)
     io_method = "pread" if loading else "pwrite"
     monkeypatch.setattr(FileIO, io_method, lambda *args: payload_io.append(args))
-    results = _parallel(run)
-    assert faults
-    assert not payload_io
-    assert type(results[0]) is Err
-    assert "agreement record" in results[0].value.msg
-    if fault == "interrupt":
-        assert isinstance(results[1], KeyboardInterrupt)
+    with caplog.at_level("DEBUG", logger=core.__name__):
+        leader, peer = _parallel(run)
+    assert faults and not payload_io
+    assert type(leader) is Err
+    assert leader.value.operation == "checkpoint rank agreement"
+    if fault == "different digest":
+        assert type(peer) is Err and leader.value.msg == peer.value.msg
+        assert "ranks disagree" in leader.value.msg
+        for rank in (0, 1):
+            assert (
+                f"Checkpoint agreement rank {rank}: {faults[0].decode()}" in caplog.text
+            )
+    elif fault == "interrupt":
+        assert isinstance(peer, KeyboardInterrupt)
     else:
-        assert type(results[1]) is Err
-        assert results[0].value.msg == results[1].value.msg
+        assert (
+            type(peer) is Err
+            and "injected digest preparation failure" in peer.value.msg
+        )
     assert _files(root) == original
     assert list(tmp_path.iterdir()) == ([root] if loading else [])
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize(
-    "scratch_name", [".checkpoint.gdcp-vote", ".gdcp-save-vote", ".gdcp-load-vote"]
-)
-def test_agreement_recovers_owned_records(tmp_path, fmt, scratch_name):
+@pytest.mark.parametrize("contents", ["empty", "file", "nested"])
+def test_save_load_preserve_unrelated_siblings(tmp_path, fmt, contents):
     root = tmp_path / "checkpoint"
-    fixture = _fixture()
-    loading = scratch_name == ".gdcp-load-vote"
-    if loading:
-        assert_ok(_run(fmt, root, fixture))
-    scratch = tmp_path / scratch_name
-    scratch.mkdir()
-    (scratch / ".owner").write_bytes(b"GDCP rank agreement v1\n")
-    (scratch / "rank-1").write_bytes(b"partial record from interrupted process")
-    (scratch / "duplicate-1").touch()
+    sibling = tmp_path / ".other-directory"
+    sibling.mkdir()
+    if contents == "file":
+        (sibling / "unrelated").write_bytes(b"foreign file")
+    elif contents == "nested":
+        (sibling / "nested").mkdir()
+        (sibling / "nested" / "unrelated").write_bytes(b"foreign file")
+    inode = sibling.stat().st_ino
+    original = _files(sibling)
 
-    assert_ok(_run(fmt, root, fixture, loading=loading))
-    assert list(tmp_path.iterdir()) == [root]
-
-
-def test_agreement_preserves_unrecognized_sibling(tmp_path):
-    root = tmp_path / "checkpoint"
-    scratch = tmp_path / ".checkpoint.gdcp-vote"
-    scratch.mkdir()
-    foreign = scratch / "rank-0"
-    foreign.write_bytes(b"foreign file")
-
-    results = _run("safetensors", root, _fixture())
-    assert all(type(result) is Err for result in results)
-    assert "unrecognized agreement directory" in results[0].value.msg
-    assert not root.exists()
-    assert _files(scratch) == {"rank-0": b"foreign file"}
+    assert_ok(_run(fmt, root, _fixture()))
+    _assert_generation(fmt, root, _fixture(), world=2)
+    assert set(tmp_path.iterdir()) == {root, sibling}
+    assert sibling.stat().st_ino == inode
+    assert _files(sibling) == original
 
 
-@pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize("different_targets", [False, True])
-def test_duplicate_rank_zero_before_staging(
-    tmp_path, monkeypatch, fmt, different_targets
-):
-    fixture = _fixture(world=1)
-    call, options = _operation(fmt, False, fixture)
-    current = local()
-    absent, initialized = Event(), Event()
-    lexists, initialize = os.path.lexists, AgreementRecords._initialize
-    owner = tmp_path / ".checkpoint0.gdcp-vote" / ".owner"
-    staged = []
-
-    def pause_owner_lookup(path):
-        if path != owner or different_targets:
-            return lexists(path)
-        if current.index == 0 and not absent.is_set():
-            found = lexists(path)
-            absent.set()
-            assert initialized.wait(2)
-            return found
-        assert absent.wait(2)
-        return lexists(path)
-
-    def signal_initialized(records, fd):
-        initialize(records, fd)
-        initialized.set()
-
-    def save(ctx):
-        current.index = ctx.rank
-        root = tmp_path / f"checkpoint{ctx.rank if different_targets else 0}"
-        return call(
-            root, fixture.states[0], RankContext(0, 1, ctx.coordinator), **options
-        )
-
-    monkeypatch.setattr(os.path, "lexists", pause_owner_lookup)
-    monkeypatch.setattr(AgreementRecords, "_initialize", signal_initialized)
-    begin = _transaction.DirectoryTransaction.begin
-
-    def track_begin(transaction, planned):
-        staged.append(transaction.stage)
-        begin(transaction, planned)
-
-    monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
-    results = _parallel(save)
-    assert all(type(result) is Err for result in results), results
-    assert results[0].value.msg == results[1].value.msg
-    assert "duplicate rank 0" in results[0].value.msg
-    assert not staged
-    assert not list(tmp_path.iterdir())
+def test_unrelated_hidden_directory_can_be_checkpoint_target(tmp_path):
+    for name in (".hidden-a", ".hidden-b"):
+        root = tmp_path / name
+        assert_ok(_run("safetensors", root, _fixture()))
+        _assert_generation("safetensors", root, _fixture(), world=2)
+    assert {path.name for path in tmp_path.iterdir()} == {".hidden-a", ".hidden-b"}
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
@@ -267,7 +334,7 @@ def test_save_rejects_different_targets_before_staging(tmp_path, fmt):
 @pytest.mark.parametrize("fmt", _FORMATS)
 @pytest.mark.parametrize("loading", [False, True])
 @pytest.mark.parametrize("fault", [OSError, KeyboardInterrupt])
-def test_agreement_setup_failure_removes_created_entries(
+def test_agreement_setup_failure_leaves_no_entries(
     tmp_path, monkeypatch, fmt, loading, fault
 ):
     root = tmp_path / "checkpoint"
@@ -276,20 +343,22 @@ def test_agreement_setup_failure_removes_created_entries(
         assert_ok(_run(fmt, root, fixture))
     original = _files(tmp_path)
     call, options = _operation(fmt, loading, fixture)
-    scan = AgreementRecords._records
+    encode = desc.json_bytes
+    current = local()
 
-    def fail_first_scan(records):
-        monkeypatch.setattr(AgreementRecords, "_records", scan)
-        assert records.owner.is_file()
-        raise fault("injected agreement setup failure")
+    def fail_leader_description(fields):
+        if current.rank == 0:
+            raise fault("injected agreement setup failure")
+        return encode(fields)
 
     def attempt(ctx):
+        current.rank = ctx.rank
         try:
             return call(root, fixture.states[ctx.rank], ctx, **options)
         except KeyboardInterrupt as exc:
             return exc
 
-    monkeypatch.setattr(AgreementRecords, "_records", fail_first_scan)
+    monkeypatch.setattr(desc, "json_bytes", fail_leader_description)
     leader, peer = _parallel(attempt)
     assert type(leader) is (Err if fault is OSError else fault)
     assert type(peer) is Err
@@ -298,59 +367,55 @@ def test_agreement_setup_failure_removes_created_entries(
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize(
-    "scratch_name", [".checkpoint.gdcp-vote", ".gdcp-save-vote", ".gdcp-load-vote"]
-)
-@pytest.mark.parametrize("empty_owner", [False, True])
-def test_agreement_preserves_sibling_without_ownership(
-    tmp_path, fmt, scratch_name, empty_owner
-):
+@pytest.mark.parametrize("mode", ["single save", "collective save", "load"])
+@pytest.mark.parametrize("empty_file", [False, True])
+def test_operations_ignore_unrelated_empty_sibling(tmp_path, fmt, mode, empty_file):
     root = tmp_path / "checkpoint"
-    fixture = _fixture()
-    loading = scratch_name == ".gdcp-load-vote"
+    world = 1 if mode == "single save" else 2
+    fixture = _fixture(world=world)
+    loading = mode == "load"
     if loading:
         assert_ok(_run(fmt, root, fixture))
-    scratch = tmp_path / scratch_name
-    scratch.mkdir()
-    owner = scratch / ".owner"
-    if empty_owner:
-        owner.touch()
-    inode = scratch.stat().st_ino
-    original = _files(tmp_path)
+    sibling = tmp_path / ".unrelated"
+    sibling.mkdir()
+    if empty_file:
+        (sibling / "empty").touch()
+    inode = sibling.stat().st_ino
+    original = _files(sibling)
 
-    results = _run(fmt, root, fixture, loading=loading)
-
-    assert all(type(result) is Err for result in results), results
-    assert "unrecognized agreement directory" in results[0].value.msg
-    assert scratch.stat().st_ino == inode
-    assert _files(tmp_path) == original
-    assert set(tmp_path.iterdir()) == ({root, scratch} if loading else {scratch})
+    assert_ok(_run(fmt, root, fixture, loading=loading))
+    assert set(tmp_path.iterdir()) == {root, sibling}
+    assert sibling.stat().st_ino == inode
+    assert _files(sibling) == original
 
 
-def test_agreement_cleanup_finishes_after_interrupt(tmp_path, monkeypatch):
+def test_agreement_interrupt_does_not_prevent_retry(tmp_path, monkeypatch):
     root = tmp_path / "checkpoint"
     fixture = _fixture()
-    unlink = Path.unlink
-    interrupt = KeyboardInterrupt("interrupted agreement cleanup")
+    interrupt = KeyboardInterrupt("interrupted agreement preparation")
+    sha256 = core.sha256
+    current = local()
 
-    def unlink_owner(path, *args, **kwargs):
-        result = unlink(path, *args, **kwargs)
-        if path.parent.name == ".gdcp-save-vote" and path.name == ".owner":
+    def hash_description(data):
+        if current.rank == 0:
             raise interrupt
-        return result
+        return sha256(data)
 
     def save(ctx):
+        current.rank = ctx.rank
         try:
             return core.save(root, fixture.states[ctx.rank], ctx)
         except KeyboardInterrupt as exc:
             return exc
 
-    monkeypatch.setattr(Path, "unlink", unlink_owner)
-    leader, peer = _parallel(save)
+    with monkeypatch.context() as patch:
+        patch.setattr(core, "sha256", hash_description)
+        leader, peer = _parallel(save)
     assert leader is interrupt
-    assert type(peer) is Err
-    assert "agreement record" in peer.value.msg
+    assert type(peer) is Err and peer.value.operation == "checkpoint rank agreement"
     assert not list(tmp_path.iterdir())
+    assert_ok(_run("safetensors", root, fixture))
+    assert list(tmp_path.iterdir()) == [root]
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
@@ -498,7 +563,7 @@ def test_transaction_close_failure_returns_error_on_every_rank(tmp_path, monkeyp
 @pytest.mark.parametrize("fmt", [fmt for fmt, _ in _PAYLOADS])
 @pytest.mark.parametrize("owner", [0, 1])
 def test_rank_state_key_mismatch_fails_before_writing(
-    tmp_path, monkeypatch, fmt, owner
+    tmp_path, monkeypatch, caplog, fmt, owner
 ):
     root = tmp_path / "checkpoint"
     source = _fixture()
@@ -511,10 +576,18 @@ def test_rank_state_key_mismatch_fails_before_writing(
         return begin(transaction, planned)
 
     monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
-    results = _run(fmt, root, source)
+    with caplog.at_level("DEBUG", logger=core.__name__):
+        results = _run(fmt, root, source)
     assert all(type(result) is Err for result in results), results
     assert results[0].value.msg == results[1].value.msg
-    assert "extraé" in results[0].value.msg
+    assert "rank_state keys" in results[0].value.msg
+    logged = {
+        int(record.args[0]): json.loads(record.args[1])
+        for record in caplog.records
+        if record.msg == "Checkpoint agreement rank %s: %s"
+    }
+    assert logged[owner]["rank_state keys"] == ["extra_state", "extraé"]
+    assert logged[1 - owner]["rank_state keys"] == ["extra_state"]
     assert not writes
     assert not list(tmp_path.iterdir())
 
@@ -570,40 +643,31 @@ def test_save_agrees_on_world_before_staging(tmp_path, monkeypatch, fmt, worlds)
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)
-@pytest.mark.parametrize(
-    "ranks, conflict", [((0, 1, 1), False), ((0, 1, 1), True), ((0, 1, 0), False)]
-)
-def test_save_rejects_duplicate_ranks_before_staging(
-    tmp_path, monkeypatch, fmt, ranks, conflict
+@pytest.mark.parametrize("loading", [False, True])
+def test_agreement_rejects_different_keys_with_three_participants(
+    tmp_path, fmt, loading
 ):
-    source = _fixture(world=len(ranks))
-    call, options = _operation(fmt, False, source)
-    for state in source.states:
-        state.components.clear()
-        state.rank_state.clear()
-    if conflict:
-        source.states[2].rank_state["extra"] = b"different keys"
     root = tmp_path / "checkpoint"
-    started = []
-    begin = _transaction.DirectoryTransaction.begin
-    coordinator = ThreadCoordinator(len(ranks), timeout=2)
+    source = _fixture(world=3)
+    if loading:
+        assert_ok(_run(fmt, root, source))
+    original = _files(root)
+    source.states[2].rank_state["another_key"] = b"different keys"
+    call, options = _operation(fmt, loading, source)
+    coordinator = ThreadCoordinator(3, timeout=2)
 
-    def track_begin(transaction, planned):
-        started.append(transaction.rank)
-        return begin(transaction, planned)
+    def operate(rank):
+        return call(
+            root, source.states[rank], RankContext(rank, 3, coordinator), **options
+        )
 
-    def save_participant(index):
-        ctx = RankContext(ranks[index], 2, coordinator)
-        return call(root, source.states[index], ctx, **options)
-
-    monkeypatch.setattr(_transaction.DirectoryTransaction, "begin", track_begin)
-    with ThreadPoolExecutor(max_workers=len(ranks)) as pool:
-        results = list(pool.map(save_participant, range(len(ranks))))
-    assert not started
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(operate, range(3)))
     assert all(type(result) is Err for result in results), results
     assert len({result.value.msg for result in results}) == 1
-    assert f"duplicate rank {ranks[-1]}" in results[0].value.msg
-    assert not list(tmp_path.iterdir())
+    assert "rank_state keys" in results[0].value.msg
+    assert _files(root) == original
+    assert list(tmp_path.iterdir()) == ([root] if loading else [])
 
 
 @pytest.mark.parametrize("fmt", _FORMATS)

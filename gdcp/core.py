@@ -1,8 +1,10 @@
 """Collective, framework-neutral checkpoint save, load, and inspection."""
 
 import logging
+import os
 from contextlib import ExitStack
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,7 +20,6 @@ from gdtensor.builder import (
 from gdtensor.io import rank_load, rank_save
 
 from . import desc
-from ._agreement import agreement_bytes, agreement_records
 from ._transaction import PREFLIGHT, DirectoryTransaction
 from .backend import SafeTensorsBackend, _raise_io_interrupt
 from .policy import PerRankPolicy
@@ -108,7 +109,8 @@ def _validate_state(state, *, rank_state=None):
             raise TypeError(f"rank_state {name} must contain bytes")
 
 
-_AGREEMENT = "agree on checkpoint ranks, components and rank state"
+_AGREEMENT = "checkpoint rank agreement"
+_DIGEST_BYTES = 8
 
 
 def _agreement_error(message):
@@ -119,84 +121,58 @@ def _component_names(state):
     return tuple(component.name for component in state.components)
 
 
-def _claim_agreement(records, previous, rank, data):
-    if rank == 0 and previous is not None:
-        previous.recover()
-    return records.claim(rank, data)
+def _agree(ctx, prepare):
+    def describe():
+        value, fields = prepare()
+        canonical = desc.json_bytes(fields)
+        digest = int.from_bytes(sha256(canonical).digest()[:_DIGEST_BYTES], "big")
+        return value, fields, canonical, digest
 
-
-def _exchange_agreement(records, previous, ctx, data):
-    coordinator = ctx.coordinator
-    assert coordinator is not None
-    if coordinator.vote(ctx.rank != 0):
-        return _agreement_error("missing rank 0")
-    opened = _collective(ctx, _AGREEMENT, lambda: ctx.rank != 0 or records.acquire())
-    if type(opened) is Err:
-        return opened
-    if not coordinator.vote(opened.value is True):
-        if not coordinator.vote(not records.owned):
-            return _agreement_error("duplicate rank 0")
-        if coordinator.vote(not records.busy):
-            return _agreement_error(f"unrecognized agreement directory: {records.path}")
-        return _agreement_error("checkpoint agreement record is already in use")
-
-    claimed = _collective(
-        ctx, _AGREEMENT, lambda: _claim_agreement(records, previous, ctx.rank, data)
-    )
-    if type(claimed) is Err:
-        return claimed
-    unreadable = _agreement_error("cannot read or verify checkpoint agreement record")
-    compared = _collective(
-        ctx, _AGREEMENT, lambda: records.compare(ctx.rank, data, claimed.value)
-    )
-    if type(compared) is Err:
-        return unreadable
-    if coordinator.vote(compared.value is True):
-        return Ok(None)
-
-    diagnosed = _collective(ctx, _AGREEMENT, records.mismatch)
-    return unreadable if type(diagnosed) is Err else _agreement_error(diagnosed.value)
-
-
-def _prepare_agreement(path, ctx, components, rank_state, loading):
-    records, previous, target = agreement_records(path, loading=loading)
-    return records, previous, agreement_bytes(ctx, components(), rank_state, target)
-
-
-def _agree(path, ctx, components, rank_state, *, loading=False):
-    if ctx.coordinator is None:
-        return _collective(
-            ctx, _AGREEMENT, lambda: _recover_agreement(path, ctx, loading)
-        )
-    prepared = _collective(
-        ctx,
-        _AGREEMENT,
-        lambda: _prepare_agreement(path, ctx, components, rank_state, loading),
-    )
+    prepared = _collective(ctx, _AGREEMENT, describe)
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    records, previous, data = prepared.value
-    try:
-        agreed = _exchange_agreement(records, previous, ctx, data)
-    finally:
-        closed = _collective(ctx, "remove checkpoint agreement record", records.close)
-    return closed if type(agreed) is Ok else agreed
+    value, fields, canonical, digest = prepared.value
+    coordinator = ctx.coordinator
+    if coordinator is None:
+        return Ok(value)
+    reference = 0
+    for bit in range(_DIGEST_BYTES * 8):
+        mask = 1 << bit
+        if coordinator.vote(ctx.rank != 0 or bool(digest & mask)):
+            reference |= mask
+    if coordinator.vote(digest == reference):
+        return Ok(value)
+    _LOG.debug("Checkpoint agreement rank %s: %s", ctx.rank, canonical.decode())
+    return _agreement_error(f"ranks disagree on {', '.join(fields)}")
 
 
-def _recover_agreement(path, ctx, loading):
-    _validate_context(ctx)
-    records, previous, _ = agreement_records(path, loading=loading)
-    records.recover()
-    if previous is not None:
-        previous.recover()
+def _backend_format(backend):
+    return getattr(backend, "format", "safetensors")
 
 
-def _agree_load(path, state, ctx):
-    # Rank-local copies can have different names under the same shared parent.
-    return _agree(
-        path, ctx, lambda: _component_names(state), state.rank_state, loading=True
-    )
+def _load_options(fmt, preflight, validate_groups, *, optional=False, **options):
+    return {
+        "format": fmt,
+        "preflight": preflight is not None,
+        "validate_optimizer_groups": validate_groups is not None,
+        "optional_rank_state": bool(optional),
+        **options,
+    }
+
+
+def _agree_load(state, ctx, format_options):
+    def prepare():
+        _validate_context(ctx)
+        options = format_options()
+        return options, {
+            "world size": ctx.world_size,
+            "requested checkpoint component sequence": _component_names(state),
+            "rank_state keys": sorted(state.rank_state),
+            "format options": options,
+        }
+
+    return _agree(ctx, prepare)
 
 
 def _compute_view(component, tensor_ids=None):
@@ -439,14 +415,18 @@ def _save_staged(transaction, state, agreement, inventory, policy, backend):
     )
 
 
-def _validate_save(state, ctx):
+def _prepare_save_agreement(path, state, ctx, format_options):
+    _validate_context(ctx)
     rank_state, components = dict(state.rank_state), _component_names(state)
     _validate_state(state, rank_state=rank_state)
-    return (
-        RankContext(ctx.rank, ctx.world_size, ctx.coordinator),
-        rank_state,
-        components,
-    )
+    snapshot = RankContext(ctx.rank, ctx.world_size, ctx.coordinator)
+    return (snapshot, rank_state, components), {
+        "world size": snapshot.world_size,
+        "checkpoint component sequence": components,
+        "rank_state keys": sorted(rank_state),
+        "resolved checkpoint save target": os.path.realpath(path),
+        "format options": format_options(),
+    }
 
 
 def _validate_rank_state_inventory(path, inventory):
@@ -504,18 +484,15 @@ class _SaveAgreement:
         return checked if type(checked) is Err else result
 
 
-def _transactional_save(path, state, context, action):
-    validated = _collective(
-        context, "validate save", lambda: _validate_save(state, context)
+def _transactional_save(path, state, context, action, *, format_options):
+    agreed = _agree(
+        context, lambda: _prepare_save_agreement(path, state, context, format_options)
     )
-    if type(validated) is Err:
-        return validated
-    assert validated.value is not None
-    ctx, rank_state, components = validated.value
-    agreement = _SaveAgreement(state, context, ctx, rank_state, components)
-    agreed = _agree(path, ctx, lambda: agreement.components, rank_state)
     if type(agreed) is Err:
         return agreed
+    assert agreed.value is not None
+    ctx, rank_state, components = agreed.value
+    agreement = _SaveAgreement(state, context, ctx, rank_state, components)
     inventory = agreement.phase(
         "prepare rank state inventory",
         lambda: _rank_state_inventory(rank_state, ctx),
@@ -565,6 +542,7 @@ def save(path, state, ctx, *, policy=None, backend=None) -> Result[None]:
         lambda transaction, agreement, inventory: _save_staged(
             transaction, state, agreement, inventory, policy, backend
         ),
+        format_options=lambda: {"format": _backend_format(backend)},
     )
 
 
@@ -866,13 +844,46 @@ def load(
     _optional_rank_state=False,
 ) -> Result[None]:
     """Restore requested components after all strict metadata checks pass."""
-    agreed = _agree_load(path, state, ctx)
+    agreed = _agree_load(
+        state,
+        ctx,
+        lambda: _load_options(
+            _backend_format(backend),
+            _preflight,
+            _validate_groups,
+            optional=_optional_rank_state,
+            strict=strict is True,
+        ),
+    )
     if type(agreed) is Err:
         return agreed
+    return _load_agreed(
+        path,
+        state,
+        ctx,
+        backend=backend,
+        strict=strict,
+        preflight=_preflight,
+        validate_groups=_validate_groups,
+        optional_rank_state=_optional_rank_state,
+    )
+
+
+def _load_agreed(
+    path,
+    state,
+    ctx,
+    *,
+    backend=None,
+    strict=True,
+    preflight=None,
+    validate_groups=None,
+    optional_rank_state=False,
+):
     prepared = _collective(
         ctx,
         "prepare load",
-        lambda: _prepare_load(path, state, ctx, backend, strict, _validate_groups),
+        lambda: _prepare_load(path, state, ctx, backend, strict, validate_groups),
     )
     if type(prepared) is Err:
         return prepared
@@ -886,7 +897,7 @@ def load(
             description.rank_state,
             ctx,
             saved_world=description.world_size,
-            optional=_optional_rank_state,
+            optional=optional_rank_state,
         )
 
-    return _load_components(components, ctx, state, load_rank_state, _preflight)
+    return _load_components(components, ctx, state, load_rank_state, preflight)

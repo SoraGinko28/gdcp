@@ -194,6 +194,7 @@ def _save_hf(path, model_or_state, dtype, max_shard_size, ctx):
             ctx,
             max_shard_size=max_shard_size,
             _write_metadata=lambda stage: _write_config(stage, model, dtype, ctx),
+            _dtype_option=dtype,
         )
     )
 
@@ -238,4 +239,4 @@ def load_hf(path, model_or_state, dtype=None):
         ctx,
         lambda: _weights(model_or_state, dtype, ctx, headers=_model_headers(path)),
     )
-    _unwrap(load_state(path, state, ctx))
+    _unwrap(load_state(path, state, ctx, _dtype_option=dtype))

@@ -125,7 +125,9 @@ def test_native_dcp_load_without_manifest(tmp_path):
     assert_values(restored, source)
 
 
-@pytest.mark.parametrize("failure", ["rank_state", "lookup", "mixed_formats"])
+@pytest.mark.parametrize(
+    "failure", ["rank_state", "mixed_rank_state", "lookup", "mixed_formats"]
+)
 def test_native_dcp_preflight_failure_votes_on_every_rank(
     tmp_path, monkeypatch, failure
 ):
@@ -145,8 +147,10 @@ def test_native_dcp_preflight_failure_votes_on_every_rank(
             raise OSError("injected manifest lookup failure")
         return failure == "mixed_formats"
 
-    if failure == "rank_state":
+    if failure in ("rank_state", "mixed_rank_state"):
         target.states[0].rank_state["extra_state"] = b""
+    if failure == "rank_state":
+        target.states[1].rank_state["extra_state"] = b""
     coordinator = ThreadCoordinator(2, timeout=2)
     monkeypatch.setattr(Path, "is_file", rank_local_is_file)
 
@@ -160,10 +164,13 @@ def test_native_dcp_preflight_failure_votes_on_every_rank(
     assert type(rank_zero) is Err and type(rank_one) is Err, results
     expected = {
         "rank_state": "native DCP has no GDCP per-rank extra_state",
+        "mixed_rank_state": "ranks disagree",
         "lookup": "injected manifest lookup failure",
-        "mixed_formats": "disagree on DCP load format",
+        "mixed_formats": "format options",
     }
     assert expected[failure] in rank_zero.value.msg
+    if failure != "lookup":
+        assert rank_zero.value.msg == rank_one.value.msg
 
 
 def test_dcp_save_close_failure_votes_on_every_rank(tmp_path, monkeypatch):

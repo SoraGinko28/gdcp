@@ -462,7 +462,9 @@ def _finalize(path, ctx, inventory):
     (Path(path) / desc.PENDING_NAME).unlink()
 
 
-def save_state(path, state, ctx, *, max_shard_size=None, _write_metadata=None):
+def save_state(
+    path, state, ctx, *, max_shard_size=None, _write_metadata=None, _dtype_option=None
+):
     """Save HF files in a sibling, preserving the old checkpoint on failure."""
     return core._transactional_save(
         path,
@@ -476,6 +478,11 @@ def save_state(path, state, ctx, *, max_shard_size=None, _write_metadata=None):
             max_shard_size,
             _write_metadata,
         ),
+        format_options=lambda: {
+            "format": "hf",
+            "max_shard_size": shard_size_bytes(max_shard_size),
+            "dtype": _dtype_option,
+        },
     )
 
 
@@ -796,9 +803,20 @@ def load_state(
     _preflight=None,
     _validate_groups=None,
     _optional_rank_state=False,
+    _dtype_option=None,
 ):
     """Load native HF headers directly, including an optional optimizer sidecar."""
-    agreed = core._agree_load(path, state, ctx)
+    agreed = core._agree_load(
+        state,
+        ctx,
+        lambda: core._load_options(
+            "hf",
+            _preflight,
+            _validate_groups,
+            optional=_optional_rank_state,
+            dtype=_dtype_option,
+        ),
+    )
     if type(agreed) is Err:
         return agreed
     if not state.components:

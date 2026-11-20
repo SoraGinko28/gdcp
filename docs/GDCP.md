@@ -41,29 +41,21 @@ All ranks must use the same FSDP2 save format and agree on whether an HF save
 exports weights only or full state. All three formats require the same ordered
 component list on every rank during load and before staging a save.
 
-When a coordinator is present, GDCP checks the live world size, unique rank
-IDs, ordered component names, and rank-state keys before payload I/O. All ranks
-use one agreement directory in the resolved target's shared parent. Saves use
-the reserved `.gdcp-save-vote` directory and also check that ranks agree on the
-resolved target name. Loads use `.gdcp-load-vote` and compare the requested
-state, which supports partial restores, native checkpoints, and rank-local
-copies with different names under the same parent. Each rank creates a claim
-and compares its checksummed description with rank 0's. The number of votes
-in this phase is independent of the number of ranks and the data being compared.
+Before payload I/O, coordinated saves and loads each use one digest to compare
+the live world size, ordered component names, rank-state keys, and built-in
+format options. Saves also compare the resolved target; loads compare the
+requested state and can read rank-local copies at different paths. Each rank
+hashes its canonical description with SHA-256, and the coordinator broadcasts
+the first 64 bits of rank 0's digest. Preparation, broadcast, and comparison
+take 66 votes regardless of name lengths, key counts, or world size. On a
+mismatch, all ranks report the fields compared and log their own description
+at debug level.
 
-Coordinated saves and loads need a writable shared target parent. The filesystem
-must provide exclusive file creation, advisory file locks across participating
-nodes, and visibility of fsynced files and directory entries to all ranks after
-a coordinator vote. A rank that cannot read or verify a record votes to fail the
-operation. Rank 0 holds the agreement directory's owner lock through cleanup.
-Overlapping save agreement phases or overlapping load agreement phases in one
-parent can fail if the directory is already in use. GDCP removes its records
-before payload I/O and cleans up entries it created if setup fails or is
-interrupted. To recover a pre-existing agreement directory, GDCP requires a
-valid owner marker and a lock it can acquire. This also applies to legacy
-`.NAME.gdcp-vote` save directories. GDCP preserves unrecognized directories,
-including empty directories and directories with an empty owner marker, and
-returns an error.
+Agreement does not write any files. Loads can read from a read-only checkpoint
+and parent. Independent jobs can load the same checkpoint or checkpoints in
+the same parent concurrently. Independent saves to different targets in one
+parent do not share agreement state; each still needs a writable location for
+its own checkpoint transaction.
 
 Weights-only HF saves apply `fp32` or `bf16` conversion to floating-point tensors.
 Integer and boolean buffers round-trip bit for bit into targets of the same dtype.
@@ -210,12 +202,9 @@ depend on rerunning the current storage policy.
 Optimizer non-tensor values live in `optimizer/objects.json`. JSON container
 tags preserve tuple/list distinctions. Extra state is stored with `torch.save`
 in `extra_state/extra_state_rank_{rank}.pt` and loaded with pickle enabled;
-only load trusted checkpoints. Before staging a save, GDCP checks that each
-rank ID is claimed once and that all participants agree on the world size and
-the set of rank-state keys. If keys differ at that point, every rank reports
-the same error naming a differing key. GDCP writes each rank's snapshot of its
-rank state and checks the rank configuration, component sequence, and key sets
-between save phases.
+only load trusted checkpoints. GDCP writes each rank's snapshot of its rank
+state and checks the rank configuration, component sequence, and key sets
+between save phases using coordinator votes alone.
 A detected change returns the same error on every rank, even if a callback
 restores the original value. GDCP also checks that every declared file exists
 before publication. A failed check preserves any previous checkpoint.
@@ -282,6 +271,8 @@ environment and exact verification commands are recorded in the task report.
 
 ## Known limitations
 
+- The process group or coordinator must supply unique rank IDs, including
+  rank 0. GDCP agrees on world size but does not census rank IDs.
 - Concurrent writers to the checkpoint target during a save are unsupported. If
   a second process creates, replaces, or swaps an entry in the target or its
   obsolete sibling during publication or cleanup, that entry can be lost or

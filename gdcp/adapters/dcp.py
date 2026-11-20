@@ -1098,19 +1098,26 @@ def _has_manifest(path):
 
 
 def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
-    manifest = core._collective_choice(
-        ctx, "DCP load format", lambda: _has_manifest(path), (True, False)
+    agreed = core._agree_load(
+        state,
+        ctx,
+        lambda: core._load_options(
+            "distcp" if _has_manifest(path) else "native DCP",
+            _preflight,
+            _validate_groups,
+        ),
     )
-    if type(manifest) is Err:
-        return manifest
-    if manifest.value:
-        return core.load(
+    if type(agreed) is Err:
+        return agreed
+    assert agreed.value is not None
+    if agreed.value["format"] == "distcp":
+        return core._load_agreed(
             path,
             state,
             ctx,
             backend=DcpBackend(),
-            _preflight=_preflight,
-            _validate_groups=_validate_groups,
+            preflight=_preflight,
+            validate_groups=_validate_groups,
         )
     unsupported = core._error(
         "validate native DCP rank state",
@@ -1123,9 +1130,6 @@ def load(path, state, ctx, *, _preflight=None, _validate_groups=None):
     )
     if type(rank_state) is Err:
         return unsupported
-    agreed = core._agree_load(path, state, ctx)
-    if type(agreed) is Err:
-        return agreed
     metadata = core._collective(
         ctx,
         "validate native DCP metadata",
