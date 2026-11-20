@@ -156,7 +156,7 @@ def _tensor_from_description(info, world_size):
     return NamedDTensor(info["id"], tensor, info.get("aliases", []))
 
 
-def _layout_file(base, ids, slots, rectangles=None):
+def _layout_file(base, ids, orders, slots, rectangles=None):
     if rectangles is not None:
         return DisjointStorageMeshList(
             [
@@ -165,7 +165,6 @@ def _layout_file(base, ids, slots, rectangles=None):
             ],
             ids,
         )
-    orders = {tensor_id: order for order, tensor_id in enumerate(ids)}
     meshes = [
         SlicedMesh(
             base,
@@ -185,29 +184,33 @@ def rebuild_component(component_desc, world_size):
         ]
     )
     ids = [named.global_tensor_id for named in table.named_d_tensors]
-    if len(set(ids)) != len(ids):
+    orders = {tensor_id: order for order, tensor_id in enumerate(ids)}
+    if len(orders) != len(ids):
         raise ValueError("duplicate tensor id in manifest")
     base = SlotOuterProductMesh(
         ArrangedMesh(TensorCount(len(ids))), ArrangedMesh(WorldSize(world_size))
     )
     entries, paths = {}, {}
     for name, info in component_desc["files"].items():
-        _add_layout_file(base, ids, name, info, entries, paths)
+        _add_layout_file(base, ids, orders, name, info, entries, paths)
     return table, PhysicalLayoutTable(component_desc["format"], entries, paths)
 
 
-def _add_layout_file(base, ids, name, info, entries, paths):
+def _add_layout_file(base, ids, orders, name, info, entries, paths):
     _safe_relative(name)
     slots = info["slots"]
     if not slots:
         raise ValueError(f"{name}: file has no slots")
-    group = _layout_file(base, ids, slots, info.get("rectangles"))
+    for tensor_id, _rank in slots:
+        if tensor_id not in orders:
+            raise ValueError(f"{name}: file slot references missing tensor {tensor_id}")
+    group = _layout_file(base, ids, orders, slots, info.get("rectangles"))
     positions = [TensorComponentPos(tensor_id, rank) for tensor_id, rank in slots]
     for pos in positions:
         if pos in entries:
             raise ValueError(f"{pos.tensor_id}: duplicate file slot")
         entries[pos] = group
-    leader = min(positions, key=lambda pos: (ids.index(pos.tensor_id), pos.rank))
+    leader = min(positions, key=lambda pos: (orders[pos.tensor_id], pos.rank))
     paths[leader] = name
 
 

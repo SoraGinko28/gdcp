@@ -746,6 +746,33 @@ def test_invalid_fsdp2_load_arguments_vote_on_every_rank(tmp_path, monkeypatch):
         list(pool.map(load, range(2)))
 
 
+def test_rejected_save_preserves_first_adamw_step(tmp_path, monkeypatch):
+    current = local()
+    coordinator = ThreadCoordinator(2, timeout=5)
+    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+
+    def save(rank):
+        current.ctx = RankContext(rank, 2, coordinator)
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        with pytest.raises(RuntimeError, match="ranks disagree on .*format options"):
+            FSDP2Checkpointer.save(
+                tmp_path / "checkpoint",
+                {"model": model, "optimizer": optimizer},
+                checkpoint_format=("safetensors", "dcp")[rank],
+            )
+        assert not optimizer.state
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        assert all(fields["step"].item() == 1 for fields in optimizer.state.values())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(save, range(2)))
+    assert not list(tmp_path.iterdir())
+
+
 def _range(key, offset, size):
     return SimpleNamespace(global_tensor_id=key, global_tensor_offset=offset, size=size)
 

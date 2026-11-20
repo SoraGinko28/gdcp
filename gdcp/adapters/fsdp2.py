@@ -507,18 +507,43 @@ def save_checkpoint(
         return path, _save_route(checkpoint_format, hf_dtype, max_shard_size)
 
     root, route = _collective(ctx, prepare)
-    state, write_metadata = _collective(
-        ctx, lambda: _prepare_save_state(checkpoint_state, ctx, route, hf_dtype)
-    )
-    state.global_steps = global_steps
-    agreement = _unwrap(
-        core._agree_save(
-            root,
-            state,
-            ctx,
-            lambda: _save_agreement_options(route, max_shard_size, hf_dtype),
+
+    def options():
+        return _save_agreement_options(route, max_shard_size, hf_dtype)
+
+    def describe():
+        if route == "HF weights":
+            components, keys = ("model",), ()
+        else:
+            state_keys = checkpoint_state if isinstance(checkpoint_state, dict) else {}
+            components = tuple(
+                name for name in ("model", "optimizer") if name in state_keys
+            )
+            keys = ("extra_state",) if "extra_state" in state_keys else ()
+        return core._save_request(root, ctx, components, keys, options)
+
+    snapshot, components, keys = _unwrap(core._agree(ctx, describe))
+
+    def materialize():
+        # Reading a fresh AdamW state dict can call optimizer.step().
+        state, metadata = _prepare_save_state(
+            checkpoint_state, snapshot, route, hf_dtype
         )
-    )
+        state.global_steps = global_steps
+        rank_state = dict(state.rank_state)
+        core._validate_state(state, rank_state=rank_state)
+        if (
+            core._component_names(state) != components
+            or tuple(sorted(rank_state)) != keys
+        ):
+            raise ValueError(
+                "checkpoint components or rank_state keys changed during state preparation"
+            )
+        return core._SaveAgreement(
+            state, ctx, snapshot, rank_state, components
+        ), metadata
+
+    agreement, write_metadata = _collective(ctx, materialize)
     if route == "safetensors":
         result = core._save_agreed(root, agreement)
     elif route == "dcp":
@@ -529,7 +554,7 @@ def save_checkpoint(
         result = hf._save_agreed(root, agreement, max_shard_size, write_metadata)
     _unwrap(result)
     if route != "HF weights":
-        _collective(ctx, lambda: _finish(state))
+        _collective(ctx, lambda: _finish(agreement.state))
 
 
 def _prepare_save_state(checkpoint_state, ctx, route, dtype):

@@ -50,7 +50,8 @@ SHA-256, and the coordinator broadcasts
 the first 64 bits of rank 0's digest. Preparation, broadcast, and comparison
 take 66 votes regardless of name lengths, key counts, or world size. On a
 mismatch, all ranks report the fields compared and log their own description
-at debug level.
+at debug level. FSDP2 compares the save request before extracting model or
+optimizer state. A disagreement leaves a fresh AdamW optimizer at its initial step.
 
 Agreement does not write any files. Loads can read from a read-only checkpoint
 and parent. Independent jobs can load the same checkpoint or checkpoints in

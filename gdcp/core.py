@@ -415,18 +415,26 @@ def _save_staged(transaction, state, agreement, inventory, policy, backend):
     )
 
 
-def _prepare_save_agreement(path, state, ctx, format_options):
+def _save_request(path, ctx, components, rank_keys, format_options):
     _validate_context(ctx)
-    rank_state, components = dict(state.rank_state), _component_names(state)
-    _validate_state(state, rank_state=rank_state)
     snapshot = RankContext(ctx.rank, ctx.world_size, ctx.coordinator)
-    return (snapshot, rank_state, components), {
+    keys = tuple(sorted(rank_keys))
+    return (snapshot, components, keys), {
         "world size": snapshot.world_size,
         "checkpoint component sequence": components,
-        "rank_state keys": sorted(rank_state),
+        "rank_state keys": keys,
         "resolved checkpoint save target": os.path.realpath(path),
         "format options": format_options(),
     }
+
+
+def _prepare_save_agreement(path, state, ctx, format_options):
+    rank_state, components = dict(state.rank_state), _component_names(state)
+    _validate_state(state, rank_state=rank_state)
+    (snapshot, _, _), fields = _save_request(
+        path, ctx, components, rank_state, format_options
+    )
+    return (snapshot, rank_state, components), fields
 
 
 def _validate_rank_state_inventory(path, inventory):
