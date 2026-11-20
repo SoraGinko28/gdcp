@@ -173,7 +173,7 @@ path is running**. Concurrent saves and loads during overwrite remain unsupporte
 | Target present, backup present | Refuse and describe all three paths. Never automatically delete a backup. |
 | Target absent, complete backup present | Rename backup back to target and log a warning, then apply the stage rules. This restores the old checkpoint; a valid stage journal restores its foreign entries too. |
 | Target absent, incomplete/unrecognized backup | Refuse; retain everything for inspection. |
-| Empty stage while a journal exists at target | Remove the empty stage and verify the published journal before removing it. |
+| Empty stage while a journal exists at target | Validate the published generation and its journal first. Keep the stage for inspection if it identifies the old directory left by exchange. Otherwise remove the empty cleanup stage and the verified journal. |
 | Nonempty stage without its own journal while a journal exists at target | Retain the stage and refuse recovery because it may be the old generation. |
 | Empty stage, or only the initializing pending-marker temporary file | Remove the provably unpublished initialization with a warning and proceed. |
 | Pending stage without a journal (legacy attempt) | Remove with a warning and proceed. Legacy pending stages could only contain unpublished checkpoint output. |

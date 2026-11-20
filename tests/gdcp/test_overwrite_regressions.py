@@ -992,8 +992,9 @@ def test_first_save_killed_after_publish_recovers_root_journal(
 
 @pytest.mark.parametrize("fmt", _FORMATS)
 @pytest.mark.parametrize("invalid", ["wrong_identity", "invalid_json"])
+@pytest.mark.parametrize("empty_stage", [False, True])
 def test_invalid_root_journal_stays_foreign_and_blocks_payload(
-    tmp_path, monkeypatch, fmt, invalid
+    tmp_path, monkeypatch, fmt, invalid, empty_stage
 ):
     root = tmp_path / "checkpoint"
     old = _fixture()
@@ -1010,6 +1011,10 @@ def test_invalid_root_journal_stays_foreign_and_blocks_payload(
         else desc.json_bytes(journal)
     )
     desc.atomic_write(root / ".gdcp_transaction", data)
+    stage = _transaction.DirectoryTransaction(root, 0).stage
+    if empty_stage:
+        stage.mkdir()
+    stage_identity = _path_identity(stage) if empty_stage else None
     before = _files(root)
     writes = []
     monkeypatch.setattr(FileIO, "pwrite", lambda *args: writes.append(args))
@@ -1017,7 +1022,11 @@ def test_invalid_root_journal_stays_foreign_and_blocks_payload(
     assert not writes
     assert _files(root) == before
     _assert_generation(fmt, root, old)
-    _assert_only_target(tmp_path)
+    if empty_stage:
+        assert _path_identity(stage) == stage_identity
+        assert set(tmp_path.iterdir()) == {root, stage}
+    else:
+        _assert_only_target(tmp_path)
 
 
 @pytest.mark.parametrize("existing", [False, True])

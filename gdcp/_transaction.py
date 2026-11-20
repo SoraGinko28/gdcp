@@ -371,9 +371,9 @@ class DirectoryTransaction:
             "restored complete checkpoint backup %s to %s", self.backup, self.root
         )
 
-    def _recover_published_journal(self):
+    def _recover_published_journal(self, *, stage_present=False):
         try:
-            self._recover_root_journal()
+            self._recover_root_journal(stage_present=stage_present)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self._refuse_recovery(f"cannot recover {self.root / JOURNAL_NAME}: {exc};")
 
@@ -387,7 +387,7 @@ class DirectoryTransaction:
             self._refuse_recovery()
         journal = self.stage / JOURNAL_NAME
         if not journal.is_file() and os.path.lexists(self.root / JOURNAL_NAME):
-            self._recover_empty_cleanup_stage()
+            self._recover_published_journal(stage_present=True)
             return
         try:
             proven = self._recover_foreign(journal) if journal.is_file() else False
@@ -403,13 +403,6 @@ class DirectoryTransaction:
         _sync_directory(self.stage.parent)
         _LOG.warning("removed unpublished checkpoint stage %s", self.stage)
 
-    def _recover_empty_cleanup_stage(self):
-        if any(self.stage.iterdir()):
-            self._refuse_recovery()
-        # Publication can recreate an empty stage for journal cleanup.
-        self.stage.rmdir()
-        self._recover_published_journal()
-
     def _foreign_record(self, item):
         name = Path(item["path"])
         if name.is_absolute() or ".." in name.parts or name == Path("."):
@@ -421,9 +414,12 @@ class DirectoryTransaction:
         if _entry_identity(self.root / name) != expected:
             self._refuse_recovery()
 
-    def _recover_root_journal(self):
+    def _recover_root_journal(self, *, stage_present=False):
         journal = self.root / JOURNAL_NAME
-        if not journal.is_file() or not _ownership.complete(self.root):
+        published = journal.is_file() and _ownership.complete(self.root)
+        if stage_present and not published:
+            self._refuse_recovery()
+        if not published:
             return
         with journal.open("rb") as file:
             record = json.load(file)
@@ -434,9 +430,20 @@ class DirectoryTransaction:
             self._refuse_recovery()
         for item in record["foreign"]:
             self._check_foreign_at_root(item)
+        if stage_present:
+            self._remove_cleanup_stage(record["old_identity"])
         self._remove_journal(journal, (entry.st_dev, entry.st_ino))
         _sync_directory(self.root)
         _LOG.warning("removed published checkpoint transaction journal %s", journal)
+
+    def _remove_cleanup_stage(self, old_identity):
+        # Exchange leaves the old directory at stage, even after every foreign
+        # entry has been carried to the new root.
+        if old_identity is not None and tuple(old_identity) == _identity(self.stage):
+            self._refuse_recovery("stage is the exchanged old directory;")
+        if any(self.stage.iterdir()):
+            self._refuse_recovery()
+        self.stage.rmdir()
 
     def _recover_foreign(self, journal):
         record = json.loads(journal.read_bytes())
