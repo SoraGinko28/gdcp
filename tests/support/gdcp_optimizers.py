@@ -116,9 +116,12 @@ def optimizer_for(kind, model):
     return LayoutOptimizer(params)
 
 
-def model_for(mesh=None, value=0):
+def model_for(mesh=None, value=0, *, device=None):
     model = torch.nn.Linear(
-        4, 8, bias=False, device=mesh.device_type if mesh is not None else "cpu"
+        4,
+        8,
+        bias=False,
+        device=mesh.device_type if mesh is not None else device or "cpu",
     )
     with torch.no_grad():
         model.weight.copy_(torch.arange(32).reshape(8, 4) / 32 + value)
@@ -156,11 +159,13 @@ def _assert_field(field, actual, expected):
 
 
 def roundtrip(root, mesh, kind, fmt):
-    source, oracle = model_for(mesh), model_for()
+    source = model_for(mesh)
+    oracle = model_for(device=source.weight.device)
     saved, oracle_optimizer = optimizer_for(kind, source), optimizer_for(kind, oracle)
     for step in range(2):
         update(source, saved, step)
         update(oracle, oracle_optimizer, step)
+    assert_equal(source, saved, oracle, oracle_optimizer)
     path = Path(root) / kind / fmt
     FSDP2Checkpointer.save(
         path, {"model": source, "optimizer": saved}, checkpoint_format=fmt
@@ -175,9 +180,12 @@ def roundtrip(root, mesh, kind, fmt):
     FSDP2Checkpointer.load(path, {"model": target, "optimizer": restored})
     del restored.step
     torch.testing.assert_close(dense(target.weight.grad), gradient, rtol=0, atol=0)
+    assert_equal(target, restored, source, saved)
     assert_equal(target, restored, oracle, oracle_optimizer)
+    update(source, saved, 2)
     update(target, restored, 2)
     update(oracle, oracle_optimizer, 2)
+    assert_equal(target, restored, source, saved)
     assert_equal(target, restored, oracle, oracle_optimizer)
 
 
