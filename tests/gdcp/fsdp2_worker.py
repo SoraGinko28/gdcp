@@ -506,6 +506,12 @@ def hsdp_tp_source(args):
 hsdp_tp_expand = hsdp_tp_contract = hsdp_tp_source
 
 
+def optimizer_matrix(args):
+    from tests.support.gdcp_optimizers import optimizer_matrix as run
+
+    run(args)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -522,6 +528,7 @@ def main():
             "hsdp",
             "param_layouts",
             "dp_tp",
+            "optimizer_matrix",
             "hsdp_tp",
             "lazy_adamw",
             "hsdp_tp_source",

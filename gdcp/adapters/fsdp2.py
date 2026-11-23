@@ -3,9 +3,10 @@
 import io
 from contextlib import ExitStack, nullcontext
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import cache, partial
 from hashlib import sha256
+from math import prod
 from typing import cast
 
 import torch
@@ -30,6 +31,7 @@ from torch.distributed.tensor import (
     Shard as TorchShard,
 )
 
+
 from torch.distributed.tensor.placement_types import _StridedShard
 
 from gdtensor.builder import (
@@ -52,6 +54,7 @@ from .. import _hdfs, core, desc, hf
 from ..checkpointer import _save_route
 from ..state import CheckpointState, Component, RankContext
 from .torch_access import TorchAccessor, _local_tensor
+from . import optimizer_state as _optim
 
 _NO_EXTRA_STATE = object()
 _DTYPES = {
@@ -137,8 +140,10 @@ def _validate_state(state, *, common_only):
         raise ValueError("optimizer requires model for parameter names")
     if "model" in state and not isinstance(state["model"], FSDPModule):
         raise TypeError("model must be one FSDP2 fully_shard module")
-    if "optimizer" in state and not isinstance(state["optimizer"], torch.optim.AdamW):
-        raise NotImplementedError("optimizer must be torch.optim.AdamW or a subclass")
+    if "optimizer" in state and not isinstance(
+        state["optimizer"], torch.optim.Optimizer
+    ):
+        raise TypeError("optimizer must be a torch.optim.Optimizer")
 
 
 def _ordered_shards(key, tensor):
@@ -295,8 +300,38 @@ def _select_submesh_writers(state, ctx):
         raise ValueError("ranks disagree on parameter mesh checkpoint keys")
     members = range(ctx.world_size)
     for key, (layout, _, (_, shape)) in entries.items():
+        _optimizer_submesh_metadata(state, key, reports, ctx)
         layout.mesh = _local_mesh(
             _writer_mesh(key, reports, members), shape, ctx.world_size
+        )
+
+
+def _optimizer_submesh_metadata(state, key, reports, ctx):
+    component_name, tensor_id = key
+    if component_name != "optimizer":
+        return
+    component = next(
+        component for component in state.components if component.name == component_name
+    )
+    schema = component.objects.get(_optim.SCHEMA_KEY)
+    if schema is None:
+        return
+    fields = schema["fields"]
+    names = sorted(fields, key=len, reverse=True)
+    name = next(name for name in names if tensor_id.startswith(f"state.{name}."))
+    field = tensor_id[len(name) + 7 :]
+    record = fields[name][field]["layout"]
+    if record["kind"] == "independent":
+        record["checkpoint_ranks"] = list(ctx.global_ranks or range(ctx.world_size))
+        record["mesh_groups"] = sorted(
+            {
+                tuple(
+                    (ctx.global_ranks or tuple(range(ctx.world_size)))[rank]
+                    for rank in ranks
+                )
+                for report in reports
+                for ranks, _ in [report[key]]
+            }
         )
 
 
@@ -330,6 +365,8 @@ def _component(name, tensors, objects, ctx, scalar_meshes=None):
 
 def _optimizer_values(state):
     tensors, objects, paths = {}, {"param_groups": state["param_groups"]}, {}
+    if _optim.SCHEMA_KEY in state:
+        objects[_optim.SCHEMA_KEY] = state[_optim.SCHEMA_KEY]
     for fqn, fields in state["state"].items():
         _optimizer_fields(fqn, fields, tensors, objects, paths)
     return tensors, objects, paths
@@ -365,17 +402,15 @@ def _model_values(model):
 
 
 def _optimizer_tensor(fqn, field, tensor, parameter):
-    if tensor.ndim == 0:
-        if isinstance(tensor, DTensor) and not all(
-            isinstance(placement, TorchReplicate) for placement in tensor.placements
+    if isinstance(tensor, DTensor):
+        if tensor.ndim == 0 and not all(
+            isinstance(p, TorchReplicate) for p in tensor.placements
         ):
             raise ValueError(f"state.{fqn}.{field}: scalar state must be replicated")
         return tensor
-    if isinstance(parameter, DTensor) and not isinstance(tensor, DTensor):
-        if tensor.shape != parameter.to_local().shape:
-            raise ValueError(
-                f"state.{fqn}.{field}: expected the parameter's local shard"
-            )
+    if tensor.ndim == 0:
+        return tensor
+    if isinstance(parameter, DTensor) and tensor.shape == parameter.to_local().shape:
         return DTensor.from_local(
             tensor,
             parameter.device_mesh,
@@ -384,38 +419,41 @@ def _optimizer_tensor(fqn, field, tensor, parameter):
             shape=parameter.shape,
             stride=parameter.stride(),
         )
-    if tensor.shape != parameter.shape:
-        raise ValueError(f"state.{fqn}.{field}: state shape must match its parameter")
-    if isinstance(parameter, DTensor) and (
-        tensor.device_mesh != parameter.device_mesh
-        or tensor.placements != parameter.placements
-    ):
-        raise ValueError(
-            f"state.{fqn}.{field}: state sharding must match its parameter"
-        )
     return tensor
 
 
-def _validate_optimizer_tensors(model, state):
+def _validate_optimizer_tensors(model, state, ctx=None):
     parameters = dict(model.named_parameters())
     for fqn, fields in state["state"].items():
         if fqn not in parameters:
             raise ValueError(f"optimizer state has no model parameter {fqn}")
-        _validate_optimizer_fields(fqn, fields, parameters[fqn])
+        state["state"][fqn] = _validate_optimizer_fields(fqn, fields, parameters[fqn])
 
 
 def _validate_optimizer_fields(fqn, fields, parameter):
+    if not isinstance(fields, Mapping):
+        raise NotImplementedError(
+            f"state.{fqn}: nested optimizer state; expected a flat mapping"
+        )
+    fields = dict(fields)
+    if len({str(field) for field in fields}) != len(fields):
+        raise ValueError(f"state.{fqn}: optimizer state key collision")
     for field, value in fields.items():
+        if not isinstance(field, str):
+            raise TypeError(
+                f"state.{fqn}.{field}: optimizer field name must be a string"
+            )
         if isinstance(value, torch.Tensor):
             fields[field] = _optimizer_tensor(fqn, field, value, parameter)
-        elif not isinstance(value, (bool, int, float, str, type(None))):
+        elif not isinstance(value, _optim.SCALARS):
             raise NotImplementedError(f"state.{fqn}.{field}: nested optimizer state")
+    return fields
 
 
 def _restore_objects(state, paths, objects):
     state["param_groups"] = objects["param_groups"]
     for key, value in objects.items():
-        if key != "param_groups":
+        if key not in {"param_groups", _optim.SCHEMA_KEY}:
             fqn, field = paths[key]
             state["state"][fqn][field] = value
 
@@ -443,10 +481,12 @@ def _prepare_optimizer_state(model, optimizer, state, objects, paths):
         for key, (fqn, field) in paths.items()
         if not isinstance(state["state"][fqn][field], torch.Tensor)
     }
+    if _optim.SCHEMA_KEY in state:
+        expected.add(_optim.SCHEMA_KEY)
     if objects.keys() != expected:
         key = sorted(objects.keys() ^ expected)[0]
         raise ValueError(f"optimizer: objects key mismatch for {key}")
-    for key in expected - {"param_groups"}:
+    for key in expected - {"param_groups", _optim.SCHEMA_KEY}:
         if not isinstance(objects[key], (bool, int, float, str, type(None))):
             raise ValueError(f"optimizer: unsupported non-tensor object {key}")
 
@@ -518,9 +558,196 @@ def _install_optimizer_state(model, optimizer, state):
     names = {parameter: name for name, parameter in parameters.items()}
     current = _named_optimizer_groups(optimizer, names)
     groups = _optimizer_groups(state["param_groups"], current, parameters)
-    optimizer.__setstate__(
-        _optimizer_installation(optimizer, state, groups, parameters)
+    _set_optimizer_state(
+        optimizer, _optimizer_installation(optimizer, state, groups, parameters)
     )
+
+
+def _set_optimizer_state(optimizer, state):
+    # __setstate__ initializes optimizer internals and may impose class defaults
+    # (AdamW forces decoupled_weight_decay). Saved group options are authoritative.
+    groups = [dict(settings) for settings in state["param_groups"]]
+    optimizer.__setstate__(state)
+    optimizer.param_groups = groups
+
+
+def _optimizer_field_schema(key, value, parameter, ctx):
+    if not isinstance(value, torch.Tensor):
+        return {"kind": "scalar"}
+    try:
+        layout = _optim._layout(value, parameter)
+    except NotImplementedError as exc:
+        raise NotImplementedError(f"{key}: {exc}") from exc
+    if layout["kind"] == "independent":
+        layout["checkpoint_ranks"] = list(ctx.global_ranks or range(ctx.world_size))
+    return {
+        "kind": "tensor",
+        "shape": list(value.shape),
+        "dtype": str(value.dtype).removeprefix("torch."),
+        "device": value.device.type,
+        "layout": layout,
+    }
+
+
+def _optimizer_schema(model, state, optimizer_class, ctx):
+    parameters = dict(model.named_parameters())
+    fields = {
+        name: {
+            str(field): _optimizer_field_schema(
+                f"state.{name}.{field}", value, parameters[name], ctx
+            )
+            for field, value in values.items()
+        }
+        for name, values in state["state"].items()
+    }
+    return {"version": 1, "class": optimizer_class, "fields": fields}
+
+
+def _expected_optimizer_fields(optimizer, group):
+    if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW)):
+        fields = {"step", "exp_avg", "exp_avg_sq"}
+        if group.get("amsgrad"):
+            fields.add("max_exp_avg_sq")
+        return fields
+    if isinstance(optimizer, torch.optim.SGD):
+        return {"momentum_buffer"} if group.get("momentum", 0) else set()
+    if isinstance(optimizer, torch.optim.Adagrad):
+        return {"step", "sum"}
+    if isinstance(optimizer, torch.optim.RMSprop):
+        fields = {"step", "square_avg"}
+        if group.get("momentum", 0):
+            fields.add("momentum_buffer")
+        if group.get("centered"):
+            fields.add("grad_avg")
+        return fields
+    return None
+
+
+def _validate_optimizer_class(optimizer, current, groups, schema):
+    if schema.get("version") != 1 or not isinstance(schema.get("fields"), dict):
+        raise ValueError("invalid optimizer layout metadata")
+    saved_class, target_class = schema.get("class"), _optim.class_name(optimizer)
+    if saved_class == target_class:
+        return
+    targets = {_optimizer_group_key(g): g for g in current["param_groups"]}
+    compatible = all(
+        _optimizer_class_group_matches(
+            optimizer,
+            current,
+            saved_group,
+            targets[_optimizer_group_key(saved_group)],
+            schema,
+        )
+        for saved_group in groups
+    )
+    if not compatible:
+        raise ValueError(
+            f"optimizer class mismatch: saved {saved_class}, target {target_class}; field sets or group option keys differ"
+        )
+
+
+def _optimizer_class_group_matches(optimizer, current, saved, target, schema):
+    if saved.keys() - {"param_names"} != target.keys() - {"param_names"}:
+        return False
+    expected = _expected_optimizer_fields(optimizer, target)
+    for name in saved["params"]:
+        target_fields = current["state"].get(name)
+        saved_fields = set(schema["fields"].get(name, {}))
+        wanted = (
+            set(target_fields)
+            if target_fields
+            else (expected if saved_fields else set())
+        )
+        if wanted is None or saved_fields != wanted:
+            return False
+    return True
+
+
+def _native_optimizer_schema(
+    parameters, groups, field_keys, tensors, objects, optimizer, *, saved_class=None
+):
+    # Native DCP has tensor metadata but no GDCP layout recipes. A native
+    # parameter-shaped slot follows its parameter; differently shaped native
+    # slots need an existing destination DTensor to prescribe a new layout.
+    names = sorted(parameters, key=len, reverse=True)
+    fields = {}
+    for key in field_keys:
+        if not key.startswith("state."):
+            continue
+        name = next((name for name in names if key.startswith(f"state.{name}.")), None)
+        if name is None:
+            raise ValueError(f"optimizer state has no model parameter for {key}")
+        field = key[len(name) + 7 :]
+        record = (
+            _native_optimizer_tensor_schema(tensors[key], parameters[name])
+            if key in tensors
+            else {"kind": "scalar"}
+        )
+        fields.setdefault(name, {})[field] = record
+    if saved_class is not None:
+        return {"version": 1, "class": saved_class, "fields": fields}
+    for saved_group in groups:
+        _validate_native_optimizer_fields(optimizer, saved_group, fields)
+    # Native checkpoints do not record a class. Group option keys still catch
+    # SGD/Adam incompatibility before any destination buffers are touched.
+    target_groups = optimizer.param_groups
+    if (
+        groups
+        and target_groups
+        and groups[0].keys() - {"params", "param_names"}
+        and groups[0].keys() - {"params", "param_names"}
+        != target_groups[0].keys() - {"params", "param_names"}
+    ):
+        raise ValueError(
+            f"optimizer class mismatch: saved native optimizer (group keys {sorted(groups[0].keys())}), target {_optim.class_name(optimizer)}"
+        )
+    return {"version": 1, "class": _optim.class_name(optimizer), "fields": fields}
+
+
+def _native_optimizer_tensor_schema(info, parameter):
+    shape = info.get("logical_shape", info["shape"])
+    dtype = info["dtype"]
+    dtype = next(
+        (str(t).removeprefix("torch.") for t, code in _DTYPES.items() if code == dtype),
+        dtype.removeprefix("torch."),
+    )
+    layout = (
+        {"kind": "parameter"}
+        if list(parameter.shape) == shape
+        else {"kind": "replicate"}
+    )
+    if shape and prod(shape) == parameter.numel():
+        layout = {"kind": "reshape"}
+    return {
+        "kind": "tensor",
+        "shape": shape,
+        "dtype": dtype,
+        "layout": layout,
+        "device": "cpu" if not shape else parameter.device.type,
+    }
+
+
+def _validate_native_optimizer_fields(optimizer, group, fields):
+    expected = _expected_optimizer_fields(optimizer, group)
+    if expected is None:
+        return
+    for name in group["params"]:
+        missing = expected - fields[name].keys() if name in fields else set()
+        if missing:
+            raise ValueError(
+                f"native DCP missing keys: state.{name}.{sorted(missing)[0]}"
+            )
+
+
+def _validate_native_current_fields(current, field_keys):
+    wanted = {
+        f"state.{name}.{field}"
+        for name, fields in current["state"].items()
+        for field in fields
+    }
+    missing = wanted - field_keys
+    if missing:
+        raise ValueError(f"native DCP missing keys: {sorted(missing)[0]}")
 
 
 def _fresh_adamw_slots(parameter, group, *, amsgrad):
@@ -610,8 +837,15 @@ class FSDP2Adapter:
 
     def _optimizer(self, checkpoint_state, state, ctx):
         model, optimizer = checkpoint_state["model"], checkpoint_state["optimizer"]
+        self.optimizer_class = _optim.class_name(optimizer)
         if optimizer.state:
-            values = get_optimizer_state_dict(model, optimizer)
+            values = cast(dict, get_optimizer_state_dict(model, optimizer))
+            values = {
+                **values,
+                "state": {
+                    name: dict(fields) for name, fields in values["state"].items()
+                },
+            }
         else:
             # PyTorch materializes an empty optimizer by calling step(). A
             # checkpoint must preserve lazy state and never advance training.
@@ -621,6 +855,8 @@ class FSDP2Adapter:
                 "param_groups": _named_optimizer_groups(optimizer, names),
             }
         self.optimizer_state = values
+        if self.loading:
+            _validate_optimizer_tensors(model, values)
         # Load buffers depend on which parameters had state when saved.
         component = (
             _component("optimizer", {}, {}, ctx)
@@ -629,13 +865,65 @@ class FSDP2Adapter:
         )
         state.components.append(component)
 
-    def prepare_optimizer(self, checkpoint_state, state, ctx, groups, field_keys):
+    def prepare_optimizer(
+        self,
+        checkpoint_state,
+        state,
+        ctx,
+        groups,
+        field_keys,
+        objects=None,
+        tensor_schema=None,
+    ):
         assert self.optimizer_state is not None
         _validate_optimizer_groups(groups, self.optimizer_state["param_groups"])
         model = checkpoint_state["model"]
         parameters = dict(model.named_parameters())
-        slots = _load_adamw_slots(parameters, self.optimizer_state, groups, field_keys)
+        objects = objects or {}
+        schema = objects.get(_optim.SCHEMA_KEY)
+        optimizer = checkpoint_state["optimizer"]
+        if (
+            schema is None
+            and tensor_schema is not None
+            and tensor_schema.get("__native__")
+        ):
+            _validate_native_current_fields(self.optimizer_state, field_keys)
+            schema = _native_optimizer_schema(
+                parameters, groups, field_keys, tensor_schema, objects, optimizer
+            )
+        if (
+            schema is None
+            and tensor_schema is not None
+            and not isinstance(optimizer, torch.optim.AdamW)
+        ):
+            schema = _native_optimizer_schema(
+                parameters,
+                groups,
+                field_keys,
+                tensor_schema,
+                objects,
+                optimizer,
+                saved_class="torch.optim.adamw.AdamW",
+            )
+        if schema is not None:
+            _validate_optimizer_class(
+                checkpoint_state["optimizer"], self.optimizer_state, groups, schema
+            )
+            slots = _optim.load_slots(
+                parameters, self.optimizer_state, schema, objects, ctx
+            )
+        elif isinstance(optimizer, torch.optim.AdamW):
+            slots = _load_adamw_slots(
+                parameters, self.optimizer_state, groups, field_keys
+            )
+        else:
+            raise ValueError(
+                "optimizer class mismatch: saved torch.optim.AdamW (legacy), "
+                f"target {_optim.class_name(optimizer)}; legacy checkpoint lacks a generic field schema"
+            )
         self.optimizer_state = {"param_groups": groups, "state": slots}
+        if _optim.SCHEMA_KEY in objects:
+            self.optimizer_state[_optim.SCHEMA_KEY] = schema
         component = self._optimizer_component(model, ctx)
         # Loading always orders the optimizer first.
         state.components[0] = component
@@ -643,7 +931,11 @@ class FSDP2Adapter:
 
     def _optimizer_component(self, model, ctx):
         assert self.optimizer_state is not None
-        _validate_optimizer_tensors(model, self.optimizer_state)
+        _validate_optimizer_tensors(model, self.optimizer_state, ctx)
+        if not self.loading:
+            self.optimizer_state[_optim.SCHEMA_KEY] = _optimizer_schema(
+                model, self.optimizer_state, self.optimizer_class, ctx
+            )
         tensors, objects, self.optimizer_paths = _optimizer_values(self.optimizer_state)
         parameters = dict(model.named_parameters())
         scalar_meshes = {
@@ -653,7 +945,8 @@ class FSDP2Adapter:
             and isinstance(p := parameters[self.optimizer_paths[key][0]], DTensor)
             and p.device_mesh.size() < ctx.world_size
         }
-        return _component("optimizer", tensors, objects, ctx, scalar_meshes)
+        component = _component("optimizer", tensors, objects, ctx, scalar_meshes)
+        return component
 
     def _extra(self, checkpoint_state):
         if self.loading:
@@ -695,7 +988,7 @@ class FSDP2Adapter:
 
     def restore(self, checkpoint_state, _loaded):
         if self.loaded_optimizer is not None:
-            checkpoint_state["optimizer"].__setstate__(self.loaded_optimizer)
+            _set_optimizer_state(checkpoint_state["optimizer"], self.loaded_optimizer)
         if self.loaded_model is not None:
             checkpoint_state["model"].load_state_dict(self.loaded_model, strict=True)
         if self.loaded_extra is not _NO_EXTRA_STATE:
@@ -764,6 +1057,7 @@ def save_checkpoint(
         ), metadata
 
     agreement, write_metadata = _collective(ctx, materialize)
+    _verify_optimizer_replicas(agreement.state, snapshot)
     if components and snapshot.coordinator is not None:
         _select_submesh_writers(agreement.state, snapshot)
         _unwrap(
@@ -786,6 +1080,23 @@ def save_checkpoint(
     _unwrap(result)
     if route != "HF weights":
         _collective(ctx, lambda: _finish(agreement.state))
+
+
+def _verify_optimizer_replicas(state, ctx):
+    for component in state.components:
+        if component.name != "optimizer":
+            continue
+        assert isinstance(component.accessor, TorchAccessor)
+        pending = {
+            key: value
+            for key, value in component.accessor.tensors.items()
+            if value.ndim and not isinstance(value, DTensor)
+        }
+        empty = not pending
+        if ctx.coordinator is not None:
+            empty = ctx.coordinator.vote(empty)
+        if not empty:
+            _collective(ctx, lambda: _optim.verify_plain_replicas(pending, ctx))
 
 
 def _prepare_save_state(checkpoint_state, ctx, route, dtype):

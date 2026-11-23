@@ -353,3 +353,14 @@ def test_13_inspect_without_tensor_open(checkpoints, monkeypatch):
         "ACCEPTANCE 13 PASS inspect returned saved world, keys, shapes and dtypes with no tensor opens",
         flush=True,
     )
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+def test_general_optimizer_state_layouts(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 4 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires four CUDA devices and NCCL")
+    output = _run(4, "optimizer_matrix", tmp_path, "--backend", backend)
+    assert output.count("optimizer matrix PASS") == 4

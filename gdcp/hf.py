@@ -748,6 +748,12 @@ def _load_prepare(path, state, ctx, validate_groups):
                     if key.startswith("optimizer.")
                 }
                 | optimizer.keys(),
+                optimizer,
+                {
+                    key.removeprefix("optimizer."): value
+                    for key, value in headers.items()
+                    if key.startswith("optimizer.")
+                },
             )
         )
     combined, _objects = _combined(

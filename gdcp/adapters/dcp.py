@@ -13,7 +13,7 @@ import struct
 import zipfile
 from bisect import bisect_right
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields as dataclass_fields, is_dataclass, replace
 from functools import lru_cache, partial
 from itertools import accumulate
 from math import prod
@@ -205,10 +205,15 @@ def _slot_geometry(component, named, rank):
 
 
 def _planner_path(component, tensor_id):
-    if component.name == "optimizer" and tensor_id.startswith("state."):
-        fqn, field = tensor_id[6:].rsplit(".", 1)
-        return "state", fqn, field
-    return (tensor_id,)
+    if component.name != "optimizer" or not tensor_id.startswith("state."):
+        return (tensor_id,)
+    schema = component.objects.get("_gdcp_optimizer", {})
+    for name, fields in schema.get("fields", {}).items():
+        prefix = f"state.{name}."
+        if tensor_id.startswith(prefix) and tensor_id[len(prefix) :] in fields:
+            return "state", name, tensor_id[len(prefix) :]
+    fqn, field = tensor_id[6:].rsplit(".", 1)
+    return "state", fqn, field
 
 
 def _objects(component):
@@ -242,6 +247,42 @@ def _plan(component, table, layout, index):
     _plan_objects(component, records, sizes, tensors, storage, planner)
     metadata = Metadata(tensors, planner_data=planner, storage_data=storage)
     return _Plan(offsets, records, sizes, metadata)
+
+
+def _canonical_metadata(value, strings):
+    """Normalize value-equal metadata independently of Python object sharing.
+
+    Restoring JSON schemas creates distinct copies of strings which optimizer
+    constructors often share. Pickle otherwise records those identities, making
+    an unchanged checkpoint's metadata differ after load and save.
+    """
+    if type(value) is str:
+        return strings.setdefault(value, value)
+    if isinstance(value, dict):
+        return {
+            _canonical_metadata(key, strings): _canonical_metadata(item, strings)
+            for key, item in sorted(value.items(), key=lambda pair: repr(pair[0]))
+        }
+    if type(value) is torch.Size:
+        return torch.Size(value)
+    if isinstance(value, tuple):
+        return tuple(_canonical_metadata(item, strings) for item in value)
+    if isinstance(value, list):
+        return [_canonical_metadata(item, strings) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return replace(
+            value,
+            **{
+                field.name: _canonical_metadata(getattr(value, field.name), strings)
+                for field in dataclass_fields(value)
+                if field.init
+            },
+        )
+    return value
+
+
+def _metadata_bytes(metadata):
+    return pickle.dumps(_canonical_metadata(metadata, {}), protocol=4)
 
 
 def _plan_tensor(
@@ -416,7 +457,7 @@ class _SaveSession(_Session, StorageSaveSession):
         try:
             desc.atomic_write(
                 Path(self.root) / ".metadata",
-                pickle.dumps(self.plan.metadata, protocol=4),
+                _metadata_bytes(self.plan.metadata),
             )
         except BaseException as exc:
             return exc
@@ -1089,10 +1130,18 @@ def _read_native_objects(root, metadata, component):
 def _native_optimizer_objects(root, metadata, component, validate_groups, combined):
     sidecar = root / "objects.json"
     keys = metadata.state_dict_metadata.keys()
+    tensors: dict = {
+        key: {"shape": list(item.size), "dtype": str(item.properties.dtype)}
+        for key, item in metadata.state_dict_metadata.items()
+        if isinstance(item, TensorStorageMetadata)
+    }
+    tensors["__native__"] = True
     if not combined and sidecar.exists():
         objects = desc.read_objects(sidecar)
         core._validate_load_call(
-            lambda: validate_groups(objects.get("param_groups"), keys | objects.keys())
+            lambda: validate_groups(
+                objects.get("param_groups"), keys | objects.keys(), objects, tensors
+            )
         )
         return lambda: objects
 
@@ -1110,7 +1159,9 @@ def _native_optimizer_objects(root, metadata, component, validate_groups, combin
         for key in paths
     }
     groups = unflatten_state_dict(flat, paths).get("param_groups")
-    component = core._validate_load_call(lambda: validate_groups(groups, keys))
+    component = core._validate_load_call(
+        lambda: validate_groups(groups, keys, {"param_groups": groups}, tensors)
+    )
     return partial(_native_objects, root, metadata, component, flat)
 
 

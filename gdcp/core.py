@@ -814,6 +814,8 @@ def _load_objects(path, component, saved, strict, validate_groups=None):
             lambda: validate_groups(
                 objects.get("param_groups"),
                 objects.keys() | {t["id"] for t in saved["tensors"]},
+                objects,
+                {t["id"]: t for t in saved["tensors"]},
             )
         )
     missing = component.objects.keys() - objects.keys()

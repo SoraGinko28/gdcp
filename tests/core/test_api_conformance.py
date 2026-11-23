@@ -358,6 +358,8 @@ def test_gdcp_torch_imports_are_confined_to_framework_adapter_and_accessor():
     allowed = {
         "adapters/fsdp2.py",
         "adapters/torch_access.py",
+        "adapters/torch_placements.py",
+        "adapters/optimizer_state.py",
         "adapters/hf.py",
         "adapters/dcp.py",
     }
