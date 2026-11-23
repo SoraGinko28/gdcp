@@ -1921,6 +1921,8 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 |  | `gdtensor.Result` | `Result` |
 |  | `gdtensor.Error` | `Error` |
 | `io` | `gdtensor.io.rank_load` | `d_tensors_view_rank_load` |
+| `io` | `gdtensor.io.validate_single_writer_save` | 检查各文件的存储分片和本 rank 实际写入计划是否都由对应的文件主 rank 写入（无 I/O） |
+| `io` | `gdtensor.io.rank_load_files` | 返回当前 rank 的加载计划实际读取的文件名（去重，无 I/O） |
 | `io` | `gdtensor.io.rank_save` | `d_tensors_view_rank_save` |
 | `io` | `gdtensor.io.chain_load` | `d_tensors_view_rank_chain_load` |
 | `io` | `gdtensor.io.chain_stat_mem_overhead` | `get_stat_mem_overhead_of_chain_load` |

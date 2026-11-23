@@ -384,9 +384,11 @@ class SafeTensorsLoadSession(LoadSessionBase):
     an unpublished (or commit-unknown) checkpoint and open fails.
     """
 
-    def __init__(self, *a, **kw) -> None:
+    def __init__(self, *a, eager_headers=True, **kw) -> None:
         super().__init__(*a, **kw)
         self._require_committed()
+        if not eager_headers:
+            return
         for path in self.my_files():
             self._read_file_offsets(path)
 

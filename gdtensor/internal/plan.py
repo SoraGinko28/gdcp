@@ -49,7 +49,7 @@ from .ranges import CopyPlan, DTensorRange, RangeFromComputeView, RangeFromStora
 from .result import catch, check_failed, invalid
 from .views import ComputeDTensorsView, StorageDTensorsView
 from .. import Result
-from .products import Ok
+from .products import Err, Ok
 
 
 def is_compute(r) -> bool:
@@ -284,6 +284,51 @@ def d_tensors_view_rank_plan_load(
     for tid in compute_view.tensor_ids:
         plan.extend(_pair(c.dst_intervals(tid, rank), s.src_candidates(tid, rank)))
     return Ok(plan)
+
+
+@catch
+def validate_single_writer_save(rank, compute_view, storage_view) -> Result[None]:
+    """Check storage slots and this rank's payload writes against each file leader."""
+    index = payload_index_of(storage_view)
+    for pos, (path, _) in index.slots.items():
+        owner = index.files[path].leader.rank
+        if pos.rank != owner:
+            raise invalid(
+                "file writers", f"{path}: writers are ranks {owner} and {pos.rank}"
+            )
+    # A replicated source may select a different writer from its stored slot.
+    result = d_tensors_view_rank_plan_save(rank, compute_view, storage_view)
+    if type(result) is Err:
+        return result
+    assert isinstance(result.value, list)
+    for _, dst in result.value:
+        assert isinstance(dst, RangeFromStorageView)
+        owner = index.files[dst.file_path].leader.rank
+        if dst.size and owner != rank:
+            raise invalid(
+                "file writers", f"{dst.file_path}: writers are ranks {owner} and {rank}"
+            )
+    return Ok(None)
+
+
+@catch
+def rank_load_files(rank, compute_view, storage_view) -> Result[list[str]]:
+    """Physical files supplying nonempty reads in this rank's validated plan."""
+    result = d_tensors_view_rank_plan_load(rank, compute_view, storage_view)
+    if type(result) is Err:
+        return result
+    plan = result.value
+    assert isinstance(plan, list)
+    validate_rank_load(rank, compute_view, storage_view, plan)
+    return Ok(
+        sorted(
+            {
+                src.file_path
+                for src, _ in plan
+                if isinstance(src, RangeFromStorageView) and src.size
+            }
+        )
+    )
 
 
 # ------------------------------------------------------------------ B.1.3

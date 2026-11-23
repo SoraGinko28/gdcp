@@ -64,12 +64,13 @@ def _has_port_conflict(results):
 @pytest.mark.skipif(
     not os.environ.get("GDTENSOR_TORCH_TESTS"), reason="set GDTENSOR_TORCH_TESTS=1"
 )
-def test_gloo_wait_uses_distributed_barrier(monkeypatch):
+@pytest.mark.parametrize("group", [None, object()], ids=["default", "explicit"])
+def test_gloo_wait_uses_distributed_barrier(monkeypatch, group):
     dist = pytest.importorskip("torch.distributed")
     called = []
-    monkeypatch.setattr(dist, "barrier", lambda: called.append("called"))
-    GlooCoordinator().wait()
-    assert called == ["called"]
+    monkeypatch.setattr(dist, "barrier", lambda group=None: called.append(group))
+    GlooCoordinator(group).wait()
+    assert called == [group]
 
 
 @pytest.mark.skipif(

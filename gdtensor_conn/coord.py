@@ -41,21 +41,44 @@ class ThreadCoordinator:
         self._barrier.wait(self.timeout)
 
 
+def _torch_vote(ok: bool, device: str, group) -> bool:
+    import torch
+    from torch.distributed import ReduceOp, all_reduce
+
+    result = torch.tensor(int(ok), dtype=torch.int32, device=device)
+    all_reduce(result, op=ReduceOp.MIN, group=group)
+    return bool(result.item())
+
+
 class GlooCoordinator:
-    """Use the default Gloo process group initialized by ``torchrun``."""
+    """Coordinate on the selected CPU Gloo group."""
+
+    def __init__(self, group=None) -> None:
+        self.group = group
 
     def vote(self, ok: bool) -> bool:
-        import torch
-        from torch.distributed import ReduceOp, all_reduce
-
-        result = torch.tensor(int(ok), dtype=torch.int32, device="cpu")
-        all_reduce(result, op=ReduceOp.MIN)
-        return bool(result.item())
+        return _torch_vote(ok, "cpu", self.group)
 
     def wait(self) -> None:
         from torch.distributed import barrier
 
-        barrier()
+        barrier(group=self.group)
+
+
+class NcclCoordinator:
+    """Use the selected NCCL group on the CUDA device assigned to this rank."""
+
+    def __init__(self, device_index: int, group=None) -> None:
+        self.group = group
+        self.device_index = device_index
+
+    def vote(self, ok: bool) -> bool:
+        return _torch_vote(ok, f"cuda:{self.device_index}", self.group)
+
+    def wait(self) -> None:
+        from torch.distributed import barrier
+
+        barrier(group=self.group, device_ids=[self.device_index])
 
 
 class ProcessCoordinator:

@@ -7,6 +7,7 @@ from .internal.api import (
     d_tensors_view_rank_load as rank_load,
     d_tensors_view_rank_save as rank_save,
 )
+from .internal.plan import validate_single_writer_save, rank_load_files
 from .internal.chain import (
     get_stat_inbound_traffic_of_chain_load as chain_stat_inbound_traffic,
     get_stat_mem_overhead_of_chain_load as chain_stat_mem_overhead,
@@ -15,7 +16,9 @@ from .internal.chain import (
 
 __all__ = [
     "rank_load",
+    "rank_load_files",
     "rank_save",
+    "validate_single_writer_save",
     "chain_load",
     "chain_stat_mem_overhead",
     "chain_stat_outbound_traffic",
