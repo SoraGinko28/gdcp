@@ -1,14 +1,16 @@
 # GDCP v1: FSDP2 checkpoints
 
 `gdcp.FSDP2Checkpointer` saves one real FSDP2 module, its AdamW optimizer, and
-arbitrary picklable per-rank extra state. All ranks call save/load with the same
-path and compatible state. The default process group must be Gloo; the v1
+arbitrary picklable per-rank extra state. All members of the checkpoint process group call save/load with the same
+path and compatible state. The group can use Gloo, NCCL, or
+both. For pure NCCL, bind each process to its assigned CUDA device before
+checkpointing (for example, `torch.cuda.set_device(local_rank)`). The v1
 acceptance suite uses CPU tensors and world sizes 1–4.
 
 ```python
 from gdcp import FSDP2Checkpointer, inspect
 
-# model has already been fully_shard-ed on a one-dimensional world mesh.
+# model has already been fully_shard-ed on a one-dimensional FSDP or two-dimensional HSDP mesh.
 checkpoint_state = {
     "model": model,
     "optimizer": optimizer,
@@ -19,6 +21,17 @@ FSDP2Checkpointer.load("/checkpoints/run", checkpoint_state)
 # model and optimizer are restored in place; extra_state is replaced.
 description = inspect("/checkpoints/run/global_step_100")  # GDTensor Result
 ```
+
+Pass the same explicit PyTorch group to each participating member, for example
+`FSDP2Checkpointer.save(path, state, process_group=dp_group)` and
+`FSDP2Checkpointer.load(path, state, process_group=dp_group)`. Omitting it uses
+the default group. The group may contain nonconsecutive global ranks. Its
+local rank zero publishes the checkpoint, filenames and extra state use
+group-local rank numbers, and tensor shards follow their device-mesh
+coordinates. A subsequent group may have different members or size. Each
+DTensor's mesh must be contained in the current checkpoint group. Independent
+groups can checkpoint to separate directories. Only
+members should call the API for a given group.
 
 Pass the run directory to `FSDP2Checkpointer.load` to resume the highest
 numeric `global_step_N` with a GDCP completion marker. Discovery reads only
@@ -33,8 +46,52 @@ by their explicit paths.
 The loading world size may differ from the saving world size. GDTensor moves
 the intersections of saved storage shards and live compute shards directly;
 GDCP never assembles full tensors during save or load. Supported placements
-are `Shard(0)` and `Replicate` on a one-dimensional mesh containing all ranks.
-Native PyTorch DCP loads support uneven `Shard(0)` chunks and empty shards. GDCP
+are `Shard(dim)` and `Replicate` on a one-dimensional mesh. A two-dimensional
+HSDP mesh can replicate on one axis and shard any single tensor dimension on the other. A fully replicated tensor is also supported. For example, use
+`init_device_mesh("cuda", (2, 2), mesh_dim_names=("replicate", "shard"))`
+when calling `fully_shard`. GDCP reads the layout from each DTensor. The
+checkpoint stores each logical tensor once. A load can switch between 1D
+FSDP and 2D HSDP or change the number of replicas and shards.
+
+On a two-dimensional DP × TP mesh, apply PyTorch tensor parallelism to the
+layer on the TP submesh, then call `fully_shard` on the DP submesh. GDCP
+supports sharding a weight and its AdamW moments along two different tensor
+dimensions. When FSDP2 subdivides existing TP shards along the same dimension,
+GDCP maps `(_StridedShard(dim, split_factor=tp_size), Shard(dim))` in TP-first
+order. Either layout can be restored into 1D FSDP and vice versa.
+
+For HSDP + TP, apply tensor parallelism on `mesh["tp"]` and call
+`fully_shard` on `mesh["replica", "dp"]`. GDCP reads
+`(Replicate(), _StridedShard(dim, split_factor=tp_size), Shard(dim))`
+in TP-first shard order while retaining the replica coordinates. Sharding
+different tensor dimensions on DP and TP also works. The storage layout keeps
+one logical copy, and checkpoints can move between 3D HSDP + TP, 2D DP + TP
+and 1D FSDP.
+
+Configure per-parameter placement in PyTorch's `fully_shard(..., shard_placement_fn=...)`.
+Return `Shard(dim)` to change the tensor dimension or `ShardPlacementResult` to
+choose a parameter-specific mesh. PyTorch requires a nonzero sharding dimension
+to divide evenly by the shard group size. GDCP maps each global byte range into
+the packed local shard, including column slices and slices on higher axes.
+Model weights and AdamW moment tensors follow the parameter layout. Scalar
+AdamW steps remain scalars. The on-disk tensor keys and shapes permit recovery
+into another supported layout with the same logical model.
+
+A checkpoint key identifies one logical tensor. If several disjoint parameter
+meshes supply the same key, saving compares corresponding local shard digests
+across those meshes and selects one complete mesh to write. These meshes must
+have matching layout and cover the checkpoint group. Conflicting copies fail
+before publication. Distinct expert weights require distinct checkpoint keys.
+
+GDCP and native PyTorch DCP exchange model and optimizer state through the
+`model/` and `optimizer/` component directories. GDCP can also load a native
+PyTorch DCP directory created with a single
+`dcp.save({"model": model_state, "optimizer": optimizer_state}, checkpoint_id=path)`.
+Pass that directory directly to `FSDP2Checkpointer.load` and request either the
+model alone or both components. The optimizer uses model parameter names, as
+returned by PyTorch's `get_state_dict`. Native DCP loads support
+non-overlapping rectangular chunks on any tensor dimensions, including uneven
+chunks and empty shards. GDCP validates complete coverage before loading. It
 honors the saved local strides, including transposed shards, when restoring at
 the same or a different world size. GDCP applies serialized tensor-view flags
 such as lazy negation with PyTorch's copy semantics. An unsupported flag or
@@ -305,6 +362,11 @@ these optimizer slots and still rejects unexpected model keys such as
 weights. Generic legacy optimizer sidecars without parameter groups use the
 `optimizer.` prefix for unmatched keys.
 Optimizer restoration precedes model restoration.
+
+Saving a fresh AdamW preserves its empty state and step counter. Restoring
+creates slots only for parameters with saved state, including when the target
+optimizer has already trained other parameters. A branch receiving its first
+gradient after restore initializes its moments on that first update.
 
 Optimizer groups are matched by their model parameter names. The target may
 reorder groups or parameters within a group. Load restores the saved group

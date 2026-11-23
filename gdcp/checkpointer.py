@@ -43,7 +43,7 @@ def _fsdp2_adapter(preflight):
 
 
 class FSDP2Checkpointer:
-    """Synchronous FSDP2/AdamW checkpoints over Gloo or CUDA/CPU groups."""
+    """Synchronous FSDP2/AdamW checkpoints over Gloo, NCCL, or a mixed group."""
 
     @classmethod
     def save(
@@ -70,7 +70,6 @@ class FSDP2Checkpointer:
             "callback": callback,
             "modifying_ckpt": modifying_ckpt,
             "role": role,
-            "process_group": process_group,
         }
         defaults = {
             name: False
@@ -98,6 +97,7 @@ class FSDP2Checkpointer:
             checkpoint_format=checkpoint_format,
             hf_dtype=hf_dtype,
             max_shard_size=max_shard_size,
+            process_group=process_group,
             _preflight=preflight,
         )
 
@@ -130,7 +130,6 @@ class FSDP2Checkpointer:
             "loader_in_split_mode": loader_in_split_mode,
             "role": role,
             "ignore_model_keys": ignore_model_keys,
-            "process_group": process_group,
             "rank": rank,
             "global_batch_size": global_batch_size,
             "seqlen": seqlen,
@@ -151,5 +150,9 @@ class FSDP2Checkpointer:
             _reject(options, defaults, kwargs)
 
         _fsdp2_adapter(preflight).load_checkpoint(
-            path, checkpoint_state, load_common_state_only, _preflight=preflight
+            path,
+            checkpoint_state,
+            load_common_state_only,
+            process_group=process_group,
+            _preflight=preflight,
         )

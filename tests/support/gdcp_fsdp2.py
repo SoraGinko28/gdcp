@@ -48,16 +48,17 @@ def train_step(model, optimizer, step):
     optimizer.zero_grad(set_to_none=True)
 
 
-def make_model(world, *, target=False):
-    model = AcceptanceModel()
-    mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp",))
+def make_model(world, *, target=False, device="cpu", mesh=None):
+    model = AcceptanceModel().to(device)
+    if mesh is None:
+        mesh = init_device_mesh(device, (world,), mesh_dim_names=("dp",))
     fully_shard(model, mesh=mesh)
     optimizer = optimizer_for(model, target=target)
     return model, optimizer
 
 
-def dense_oracle(steps=2):
-    model = AcceptanceModel()
+def dense_oracle(steps=2, *, device="cpu"):
+    model = AcceptanceModel().to(device)
     optimizer = optimizer_for(model)
     for step in range(steps):
         train_step(model, optimizer, step)

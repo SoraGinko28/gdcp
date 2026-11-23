@@ -49,7 +49,6 @@ SAVE_REJECTED = {
     "callback": "unsupported_callback",
     "modifying_ckpt": True,
     "role": "actor",
-    "process_group": "unsupported_group",
 }
 LOAD_REJECTED = {
     "enable_shm_download_ckpt_tmp": True,
@@ -58,7 +57,6 @@ LOAD_REJECTED = {
     "loader_in_split_mode": True,
     "role": "actor",
     "ignore_model_keys": set(),
-    "process_group": "unsupported_group",
     "rank": 0,
     "global_batch_size": 1,
     "seqlen": 1,

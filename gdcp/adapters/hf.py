@@ -21,6 +21,8 @@ from .fsdp2 import (
     _component,
     _context,
     _model_values,
+    _optimizer_tensor,
+    _select_submesh_writers,
     _unwrap,
 )
 from .torch_access import TorchAccessor
@@ -33,8 +35,8 @@ _SUPPORTED_CODES = set(_TORCH_DTYPE_CODES.values())
 class _CastAccessor(DTensorDataAccessor):
     """Convert local shards lazily, releasing each before visiting the next."""
 
-    def __init__(self, tensors, dtype, ctx):
-        self.tensors, self.dtype, self.ctx = tensors, dtype, ctx
+    def __init__(self, tensors, dtype, boxes):
+        self.tensors, self.dtype, self.boxes = tensors, dtype, boxes
         self.current: str | None = None
         self.accessor: TorchAccessor | None = None
 
@@ -46,9 +48,7 @@ class _CastAccessor(DTensorDataAccessor):
                 tensor.to(dtype=self.dtype) if tensor.is_floating_point() else tensor
             )
             self.current = key
-            self.accessor = TorchAccessor(
-                {key: tensor}, self.ctx.rank, self.ctx.world_size
-            )
+            self.accessor = TorchAccessor({key: tensor}, self.boxes)
         assert self.accessor is not None
         return self.accessor
 
@@ -73,7 +73,13 @@ def _dtype(dtype):
 
 
 def _master_values(model, optimizer, tensors):
-    state = cast(dict[str, Any], get_optimizer_state_dict(model, optimizer))
+    # Querying PyTorch for an empty optimizer would take an optimizer step
+    # even though this weights-only export will reject the missing masters.
+    state = (
+        cast(dict[str, Any], get_optimizer_state_dict(model, optimizer))
+        if optimizer.state
+        else {"state": {}}
+    )
     masters = {
         fqn: fields["master_param"]
         for fqn, fields in state["state"].items()
@@ -89,7 +95,10 @@ def _master_values(model, optimizer, tensors):
         raise ValueError(
             f"fp32 HF export is missing master_param for {sorted(missing)[0]}"
         )
-    return tensors | {name: masters[name] for name in parameter_names & tensors.keys()}
+    return tensors | {
+        name: _optimizer_tensor(name, "master_param", masters[name], tensors[name])
+        for name in parameter_names & tensors.keys()
+    }
 
 
 def _inputs(model_or_state):
@@ -164,7 +173,10 @@ def _weights(model_or_state, dtype, ctx, *, headers=None):
         entries.append(NamedDTensor(key, described, alias_names))
     component.table = DTensorTable(entries)
     if not loading:
-        component.accessor = _CastAccessor(tensors, target_dtype, ctx)
+        assert isinstance(component.accessor, TorchAccessor)
+        component.accessor = _CastAccessor(
+            tensors, target_dtype, component.accessor.boxes
+        )
     return model, CheckpointState(components=[component])
 
 
@@ -191,6 +203,7 @@ def save_hf(path, model_or_state, dtype="fp32", max_shard_size=None):
         return _prepare_save(model_or_state, dtype, ctx)
 
     state, write_metadata = _collective(ctx, prepare)
+    _select_submesh_writers(state, ctx)
     _unwrap(
         save_state(
             path,

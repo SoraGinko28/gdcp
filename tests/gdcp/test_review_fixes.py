@@ -243,7 +243,7 @@ def test_fsdp2_dispatch_shares_initial_agreement(
     before = _files(tmp_path)
     initial_states = [dict(state) for state in states]
     current = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: current.ctx)
 
     def attempt(ctx):
         current.ctx = ctx
@@ -1022,7 +1022,7 @@ def test_extra_missing_worker_rejects_same_world_load(tmp_path, monkeypatch, fmt
             {"rank": rank}, source / "extra_state" / f"extra_state_rank_{rank}.pt"
         )
     current = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: current.ctx)
 
     def check_rank(ctx):
         current.ctx = ctx
@@ -1262,7 +1262,7 @@ def test_facade_checks_materialized_tensor_schema(tmp_path, monkeypatch, fmt):
     component = fixture.states[1].components[0]
     component.table = DTensorTable(list(reversed(component.table.named_d_tensors)))
     current = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: current.ctx)
     monkeypatch.setattr(
         fsdp2,
         "_prepare_save_state",

@@ -37,6 +37,12 @@ class RankContext:
     rank: int
     world_size: int
     coordinator: Coordinator | None = None
+    # Group-local rank -> global rank. None denotes the default world.
+    global_ranks: tuple[int, ...] | None = None
+
+    @property
+    def global_rank(self):
+        return self.rank if self.global_ranks is None else self.global_ranks[self.rank]
 
 
 class StoragePolicy(Protocol):

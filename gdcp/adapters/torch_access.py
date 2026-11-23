@@ -3,7 +3,7 @@
 from math import prod
 
 import torch
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 
 from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import Err, InvalidArgumentError
@@ -15,13 +15,32 @@ def _local_tensor(tensor):
     )
 
 
-def _origin(tensor, rank, world):
-    if not isinstance(tensor, DTensor) or not isinstance(tensor.placements[0], Shard):
-        return 0
-    # This translates the framework's contiguous local buffer, not a copy plan.
-    rows = tensor.shape[0]
-    first = min(rank * ((rows + world - 1) // world), rows)
-    return first * prod(tensor.shape[1:]) * tensor.element_size()
+def _shard_spans(tensor, box):
+    """Byte stripes, outermost first, for a packed local rectangular shard."""
+    if box is None or tensor.ndim == 0:
+        return ()
+    lo, hi = box
+    shape = tensor.shape
+    if tuple(end - start for start, end in zip(lo, hi, strict=True)) != tuple(
+        tensor.to_local().shape
+    ):
+        raise ValueError("planned shard shape differs from the local DTensor")
+    spans = []
+    for dim, (length, start, end) in enumerate(zip(shape, lo, hi, strict=True)):
+        if end - start != length:
+            stride = prod(shape[dim + 1 :]) * tensor.element_size()
+            spans.append((length * stride, start * stride, (end - start) * stride))
+    return tuple(spans)
+
+
+def _local_offset(spans, offset, size):
+    for period, start, width in spans:
+        block, within = divmod(offset, period)
+        relative = within - start
+        if relative < 0 or relative + size > width:
+            raise ValueError("range is outside the local shard")
+        offset = block * width + relative
+    return offset
 
 
 def _finish_write(key, tensor, host, written):
@@ -41,10 +60,12 @@ class TorchAccessor(DTensorDataAccessor):
     staging buffer. CPU contiguous tensors need no staging allocation at all.
     """
 
-    def __init__(self, tensors, rank, world_size):
+    def __init__(self, tensors, boxes):
         self.tensors = tensors
-        self.origins = {
-            key: _origin(value, rank, world_size) for key, value in tensors.items()
+        self.boxes = boxes
+        self.spans = {
+            key: _shard_spans(value, boxes[key]) if isinstance(value, DTensor) else ()
+            for key, value in tensors.items()
         }
         self._key = None
         self._tensor = None
@@ -88,7 +109,9 @@ class TorchAccessor(DTensorDataAccessor):
         self._stage(rng.global_tensor_id, mode)
         assert self._host is not None
         data = self._host.reshape(-1).view(torch.uint8)
-        offset = rng.global_tensor_offset - self.origins[rng.global_tensor_id]
+        offset = _local_offset(
+            self.spans[rng.global_tensor_id], rng.global_tensor_offset, rng.size
+        )
         if offset < 0 or offset + rng.size > data.numel():
             raise ValueError(
                 f"{rng.global_tensor_id}: range is outside the local tensor"

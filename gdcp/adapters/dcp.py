@@ -215,6 +215,13 @@ def _objects(component):
     values = {
         key: value for key, value in component.objects.items() if key != "aliases"
     }
+    if (
+        component.name == "optimizer"
+        and "param_groups" in values
+        and not component.table.named_d_tensors
+        and not any(key.startswith("state.") for key in values)
+    ):
+        values["state"] = {}
     return flatten_state_dict(values)
 
 
@@ -1079,11 +1086,14 @@ def _read_native_objects(root, metadata, component):
     return _native_objects(root, metadata, component)
 
 
-def _native_optimizer_objects(root, metadata, component, validate_groups):
+def _native_optimizer_objects(root, metadata, component, validate_groups, combined):
     sidecar = root / "objects.json"
-    if sidecar.exists():
+    keys = metadata.state_dict_metadata.keys()
+    if not combined and sidecar.exists():
         objects = desc.read_objects(sidecar)
-        core._validate_load_call(lambda: validate_groups(objects.get("param_groups")))
+        core._validate_load_call(
+            lambda: validate_groups(objects.get("param_groups"), keys | objects.keys())
+        )
         return lambda: objects
 
     assert metadata.storage_data is not None
@@ -1100,31 +1110,71 @@ def _native_optimizer_objects(root, metadata, component, validate_groups):
         for key in paths
     }
     groups = unflatten_state_dict(flat, paths).get("param_groups")
-    core._validate_load_call(lambda: validate_groups(groups))
+    component = core._validate_load_call(lambda: validate_groups(groups, keys))
     return partial(_native_objects, root, metadata, component, flat)
+
+
+def _component_metadata(metadata, name):
+    # PyTorch's planner paths distinguish a nested component from a literal
+    # dot in a parameter name. Keep file locations and chunk offsets intact.
+    keys = {}
+    paths = {}
+    for key, path in metadata.planner_data.items():
+        if len(path) < 2 or path[0] != name:
+            continue
+        if not key.startswith(name + "."):
+            raise ValueError(f"inconsistent DCP planner path for {key}")
+        local = key[len(name) + 1 :]
+        keys[key] = local
+        paths[local] = path[1:]
+    if not keys:
+        raise ValueError(f"missing native DCP component {name}")
+    assert metadata.storage_data is not None
+    return Metadata(
+        {local: metadata.state_dict_metadata[key] for key, local in keys.items()},
+        planner_data=paths,
+        storage_data={
+            MetadataIndex(keys[index.fqn], index.offset, index.index): record
+            for index, record in metadata.storage_data.items()
+            if index.fqn in keys
+        },
+    )
 
 
 def _prepare_native(path, state, ctx, validate_groups):
     core._validate_context(ctx)
     core._validate_state(state)
     root = Path(path)
-    metadata = {c.name: _read_native_metadata(root / c.name) for c in state.components}
+    combined = (root / ".metadata").is_file()
+    if combined:
+        bundle = _read_native_metadata(root)
+        metadata = {
+            c.name: _component_metadata(bundle, c.name) for c in state.components
+        }
+    else:
+        metadata = {
+            c.name: _read_native_metadata(root / c.name) for c in state.components
+        }
     optimizer_objects = None
     if validate_groups is not None:
         optimizer = next(c for c in state.components if c.name == "optimizer")
         optimizer_objects = _native_optimizer_objects(
-            root / optimizer.name, metadata[optimizer.name], optimizer, validate_groups
+            root if combined else root / optimizer.name,
+            metadata[optimizer.name],
+            optimizer,
+            validate_groups,
+            combined,
         )
     prepared = []
     for component in state.components:
         name = component.name
+        directory = root if combined else root / name
+        objects = optimizer_objects if name == "optimizer" else None
+        if combined and objects is None:
+            objects = partial(_native_objects, directory, metadata[name], component)
         prepared.append(
             _prepare_native_component(
-                root / name,
-                component,
-                ctx,
-                metadata[name],
-                optimizer_objects if name == "optimizer" else None,
+                directory, component, ctx, metadata[name], objects
             )
         )
     return prepared

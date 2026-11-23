@@ -738,7 +738,18 @@ def _load_prepare(path, state, ctx, validate_groups):
         optimizer = objects["optimizer"]
         if not isinstance(optimizer, dict):
             raise ValueError("HF objects for optimizer must contain a mapping")
-        core._validate_load_call(lambda: validate_groups(optimizer.get("param_groups")))
+        keys = optimizer_tensors if optimizer_tensors is not None else headers.keys()
+        core._validate_load_call(
+            lambda: validate_groups(
+                optimizer.get("param_groups"),
+                {
+                    key.removeprefix("optimizer.")
+                    for key in keys
+                    if key.startswith("optimizer.")
+                }
+                | optimizer.keys(),
+            )
+        )
     combined, _objects = _combined(
         state, headers.keys(), optimizer_tensors=optimizer_tensors
     )

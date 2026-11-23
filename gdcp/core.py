@@ -298,6 +298,11 @@ def _save_one(agreement, compute, storage):
     if type(has_payload) is Err:
         return has_payload
     if not has_payload.value:
+        if storage.physical_layout.container_format == "distcp":
+            # Even without tensor slots, PyTorch needs metadata and an object
+            # record for the parameter groups of a pristine optimizer.
+            assert storage.begin_save is not None
+            return _require(storage.begin_save(storage, ctx.rank)).commit()
         return Ok(None)
     result = _rank_save(ctx, compute, storage)
     _raise_io_interrupt(storage)
@@ -402,7 +407,9 @@ def _planned_files(state, prepared, ctx, rank_state):
             files.update(prefix / name for name in fixed)
         if component.objects:
             files.add(prefix / "objects.json")
-        if component.objects and saved["format"] != "safetensors":
+        if saved["format"] == "distcp":
+            files.add(prefix / ".metadata")
+        if component.objects and saved["format"] == "distcp":
             files.add(prefix / "__0_0.distcp")
     return files
 
@@ -461,9 +468,9 @@ def _save_staged(transaction, state, agreement, inventory, policy, backend):
     )
 
 
-def _save_request(path, ctx, components, rank_keys, format_options):
+def _save_request(path, ctx: RankContext, components, rank_keys, format_options):
     _validate_context(ctx)
-    snapshot = RankContext(ctx.rank, ctx.world_size, ctx.coordinator)
+    snapshot = replace(ctx)
     keys = tuple(sorted(rank_keys))
     target = _hdfs.checkpoint_path(path)
     if isinstance(target, _hdfs.HdfsPath) and not target.path.name:
@@ -803,7 +810,12 @@ def _load_objects(path, component, saved, strict, validate_groups=None):
             _hdfs.local_file(Path(path) / component.name / saved["objects"])
         )
     if validate_groups is not None:
-        _validate_load_call(lambda: validate_groups(objects.get("param_groups")))
+        component = _validate_load_call(
+            lambda: validate_groups(
+                objects.get("param_groups"),
+                objects.keys() | {t["id"] for t in saved["tensors"]},
+            )
+        )
     missing = component.objects.keys() - objects.keys()
     unexpected = objects.keys() - component.objects.keys()
     if missing or (strict and unexpected):

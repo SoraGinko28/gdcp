@@ -96,6 +96,118 @@ def test_03_training_continues_after_reshard(checkpoints):
     _run(3, "load", source, "--source-world", 2, "--continue-step")
 
 
+@pytest.mark.parametrize("backend", ["nccl", "cuda:nccl,cpu:gloo"])
+def test_gpu_save_failure_and_reshard(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if torch.cuda.device_count() < 3 or not torch.distributed.is_nccl_available():
+        pytest.skip("requires three CUDA devices and NCCL")
+    _run(2, "gpu_save", tmp_path, "--backend", backend)
+    _run(3, "gpu_load", tmp_path, "--backend", backend)
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+def test_independent_process_subgroups(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 4 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires four CUDA devices and NCCL")
+    output = _run(4, "subgroups", tmp_path, "--backend", backend)
+    assert output.count("subgroup PASS") == 4
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+def test_hsdp_checkpoint_layouts(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 4 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires four CUDA devices and NCCL")
+    output = _run(4, "hsdp", tmp_path, "--backend", backend)
+    assert output.count("HSDP PASS") == 4
+    # The reader checks that each logical byte appears on disk exactly once.
+    records, _, _ = independent_reader(tmp_path / "hsdp" / "safetensors")
+    flat, _, _ = independent_reader(tmp_path / "fsdp" / "safetensors")
+    assert records == flat
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+def test_parameter_layouts(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 4 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires four CUDA devices and NCCL")
+    output = _run(4, "param_layouts", tmp_path, "--backend", backend)
+    assert output.count("parameter layouts PASS") == 4
+    records, _, _ = independent_reader(tmp_path / "mixed" / "safetensors")
+    flat, _, _ = independent_reader(tmp_path / "flat" / "safetensors")
+    assert records == flat
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+def test_dp_tp_same_and_different_dimensions(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 4 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires four CUDA devices and NCCL")
+    output = _run(4, "dp_tp", tmp_path, "--backend", backend)
+    assert output.count("DP+TP PASS") == 4
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+@pytest.mark.parametrize("world", [4, 8])
+def test_hsdp_tp_checkpoint_layouts(tmp_path, backend, world):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < world or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip(f"requires {world} CUDA devices and NCCL")
+    output = _run(world, "hsdp_tp", tmp_path, "--backend", backend)
+    assert output.count("HSDP+TP PASS") == world
+    for root in tmp_path.iterdir():
+        independent_reader(root / "hsdptp" / "safetensors")
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+@pytest.mark.parametrize("flat_world", [2, 3])
+def test_cross_world_native_interchange(tmp_path, backend, flat_world):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 4 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires four CUDA devices and NCCL")
+    for world, action in (
+        (flat_world, "cross_save"),
+        (4, "cross_exchange"),
+        (flat_world, "cross_exchange"),
+    ):
+        output = _run(world, action, tmp_path, "--backend", backend)
+        assert output.count("CROSS PASS") == world
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+def test_lazy_adamw_resume(tmp_path, backend):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < 2 or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip("requires two CUDA devices and NCCL")
+    output = _run(2, "lazy_adamw", tmp_path, "--backend", backend)
+    assert output.count("lazy AdamW PASS") == 2
+
+
+def test_hsdp_tp_cross_world_dcp_interchange(tmp_path):
+    for world, action in (
+        (4, "hsdp_tp_source"),
+        (8, "hsdp_tp_expand"),
+        (4, "hsdp_tp_contract"),
+    ):
+        output = _run(world, action, tmp_path)
+        assert output.count("HSDP+TP interchange PASS") == world
+
+
 def _identity_files(path):
     files = {"gdcp_manifest.json": (path / "gdcp_manifest.json").read_bytes()}
     files.update(

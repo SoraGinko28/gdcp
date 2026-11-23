@@ -1,17 +1,28 @@
 """Real FSDP2 state dictionaries and per-rank torch serialization."""
 
 import io
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from collections import defaultdict
 from collections.abc import Callable
-from functools import partial
+from functools import cache, partial
+from hashlib import sha256
 from typing import cast
 
 import torch
-from torch.distributed import get_backend, get_rank, get_world_size, is_initialized
+from torch.distributed import (
+    ProcessGroup,
+    GroupMember,
+    all_gather_object,
+    get_backend,
+    get_rank,
+    get_world_size,
+    get_process_group_ranks,
+    is_initialized,
+)
 from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
 )
+from torch.distributed.distributed_c10d import group
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import (
     DTensor,
@@ -19,23 +30,28 @@ from torch.distributed.tensor import (
     Shard as TorchShard,
 )
 
+from torch.distributed.tensor.placement_types import _StridedShard
+
 from gdtensor.builder import (
     ArrangedMesh,
     DTensorTable,
     Err,
     GlobalTensorMeta,
     NaiveDTensor,
+    LiteralMesh,
+    ReshapedMesh,
     NamedDTensor,
     Replicate,
     Shard,
 )
 from gdtensor.tag import WorldSize
-from gdtensor_conn.coord import GlooCoordinator
+from gdtensor_conn._geometry import _mesh, owned_box
+from gdtensor_conn.coord import GlooCoordinator, NcclCoordinator
 
 from .. import _hdfs, core, desc, hf
 from ..checkpointer import _save_route
 from ..state import CheckpointState, Component, RankContext
-from .torch_access import TorchAccessor
+from .torch_access import TorchAccessor, _local_tensor
 
 _NO_EXTRA_STATE = object()
 _DTYPES = {
@@ -55,16 +71,33 @@ _DTYPES = {
 }
 
 
-def _context():
+def _context(process_group=None):
+    if process_group == GroupMember.NON_GROUP_MEMBER:
+        raise ValueError("current rank is not a member of process_group")
+    if process_group is not None and not isinstance(process_group, ProcessGroup):
+        raise TypeError("process_group must be a torch.distributed.ProcessGroup")
     if not is_initialized():
+        if process_group is not None:
+            raise ValueError("process_group requires initialized torch.distributed")
         return RankContext(0, 1)
-    backends = get_backend().lower().split(",")
-    if "gloo" not in backends and "cpu:gloo" not in backends:
-        raise NotImplementedError(
-            "default process group must provide Gloo for CPU tensors "
-            "(use gloo or cuda:nccl,cpu:gloo)"
+    backends = get_backend(process_group).lower().split(",")
+    if "gloo" in backends or "cpu:gloo" in backends:
+        coordinator = GlooCoordinator(process_group)
+    elif "nccl" in backends or "cuda:nccl" in backends:
+        selected = group.WORLD if process_group is None else process_group
+        bound = selected.bound_device_id if selected is not None else None
+        device = bound.index if bound is not None else None
+        coordinator = NcclCoordinator(
+            torch.cuda.current_device() if device is None else device, process_group
         )
-    return RankContext(get_rank(), get_world_size(), GlooCoordinator())
+    else:
+        raise NotImplementedError("process group must provide CPU Gloo or CUDA NCCL")
+    members = (
+        None if process_group is None else tuple(get_process_group_ranks(process_group))
+    )
+    return RankContext(
+        get_rank(process_group), get_world_size(process_group), coordinator, members
+    )
 
 
 def _unwrap(result):
@@ -108,7 +141,31 @@ def _validate_state(state, *, common_only):
         raise NotImplementedError("optimizer must be torch.optim.AdamW or a subclass")
 
 
-def _describe_tensor(key, tensor, ctx):
+def _ordered_shards(key, tensor):
+    ranks = tensor.device_mesh.mesh
+    placements = list(tensor.placements)
+    # Replication does not change shard boundaries. Keep replica axes and their
+    # rank coordinates fixed while expressing FSDP's TP-first split order.
+    axes = [i for i, p in enumerate(placements) if not isinstance(p, TorchReplicate)]
+    if len(axes) > 2:
+        raise NotImplementedError(
+            f"{key}: expected a replica axis on the HSDP + TP mesh"
+        )
+    if len(axes) == 2 and isinstance(dp := placements[axes[0]], _StridedShard):
+        dp_axis, tp_axis = axes
+        tp = placements[tp_axis]
+        if not (
+            type(tp) is TorchShard
+            and tp.dim == dp.dim
+            and dp.split_factor == ranks.size(tp_axis)
+        ):
+            raise NotImplementedError(f"{key}: unsupported strided DP/TP placement")
+        ranks = ranks.transpose(dp_axis, tp_axis)
+        placements[dp_axis], placements[tp_axis] = tp, TorchShard(dp.dim)
+    return ranks, placements
+
+
+def _describe_tensor(key, tensor, ctx, replicated_mesh=None):
     if tensor.device.type == "meta":
         raise NotImplementedError(f"{key}: meta tensors are not supported")
     if tensor.dtype not in _DTYPES:
@@ -116,44 +173,153 @@ def _describe_tensor(key, tensor, ctx):
     meta = GlobalTensorMeta(
         list(tensor.shape) or [1], _DTYPES[tensor.dtype], tensor.element_size()
     )
-    mesh = ArrangedMesh(WorldSize(ctx.world_size))
-    if isinstance(tensor, DTensor):
-        placement = _dtensor_placement(key, tensor, ctx)
-        return NaiveDTensor(meta, [placement], mesh, torch_d_tensor=tensor)
-    return NaiveDTensor(meta, [Replicate()], mesh)
+    device_mesh = tensor.device_mesh if isinstance(tensor, DTensor) else replicated_mesh
+    if device_mesh is None:
+        return NaiveDTensor(
+            meta, [Replicate()], ArrangedMesh(WorldSize(ctx.world_size))
+        )
+    if device_mesh.ndim not in (1, 2, 3):
+        raise NotImplementedError(
+            f"{key}: expected a device mesh with one to three axes"
+        )
+    ranks, torch_placements = (
+        _ordered_shards(key, tensor)
+        if isinstance(tensor, DTensor)
+        else (device_mesh.mesh, ())
+    )
+    mesh = _compute_mesh(key, ranks.reshape(-1).tolist(), ranks.shape, ctx)
+    if not isinstance(tensor, DTensor):
+        # A CPU AdamW step uses the parameter's replica topology for I/O, but
+        # the accessor reads and restores the original scalar on its own device.
+        return NaiveDTensor(meta, [Replicate() for _ in range(device_mesh.ndim)], mesh)
+    placements = []
+    for placement in torch_placements:
+        if isinstance(placement, TorchReplicate):
+            placements.append(Replicate())
+        elif type(placement) is TorchShard and 0 <= placement.dim < tensor.ndim:
+            placements.append(Shard(placement.dim))
+        else:
+            raise NotImplementedError(
+                f"{key}: expected Replicate or Shard on a valid tensor dimension"
+            )
+    return NaiveDTensor(meta, placements, mesh, torch_d_tensor=tensor)
 
 
-def _dtensor_placement(key, tensor, ctx):
-    mesh = tensor.device_mesh
-    if mesh.ndim != 1 or mesh.mesh.reshape(-1).tolist() != list(range(ctx.world_size)):
-        raise NotImplementedError(f"{key}: mesh must be one-dimensional over all ranks")
-    placements = tensor.placements
-    if len(placements) != 1:
-        raise NotImplementedError(f"{key}: unsupported placements {placements}")
-    placement = placements[0]
-    if isinstance(placement, TorchShard) and placement.dim == 0:
-        if tensor.ndim == 0:
-            raise NotImplementedError(f"{key}: a scalar cannot use Shard(0)")
-        return Shard(0)
-    if not isinstance(placement, TorchReplicate):
-        raise NotImplementedError(f"{key}: only Shard(0) and Replicate are supported")
-    return Replicate()
+def _compute_mesh(key, ranks, shape, ctx):
+    expected = ctx.global_ranks or tuple(range(ctx.world_size))
+    if len(set(ranks)) != len(ranks) or not set(ranks) <= set(expected):
+        raise ValueError(f"{key}: device mesh must match the checkpoint process_group")
+    group_ranks = {member: rank for rank, member in enumerate(expected)}
+    return _local_mesh(tuple(group_ranks[r] for r in ranks), shape, ctx.world_size)
 
 
-def _component(name, tensors, objects, ctx):
+def _local_mesh(ranks, shape, world_size):
+    mesh = (
+        ArrangedMesh(WorldSize(world_size))
+        if ranks == tuple(range(world_size))
+        else LiteralMesh(list(ranks), WorldSize(world_size))
+    )
+    return ReshapedMesh(mesh, list(shape)) if len(shape) > 1 else mesh
+
+
+def _submesh_entries(state, world_size):
+    @cache
+    def subgrid(mesh):
+        cells = _mesh(mesh)
+        if cells.size < world_size:
+            return tuple(cells.ravel().tolist()), cells.shape
+        return None
+
+    return {
+        (component.name, named.global_tensor_id): (
+            named.d_tensor,
+            component.accessor.tensors[named.global_tensor_id],
+            grid,
+        )
+        for component in state.components
+        for named in component.table.named_d_tensors
+        if (grid := subgrid(named.d_tensor.mesh)) is not None
+    }
+
+
+def _submesh_report(entries, rank):
+    report = {}
+    for key, (_, value, (ranks, _)) in entries.items():
+        digest = None
+        if rank in ranks:
+            local = _local_tensor(value).contiguous().reshape(-1).view(torch.uint8)
+            digest = sha256(memoryview(local.cpu().numpy())).digest()
+        report[key] = (ranks, digest)
+    return report
+
+
+def _writer_mesh(key, reports, members):
+    records = [report[key] for report in reports]
+    groups = {ranks for ranks, _ in records}
+    first = records[0][0]
+    if len(groups) == 1:
+        return first
+    # Separate submeshes can carry replicas of one checkpoint key. Validate
+    # every corresponding shard before allowing one submesh to publish it.
+    if sum(map(len, groups)) != len(members) or set().union(*groups) != set(members):
+        raise ValueError(f"{key}: parameter meshes must form disjoint groups")
+    reference = {}
+    for rank, (ranks, digest) in zip(members, records, strict=True):
+        if rank not in ranks or len(ranks) != len(first):
+            raise ValueError(f"{key}: inconsistent parameter mesh membership")
+        coordinate = ranks.index(rank)
+        if reference.setdefault(coordinate, digest) != digest:
+            raise ValueError(
+                f"{key}: same checkpoint key has different values on its parameter meshes"
+            )
+    return first
+
+
+def _select_submesh_writers(state, ctx):
+    if ctx.world_size == 1 or ctx.coordinator is None:
+        return
+    entries = _collective(ctx, lambda: _submesh_entries(state, ctx.world_size))
+    if ctx.coordinator.vote(not entries):
+        return
+    local = _collective(ctx, lambda: _submesh_report(entries, ctx.rank))
+    reports = [{} for _ in range(ctx.world_size)]
+    coordinator = ctx.coordinator
+    device = (
+        torch.cuda.device(coordinator.device_index)
+        if isinstance(coordinator, NcclCoordinator)
+        else nullcontext()
+    )
+    with device:
+        all_gather_object(reports, local, group=coordinator.group)
+    if any(report.keys() != local.keys() for report in reports):
+        raise ValueError("ranks disagree on parameter mesh checkpoint keys")
+    members = range(ctx.world_size)
+    for key, (layout, _, (_, shape)) in entries.items():
+        layout.mesh = _local_mesh(
+            _writer_mesh(key, reports, members), shape, ctx.world_size
+        )
+
+
+def _component(name, tensors, objects, ctx, scalar_meshes=None):
+    scalar_meshes = scalar_meshes or {}
     aliases = objects.get("aliases", {}) if name == "model" else {}
     entries = [
         NamedDTensor(
             key,
-            _describe_tensor(key, tensor, ctx),
+            _describe_tensor(key, tensor, ctx, scalar_meshes.get(key)),
             [alias for alias, canonical in aliases.items() if canonical == key],
         )
         for key, tensor in tensors.items()
     ]
+    boxes = {
+        named.global_tensor_id: owned_box(named, "compute", ctx.rank)
+        for named in entries
+        if isinstance(tensors[named.global_tensor_id], DTensor)
+    }
     component = Component(
         name,
         DTensorTable(entries),
-        TorchAccessor(tensors, ctx.rank, ctx.world_size),
+        TorchAccessor(tensors, boxes),
         objects,
     )
     component.logical_shapes = {
@@ -357,27 +523,7 @@ def _install_optimizer_state(model, optimizer, state):
     )
 
 
-def _fresh_optimizer_state(model, optimizer):
-    # PyTorch's state-dict helper calls optimizer.step() on an empty optimizer.
-    # Use private destination buffers for AdamW's lazy slots during load.
-    names = {parameter: name for name, parameter in model.named_parameters()}
-    groups = _named_optimizer_groups(optimizer, names)
-    state = {}
-    if not any(
-        parameter.grad is not None
-        for group in optimizer.param_groups
-        for parameter in group["params"]
-    ):
-        state = {
-            names[parameter]: _fresh_adamw_slots(parameter, group)
-            for group in optimizer.param_groups
-            for parameter in group["params"]
-            if parameter.requires_grad
-        }
-    return {"state": state, "param_groups": groups}
-
-
-def _fresh_adamw_slots(parameter, group):
+def _fresh_adamw_slots(parameter, group, *, amsgrad):
     scalar_dtype = torch.get_default_dtype()
     if group["fused"] or scalar_dtype != torch.float64:
         scalar_dtype = torch.float32
@@ -387,8 +533,47 @@ def _fresh_adamw_slots(parameter, group):
         "exp_avg": torch.empty_like(parameter),
         "exp_avg_sq": torch.empty_like(parameter),
     }
-    if group["amsgrad"]:
+    if amsgrad:
         slots["max_exp_avg_sq"] = torch.empty_like(parameter)
+    return slots
+
+
+def _load_adamw_slots(parameters, target, groups, field_keys):
+    current = target["state"]
+    target_groups = {
+        _optimizer_group_key(group): group for group in target["param_groups"]
+    }
+    # Only a parameter with saved state should acquire AdamW slots. Keep
+    # all expected fields on active parameters so incomplete records fail.
+    active = {
+        key[6:].rsplit(".", 1)[0] for key in field_keys if key.startswith("state.")
+    }
+    # Subclasses can have additional field names containing dots. The
+    # live schema supplies their exact parameter/field boundary.
+    active.update(
+        name
+        for name, fields in current.items()
+        if any(f"state.{name}.{field}" in field_keys for field in fields)
+    )
+    slots = {}
+    for saved_group in groups:
+        settings = {
+            **target_groups[_optimizer_group_key(saved_group)],
+            **saved_group,
+        }
+        for name in (p for p in saved_group["params"] if p in active):
+            fields = current.get(name)
+            slots[name] = (
+                dict(fields)
+                if fields
+                else _fresh_adamw_slots(
+                    parameters[name],
+                    settings,
+                    amsgrad=saved_group.get(
+                        "amsgrad", f"state.{name}.max_exp_avg_sq" in field_keys
+                    ),
+                )
+            )
     return slots
 
 
@@ -425,21 +610,50 @@ class FSDP2Adapter:
 
     def _optimizer(self, checkpoint_state, state, ctx):
         model, optimizer = checkpoint_state["model"], checkpoint_state["optimizer"]
-        values = (
-            _fresh_optimizer_state(model, optimizer)
-            if self.loading and not optimizer.state
-            else get_optimizer_state_dict(model, optimizer)
-        )
-        self.optimizer_state = values
-        if self.loading:
-            slots = cast(dict[str, dict], values["state"])
-            self.optimizer_state = {
-                "param_groups": values["param_groups"],
-                "state": {fqn: dict(fields) for fqn, fields in slots.items()},
+        if optimizer.state:
+            values = get_optimizer_state_dict(model, optimizer)
+        else:
+            # PyTorch materializes an empty optimizer by calling step(). A
+            # checkpoint must preserve lazy state and never advance training.
+            names = {p: name for name, p in model.named_parameters()}
+            values = {
+                "state": {},
+                "param_groups": _named_optimizer_groups(optimizer, names),
             }
+        self.optimizer_state = values
+        # Load buffers depend on which parameters had state when saved.
+        component = (
+            _component("optimizer", {}, {}, ctx)
+            if self.loading
+            else self._optimizer_component(model, ctx)
+        )
+        state.components.append(component)
+
+    def prepare_optimizer(self, checkpoint_state, state, ctx, groups, field_keys):
+        assert self.optimizer_state is not None
+        _validate_optimizer_groups(groups, self.optimizer_state["param_groups"])
+        model = checkpoint_state["model"]
+        parameters = dict(model.named_parameters())
+        slots = _load_adamw_slots(parameters, self.optimizer_state, groups, field_keys)
+        self.optimizer_state = {"param_groups": groups, "state": slots}
+        component = self._optimizer_component(model, ctx)
+        # Loading always orders the optimizer first.
+        state.components[0] = component
+        return component
+
+    def _optimizer_component(self, model, ctx):
+        assert self.optimizer_state is not None
         _validate_optimizer_tensors(model, self.optimizer_state)
         tensors, objects, self.optimizer_paths = _optimizer_values(self.optimizer_state)
-        state.components.append(_component("optimizer", tensors, objects, ctx))
+        parameters = dict(model.named_parameters())
+        scalar_meshes = {
+            key: p.device_mesh
+            for key, value in tensors.items()
+            if value.ndim == 0
+            and isinstance(p := parameters[self.optimizer_paths[key][0]], DTensor)
+            and p.device_mesh.size() < ctx.world_size
+        }
+        return _component("optimizer", tensors, objects, ctx, scalar_meshes)
 
     def _extra(self, checkpoint_state):
         if self.loading:
@@ -501,9 +715,10 @@ def save_checkpoint(
     checkpoint_format="safetensors",
     hf_dtype=None,
     max_shard_size=None,
+    process_group=None,
     _preflight=None,
 ):
-    ctx = _context()
+    ctx = _context(process_group)
 
     def prepare():
         if _preflight is not None:
@@ -529,7 +744,6 @@ def save_checkpoint(
     snapshot, components, keys = _unwrap(core._agree(ctx, describe))
 
     def materialize():
-        # Reading a fresh AdamW state dict can call optimizer.step().
         if isinstance(root, _hdfs.HdfsPath):
             _hdfs.require_client()
         state, metadata = _prepare_save_state(
@@ -551,6 +765,7 @@ def save_checkpoint(
 
     agreement, write_metadata = _collective(ctx, materialize)
     if components and snapshot.coordinator is not None:
+        _select_submesh_writers(agreement.state, snapshot)
         _unwrap(
             core._agree(
                 snapshot,
@@ -605,7 +820,7 @@ def _load_format(root, state):
     if marker == desc.HF_COMMITTED_NAME:
         return "hf"
     native_hf = hf._has_native_files(root)
-    native_dcp = any(
+    native_dcp = (root / ".metadata").is_file() or any(
         (root / name / ".metadata").is_file() for name in ("model", "optimizer")
     )
     if native_hf and native_dcp:
@@ -652,8 +867,10 @@ def _load_agreement_options(path, state, preflight, validate_groups, common_only
     )
 
 
-def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=None):
-    ctx = _context()
+def load_checkpoint(
+    path, checkpoint_state, common_only=False, *, process_group=None, _preflight=None
+):
+    ctx = _context(process_group)
     adapter = FSDP2Adapter(loading=True, common_only=common_only)
 
     def prepare():
@@ -669,7 +886,7 @@ def load_checkpoint(path, checkpoint_state, common_only=False, *, _preflight=Non
 
     optimizer = adapter.optimizer_state
     validate_groups = (
-        partial(_validate_optimizer_groups, current=optimizer["param_groups"])
+        partial(adapter.prepare_optimizer, checkpoint_state, state, ctx)
         if optimizer is not None
         else None
     )

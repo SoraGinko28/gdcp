@@ -66,6 +66,18 @@ def _component_files(root, component, prefix):
     files.update(prefix / name for name in fixed if os.path.lexists(root / name))
     if component["objects"] is not None:
         files.add(prefix / _name(component["objects"]))
+    if (
+        component["format"] == "distcp"
+        and "__0_0.distcp" not in component["files"]
+        and (root / ".metadata").is_file()
+    ):
+        # Native DCP stores optimizer groups alongside tensors. An empty
+        # optimizer has only this record, outside the tensor file list.
+        if any(
+            record.relative_path == "__0_0.distcp"
+            for record in read_storage_records(root)
+        ):
+            files.add(prefix / "__0_0.distcp")
     return files
 
 

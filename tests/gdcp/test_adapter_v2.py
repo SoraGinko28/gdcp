@@ -30,7 +30,7 @@ from gdcp.adapters.torch_access import TorchAccessor
 from gdcp.hf import read_headers
 from gdcp.state import CheckpointState, RankContext
 from gdtensor.builder import Err, Ok
-from gdtensor_conn.coord import ThreadCoordinator
+from gdtensor_conn.coord import GlooCoordinator, NcclCoordinator, ThreadCoordinator
 from gdtensor_conn.iobackend import FileIO
 
 _FORMATS = ("safetensors", "dcp", "hf")
@@ -198,7 +198,7 @@ def sharded_world(request, monkeypatch):
     context = local()
     coordinator = ThreadCoordinator(world, timeout=5) if world > 1 else None
     monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
     monkeypatch.setattr(hf_adapter, "_context", lambda: context.value)
     try:
         yield DeviceMesh("cpu", list(range(world))), world, context, coordinator
@@ -318,7 +318,7 @@ def test_latest_agrees_on_step_across_rank_local_paths(tmp_path, monkeypatch):
         FSDP2Checkpointer.save(root, {"extra_state": rank}, global_steps=rank + 10)
     coordinator = ThreadCoordinator(2, timeout=5)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
 
     def load(rank):
         context.value = RankContext(rank, 2, coordinator)
@@ -336,7 +336,7 @@ def test_fsdp2_format_lookup_failure_votes_on_every_rank(tmp_path, monkeypatch):
     coordinator = ThreadCoordinator(2, timeout=2)
     context = local()
     is_file = Path.is_file
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
 
     def rank_local_is_file(path):
         if path == tmp_path / desc.MANIFEST_NAME and context.value.rank == 0:
@@ -762,7 +762,7 @@ def test_invalid_fsdp2_save_arguments_vote_on_every_rank(
 ):
     coordinator = ThreadCoordinator(2, timeout=2)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
 
     def save(rank):
         context.value = RankContext(rank, 2, coordinator)
@@ -789,7 +789,7 @@ def test_invalid_fsdp2_save_arguments_vote_on_every_rank(
 def test_fsdp2_save_routes_agree_before_dispatch(tmp_path, monkeypatch, options):
     coordinator = ThreadCoordinator(2, timeout=2)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
     dispatched = []
 
     def track_dispatch(*args, **kwargs):
@@ -813,7 +813,7 @@ def test_fsdp2_save_routes_agree_before_dispatch(tmp_path, monkeypatch, options)
 def test_invalid_fsdp2_load_arguments_vote_on_every_rank(tmp_path, monkeypatch):
     coordinator = ThreadCoordinator(2, timeout=2)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
 
     def load(rank):
         context.value = RankContext(rank, 2, coordinator)
@@ -833,7 +833,7 @@ def test_invalid_fsdp2_load_arguments_vote_on_every_rank(tmp_path, monkeypatch):
 def test_rejected_save_preserves_first_adamw_step(tmp_path, monkeypatch):
     current = local()
     coordinator = ThreadCoordinator(2, timeout=5)
-    monkeypatch.setattr(fsdp2, "_context", lambda: current.ctx)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: current.ctx)
     monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
 
     def save(rank):
@@ -884,7 +884,7 @@ def _write(accessor, key, offset, data):
 
 def test_staging_reuses_one_host_tensor_for_all_save_ranges(monkeypatch):
     tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
-    accessor = TorchAccessor({"first": tensor, "second": tensor[:2]}, 0, 1)
+    accessor = TorchAccessor({"first": tensor, "second": tensor[:2]}, {})
     calls, original = [], torch.Tensor.cpu
 
     def cpu(value, *args, **kwargs):
@@ -912,7 +912,7 @@ def test_load_staging_writes_back_once_after_all_ranges(monkeypatch):
     tensor = torch.full((3, 4), -1.0).t()
     expected = torch.arange(12, dtype=torch.float32).reshape(4, 3)
     raw = expected.view(torch.uint8).numpy().tobytes()
-    accessor = TorchAccessor({"weight": tensor}, 0, 1)
+    accessor = TorchAccessor({"weight": tensor}, {})
     calls, original = [], torch_access._finish_write
 
     def finish(*args):
@@ -932,7 +932,7 @@ def test_load_staging_writes_back_once_after_all_ranges(monkeypatch):
 
 def test_incomplete_load_rejected_before_staging_writeback():
     tensor = torch.full((2, 3), -1.0).t()
-    accessor = TorchAccessor({"weight": tensor}, 0, 1)
+    accessor = TorchAccessor({"weight": tensor}, {})
     _write(accessor, "weight", 0, bytes(4))
     with pytest.raises(ValueError, match="incomplete local tensor load"):
         accessor.finish()
@@ -944,18 +944,57 @@ def test_incomplete_load_rejected_before_staging_writeback():
 )
 def test_context_accepts_cpu_gloo_in_composite_group(monkeypatch, backend):
     monkeypatch.setattr(fsdp2, "is_initialized", lambda: True)
-    monkeypatch.setattr(fsdp2, "get_backend", lambda: backend)
-    monkeypatch.setattr(fsdp2, "get_rank", lambda: 1)
-    monkeypatch.setattr(fsdp2, "get_world_size", lambda: 4)
-    assert fsdp2._context().rank == 1
-    assert fsdp2._context().world_size == 4
+    monkeypatch.setattr(fsdp2, "get_backend", lambda group=None: backend)
+    monkeypatch.setattr(fsdp2, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(fsdp2, "get_world_size", lambda group=None: 4)
+    ctx = fsdp2._context()
+    assert (ctx.rank, ctx.world_size) == (1, 4)
+    assert isinstance(ctx.coordinator, GlooCoordinator)
 
 
-def test_context_rejects_group_without_cpu_gloo(monkeypatch):
+@pytest.mark.parametrize("backend", ["nccl", "cuda:nccl"])
+@pytest.mark.parametrize("bound_device", [None, torch.device("cuda:2")])
+def test_context_accepts_cuda_nccl(monkeypatch, backend, bound_device):
     monkeypatch.setattr(fsdp2, "is_initialized", lambda: True)
-    monkeypatch.setattr(fsdp2, "get_backend", lambda: "nccl")
-    with pytest.raises(NotImplementedError, match="Gloo for CPU"):
+    monkeypatch.setattr(fsdp2, "get_backend", lambda group=None: backend)
+    monkeypatch.setattr(fsdp2, "get_rank", lambda group=None: 5)
+    monkeypatch.setattr(fsdp2, "get_world_size", lambda group=None: 8)
+    monkeypatch.setattr(
+        fsdp2,
+        "group",
+        SimpleNamespace(WORLD=SimpleNamespace(bound_device_id=bound_device)),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    ctx = fsdp2._context()
+    assert isinstance(ctx.coordinator, NcclCoordinator)
+    assert ctx.coordinator.device_index == (2 if bound_device is not None else 1)
+
+
+def test_context_rejects_unsupported_backend(monkeypatch):
+    monkeypatch.setattr(fsdp2, "is_initialized", lambda: True)
+    monkeypatch.setattr(fsdp2, "get_backend", lambda group=None: "mpi")
+    with pytest.raises(NotImplementedError, match="CPU Gloo or CUDA NCCL"):
         fsdp2._context()
+
+
+def test_strided_hsdp_keeps_replica_coordinates_on_rectangular_mesh():
+    from itertools import product
+    from torch.distributed.tensor import Replicate
+    from torch.distributed.tensor.placement_types import _StridedShard
+
+    ranks = torch.arange(12).reshape(2, 3, 2)
+    source = SimpleNamespace(
+        device_mesh=SimpleNamespace(mesh=ranks),
+        placements=(Replicate(), _StridedShard(1, split_factor=2), Shard(1)),
+    )
+    ordered, placements = fsdp2._ordered_shards("weight", source)
+    assert placements == [Replicate(), Shard(1), Shard(1)]
+    assert ordered.shape == (2, 2, 3)
+    for replica, dp, tp in product(range(2), range(3), range(2)):
+        assert ordered[replica, tp, dp] == ranks[replica, dp, tp]
+    source.placements = (Replicate(), _StridedShard(1, split_factor=3), Shard(1))
+    with pytest.raises(NotImplementedError, match="strided DP/TP"):
+        fsdp2._ordered_shards("weight", source)
 
 
 def test_tied_parameter_has_one_tensor_and_alias_metadata():
@@ -1029,7 +1068,7 @@ def test_optimizer_adamw_subclass_is_supported(monkeypatch):
 
 
 def test_invalid_accessor_range_returns_result_error():
-    accessor = TorchAccessor({"weight": torch.zeros(2)}, 0, 1)
+    accessor = TorchAccessor({"weight": torch.zeros(2)}, {})
     result = accessor.read_to_buffer(_range("weight", 0, 12), lambda *args: Ok(None))
     assert type(result) is Err
 
@@ -1039,7 +1078,7 @@ def mesh(monkeypatch):
     pytest.importorskip("torch.testing._internal.distributed.fake_pg")
     init_process_group("fake", store=HashStore(), rank=0, world_size=1)
     context = RankContext(0, 1)
-    monkeypatch.setattr(fsdp2, "_context", lambda: context)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context)
     monkeypatch.setattr(hf_adapter, "_context", lambda: context)
     try:
         yield DeviceMesh("cpu", [0])
@@ -1311,7 +1350,7 @@ def test_native_dcp_group_validation_precedes_payload_reads_on_every_rank(
 
     coordinator = ThreadCoordinator(2, timeout=10)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
     read_object = dcp._read_object
     reads = []
 
@@ -1382,7 +1421,7 @@ def test_native_dcp_validates_inventory_on_all_ranks_before_unrestricted_load(
 ):
     coordinator = ThreadCoordinator(2, timeout=10)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
     unrestricted = []
     torch_load, pickle_load = torch.load, dcp.pickle.load
 
@@ -1447,7 +1486,7 @@ def test_native_dcp_validates_records_on_all_ranks_before_unrestricted_load(
 
     coordinator = ThreadCoordinator(2, timeout=10)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
     unrestricted = []
     torch_load = torch.load
 
@@ -1502,7 +1541,7 @@ def test_rank_specific_alias_failure_stops_writes_on_every_rank(
     FSDP2Checkpointer.save(tmp_path, {"model": source}, checkpoint_format=fmt)
     coordinator = ThreadCoordinator(2, timeout=10)
     context = local()
-    monkeypatch.setattr(fsdp2, "_context", lambda: context.value)
+    monkeypatch.setattr(fsdp2, "_context", lambda process_group=None: context.value)
     writes = []
     write = fsdp2.TorchAccessor.write_from_buffer
 
@@ -1580,6 +1619,61 @@ def test_valid_load_installs_fresh_optimizer_state(mesh, tmp_path, fmt):
     assert _values(target, optimizer) == _values(source, saved)
     assert optimizer.param_groups[0]["lr"] == 0.01
     assert target.alias is target.a
+
+
+def test_rejected_fp32_export_preserves_empty_optimizer(mesh, tmp_path):
+    model = _grouped_model(mesh, 1.0)
+    opt = _grouped_optimizer(model, ("ab", "cd"), initialized=False)
+    with pytest.raises((ValueError, RuntimeError), match="missing master_param"):
+        FSDP2Checkpointer.save(
+            tmp_path,
+            {"model": model, "optimizer": opt},
+            checkpoint_format="hf",
+            hf_dtype="fp32",
+        )
+    assert not opt.state
+
+
+def test_pristine_adamw_dcp_component_readable_by_pytorch(mesh, tmp_path):
+    model = _grouped_model(mesh, 1.0)
+    opt = _grouped_optimizer(model, ("ab", "cd"), initialized=False)
+    for _ in range(2):
+        FSDP2Checkpointer.save(
+            tmp_path, {"model": model, "optimizer": opt}, checkpoint_format="dcp"
+        )
+        restored = {
+            "state": {},
+            "param_groups": fsdp2._named_optimizer_groups(
+                opt, {p: name for name, p in model.named_parameters()}
+            ),
+        }
+        torch.distributed.checkpoint.load(
+            restored, checkpoint_id=tmp_path / "optimizer"
+        )
+        assert not restored["state"]
+        assert restored["param_groups"][1]["params"] == ["c", "d"]
+        assert not opt.state
+
+
+def test_native_dcp_bundle_model_only_and_missing_optimizer_moment(mesh, tmp_path):
+    source = _grouped_model(mesh, 1.0)
+    opt = _grouped_optimizer(source, ("ab", "cd"))
+    saved = cast(dict[str, Any], get_optimizer_state_dict(source, opt))
+    del saved["state"]["a"]["exp_avg"]
+    torch_dcp_save(
+        {"model": source.state_dict(), "optimizer": saved}, checkpoint_id=tmp_path
+    )
+    target = _grouped_model(mesh, 9.0)
+    fresh = _grouped_optimizer(target, ("ab", "cd"), initialized=False)
+    _load_rejected(
+        tmp_path,
+        {"model": target, "optimizer": fresh},
+        r"missing keys.*state\.a\.exp_avg",
+    )
+    assert not fresh.state
+    assert _values(target) != _values(source)
+    FSDP2Checkpointer.load(tmp_path, {"model": target})
+    assert _values(target) == _values(source)
 
 
 def test_hf_weights_only_export_loads_tied_model_without_alias_sidecar(mesh, tmp_path):
