@@ -72,14 +72,13 @@ header reader recognizes safetensors dtypes such as `U16`, `U32`, `U64`, and
 packed floats. If a requested tensor uses a dtype that the load path cannot
 represent, the error names the dtype and key.
 
-Native PyTorch DCP loads accept uneven `Shard(0)` chunks and ignore empty
-shards at any row offset. GDCP reads each chunk in logical element order using
-its serialized strides, including for transposed local tensors. GDCP applies
-serialized tensor-view flags such as lazy negation with PyTorch's copy semantics.
-An unsupported flag or dtype, such as a conjugate view of a complex tensor,
-produces an error naming the tensor. The nonempty chunks must cover the tensor
-along dimension 0. GDCP reports a chunk geometry error for overlaps, gaps, and
-sharding along another dimension.
+Native PyTorch DCP loads accept rectangular shards along any tensor dimensions,
+including column shards, two-axis tiles, uneven splits and empty shards. GDCP
+checks that the nonempty rectangles stay in bounds and cover the tensor exactly
+once. It translates requested global byte ranges into packed offsets in each
+record, then applies the record's serialized strides and tensor-view flags.
+This preserves transposed tensors and lazy negation under resharding. An
+unsupported dtype or view produces an error naming the tensor.
 
 All three formats use the coordinator to compare a digest of the live
 world size, rank-state keys, the ordered component list, and format options,

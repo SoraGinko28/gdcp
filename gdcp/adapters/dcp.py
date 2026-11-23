@@ -15,6 +15,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import lru_cache, partial
+from itertools import accumulate
 from math import prod
 from contextlib import ExitStack
 from pathlib import Path
@@ -507,9 +508,48 @@ def _record_payload(root, record, expected, tensor_id):
 
 
 @dataclass(frozen=True)
-class _NativePayload:
+class _NativeBox:
     start: int
     end: int
+    run_bytes: int
+    global_strides: tuple[int, ...]
+
+
+def _native_box(shape, chunk, itemsize):
+    strides = tuple(prod(shape[i + 1 :]) * itemsize for i in range(len(shape)))
+    start = sum(lo * stride for lo, stride in zip(chunk.offsets, strides, strict=True))
+    extent = sum(
+        (n - 1) * stride for n, stride in zip(chunk.sizes, strides, strict=True)
+    )
+    run = itemsize
+    for length, full in reversed(list(zip(chunk.sizes, shape, strict=True))):
+        run *= length
+        if length != full:
+            break
+    return _NativeBox(start, start + extent + itemsize, run, strides)
+
+
+def _local_range(chunk, offset):
+    """Packed byte offset and contiguous length, or None for a gap between rows."""
+    box = chunk.box
+    relative = offset - box.start
+    if not 0 <= relative < box.end - box.start:
+        return None
+    if box.run_bytes == box.end - box.start:
+        return relative, box.run_bytes - relative
+    element = 0
+    for length, stride in zip(chunk.shape, box.global_strides, strict=True):
+        coordinate, relative = divmod(relative, stride)
+        if coordinate >= length:
+            return None
+        element = element * length + coordinate
+    local = element * chunk.itemsize + relative
+    return local, box.run_bytes - local % box.run_bytes
+
+
+@dataclass(frozen=True)
+class _NativePayload:
+    box: _NativeBox
     path: str
     offset: int
     shape: tuple[int, ...]
@@ -536,7 +576,7 @@ class _NativePayload:
             ) from exc
 
 
-def _native_payload(root, tensor_id, start, shape, dtype, record):
+def _native_payload(root, tensor_id, box, shape, dtype, record):
     path = os.path.join(root, record.relative_path)
     try:
         with open(path, "rb") as handle, FakeTensorMode():
@@ -569,8 +609,7 @@ def _native_payload(root, tensor_id, start, shape, dtype, record):
     ):
         raise ValueError(f"{tensor_id}: DCP tensor view exceeds its serialized storage")
     chunk = _NativePayload(
-        start,
-        start + prod(shape) * itemsize,
+        box,
         path,
         record.offset + offset + storage_offset,
         tuple(shape),
@@ -609,13 +648,24 @@ def _read_strided(chunk, start, end):
         return view.flat[start // chunk.itemsize : end // chunk.itemsize].view(np.uint8)
 
 
-def _overlapping_chunks(chunks, start, end):
-    first = bisect_right(chunks, start, key=lambda chunk: chunk.end)
-    for index in range(first, len(chunks)):
-        chunk = chunks[index]
-        if chunk.start >= end:
-            break
-        yield chunk
+class _NativeChunks:
+    """Index rectangular records by bounding byte range without expanding rows."""
+
+    def __init__(self, chunks):
+        self.chunks = sorted(chunks, key=lambda chunk: chunk.box.start)
+        self.starts = [chunk.box.start for chunk in self.chunks]
+        self.ends = list(accumulate((chunk.box.end for chunk in self.chunks), max))
+
+
+def _locate_chunk(index, offset):
+    for i in range(
+        bisect_right(index.ends, offset), bisect_right(index.starts, offset)
+    ):
+        chunk = index.chunks[i]
+        local = _local_range(chunk, offset)
+        if local is not None:
+            return chunk, *local
+    raise ValueError(f"native DCP byte offset {offset} has no backing record")
 
 
 class _NativeAccessor(DTensorDataAccessor):
@@ -630,14 +680,15 @@ class _NativeAccessor(DTensorDataAccessor):
         start = global_range.contiguous_payload_offset
         end = start + global_range.size
         chunks = self.ranges[global_range.file_path]
-        for chunk in _overlapping_chunks(chunks, start, end):
-            self._read_chunk(
-                chunk, max(start, chunk.start), min(end, chunk.end), read_to_buffer
-            )
+        while start < end:
+            chunk, local, available = _locate_chunk(chunks, start)
+            size = min(end - start, available)
+            self._read_chunk(chunk, local, local + size, read_to_buffer)
+            start += size
 
     def _read_chunk(self, chunk, start, end, callback):
         try:
-            data = self._read_payload(chunk, start - chunk.start, end - chunk.start)
+            data = self._read_payload(chunk, start, end)
         except OSError as exc:
             raise io_error("read", str(exc), chunk.path) from None
         call_buffer_callback(callback, chunk.resolve_view(data))
@@ -671,7 +722,9 @@ class DcpBackend:
         native_ranges = None
         if native_records is not None:
             native_ranges = {
-                path: [_native_payload(root, *record) for record in records]
+                path: _NativeChunks(
+                    _native_payload(root, *record) for record in records
+                )
                 for path, records in native_records.items()
             }
 
@@ -839,36 +892,41 @@ def _native_tensor(tensor_id, item, count, world):
 
 
 def _native_chunks(tensor_id, item):
-    shape = list(item.size)
-    chunks = sorted(item.chunks, key=lambda chunk: tuple(chunk.offsets))
-    error = ValueError(
-        f"{tensor_id}: DCP chunk geometry cannot be represented: only contiguous Shard(0) chunks are supported"
-    )
+    shape = item.size
+    error = ValueError(f"{tensor_id}: DCP chunk geometry cannot be represented")
     if not shape:
-        if len(chunks) != 1 or chunks[0].offsets or chunks[0].sizes:
+        if len(item.chunks) != 1 or item.chunks[0].offsets or item.chunks[0].sizes:
             raise error
-        return chunks
-    if prod(shape) == 0 and not chunks:
-        return []
-    covered, nonempty = 0, []
-    for chunk in chunks:
-        offsets, sizes = chunk.offsets, chunk.sizes
-        if (
-            len(offsets) != len(shape)
-            or any(offsets[1:])
-            or list(sizes[1:]) != shape[1:]
-            or len(sizes) != len(shape)
-        ):
+        return item.chunks
+    nonempty, active = [], []
+    covered = 0
+    for chunk in sorted(item.chunks, key=lambda c: tuple(c.offsets)):
+        if len(chunk.offsets) != len(shape) or len(chunk.sizes) != len(shape):
             raise error
-        if sizes[0] == 0:
+        bounds = tuple(zip(chunk.offsets, chunk.sizes, shape, strict=True))
+        # A padded rank can report an empty extent past the last element.
+        if any(lo < 0 or n < 0 or (n > 0 and lo + n > full) for lo, n, full in bounds):
+            raise error
+        volume = prod(chunk.sizes)
+        if not volume:
             continue
-        if offsets[0] != covered or sizes[0] < 0 or covered + sizes[0] > shape[0]:
+        # A disjoint collection of in-bounds boxes covers the tensor exactly
+        # when their volumes sum to its volume. Sweep axis 0 to retire old boxes.
+        lo = chunk.offsets
+        hi = tuple(start + n for start, n, _ in bounds)
+        active = [(left, right) for left, right in active if right[0] > lo[0]]
+        if any(_boxes_overlap(lo, hi, left, right) for left, right in active):
             raise error
-        covered += sizes[0]
+        active.append((lo, hi))
         nonempty.append(chunk)
-    if covered != shape[0]:
+        covered += volume
+    if covered != prod(shape):
         raise error
     return nonempty
+
+
+def _boxes_overlap(lo, hi, left, right):
+    return all(a < d and c < b for a, b, c, d in zip(lo, hi, left, right, strict=True))
 
 
 def _native_objects(root, metadata, component, flat=None):
@@ -1000,17 +1058,12 @@ def read_component(root, component, *, metadata=None):
 
 def _native_records(metadata, key, item, chunks):
     assert metadata.storage_data is not None
-    row_bytes = prod(item.size[1:]) * item.properties.dtype.itemsize
-    if row_bytes == 0:
-        return []
     records = []
     for chunk in chunks:
         record = metadata.storage_data[MetadataIndex(key, chunk.offsets)]
         desc._safe_relative(record.relative_path)
-        start = chunk.offsets[0] if item.size else 0
-        records.append(
-            (key, start * row_bytes, chunk.sizes, item.properties.dtype, record)
-        )
+        box = _native_box(item.size, chunk, item.properties.dtype.itemsize)
+        records.append((key, box, chunk.sizes, item.properties.dtype, record))
     return records
 
 

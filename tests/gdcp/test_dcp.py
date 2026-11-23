@@ -413,7 +413,8 @@ def _check_torch_shard_load(root, expected, rank, world, native_load):
         )
 
 
-def test_native_dcp_load_uneven_shards_with_interior_empty(tmp_path):
+@pytest.mark.parametrize("empty_row", [1, 12], ids=["interior", "padded"])
+def test_native_dcp_load_uneven_shards_with_empty_record(tmp_path, empty_row):
     import pickle
 
     torch = pytest.importorskip("torch")
@@ -443,7 +444,7 @@ def test_native_dcp_load_uneven_shards_with_interior_empty(tmp_path):
     assert isinstance(item, TensorStorageMetadata)
     assert isinstance(empty_item, TensorStorageMetadata)
     empty = empty_item.chunks[0]
-    offset = torch.Size([1, 0])
+    offset = torch.Size([empty_row, 0])
     item.chunks.insert(1, ChunkStorageMetadata(offset, empty.sizes))
     metadata.storage_data[MetadataIndex("weight", offset)] = metadata.storage_data.pop(
         MetadataIndex("empty", empty.offsets)
@@ -456,15 +457,38 @@ def test_native_dcp_load_uneven_shards_with_interior_empty(tmp_path):
         _check_native_shard_load(tmp_path, values.numpy(), world)
 
 
+def test_native_rectangular_tiles_on_inner_axes(tmp_path):
+    import torch
+    from torch.distributed._shard.sharded_tensor import Shard, init_from_local_shards
+    from torch.distributed.checkpoint import save as native_save
+
+    values = torch.arange(60, dtype=torch.float32).reshape(3, 4, 5)
+    # Different column boundaries in the two slabs also exercise holes in a
+    # chunk's bounding byte range and reads starting inside its packed rows.
+    boxes = ((0, 1, 0, 2), (0, 1, 2, 5), (1, 4, 0, 3), (1, 4, 3, 5))
+    with _torch_rank(0, 1):
+        shards = [
+            Shard.from_tensor_and_offsets(
+                values[:, a:b, c:d].contiguous(), [0, a, c], 0
+            )
+            for a, b, c, d in boxes
+        ]
+        tensor = init_from_local_shards(shards, *values.shape)
+        native_save({"weight": tensor}, checkpoint_id=tmp_path / "model", no_dist=True)
+    for world in (1, 4):
+        _check_native_shard_load(tmp_path, values.numpy(), world)
+
+
 @pytest.mark.parametrize(
     "geometry",
     [
-        [([0, 0], [10, 2]), ([0, 2], [10, 2])],
+        [([0, 0], [10, 2]), ([0, 1], [10, 2])],
         [([0, 0], [6, 4]), ([5, 0], [5, 4])],
         [([0, 0], [4, 4]), ([5, 0], [5, 4])],
         [([0, 0], [6, 4])],
+        [([0, 0], [10, 3]), ([0, 4], [10, 1])],
     ],
-    ids=["column-shard", "overlap", "gap", "incomplete"],
+    ids=["column-overlap", "overlap", "gap", "incomplete", "out-of-bounds"],
 )
 def test_noncanonical_native_chunk_geometry_is_rejected(tmp_path, geometry):
     import pickle
