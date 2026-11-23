@@ -38,7 +38,7 @@ def _assert_request(request):
     assert isinstance(request, gdcp.DataAccessorRequest)
     assert is_dataclass(request)
     with pytest.raises(FrozenInstanceError):
-        request.mode = "invalid"
+        setattr(request, "mode", "invalid")
     assert request.component in ("model", "optimizer")
     assert request.mode in ("save", "load")
     assert request.tensors.keys() == request.ownership.keys()
