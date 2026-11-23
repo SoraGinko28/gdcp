@@ -176,6 +176,8 @@ def _weights(model_or_state, dtype, ctx, *, headers=None):
     component.table = DTensorTable(entries)
     if not loading:
         assert isinstance(component.accessor, TorchAccessor)
+        # Replica checks compare the original bytes, before dtype conversion.
+        component.source_accessor = component.accessor
         component.accessor = _CastAccessor(
             tensors,
             target_dtype,

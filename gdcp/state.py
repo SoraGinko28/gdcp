@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from gdtensor.access import DTensorDataAccessor
+
+from .access import DataAccessorRequest
 from gdtensor.builder import DTensorTable, PhysicalLayoutTable, StorageDTensorsView
 
 
@@ -22,6 +24,10 @@ class Component:
     # Scalars use a one-element physical tensor because the core requires
     # nonempty shapes. This retains the framework's logical shape.
     logical_shapes: dict[str, list[int]] = field(default_factory=dict)
+    # Optional framework mapping used by accessor-based preparation checks.
+    data_request: DataAccessorRequest | None = field(default=None, repr=False)
+    # Export conversions retain the source accessor for replica validation.
+    source_accessor: DTensorDataAccessor | None = field(default=None, repr=False)
 
 
 @dataclass

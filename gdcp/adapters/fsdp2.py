@@ -5,7 +5,7 @@ from contextlib import ExitStack, nullcontext
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from functools import cache, partial
-from hashlib import sha256
+from types import MappingProxyType
 from math import prod
 from typing import cast
 
@@ -50,9 +50,12 @@ from gdtensor_conn._geometry import _mesh, owned_intervals
 from gdtensor_conn.coord import GlooCoordinator, NcclCoordinator
 
 from .. import _hdfs, core, desc, hf
+from ..access import DataAccessorRequest
+from gdtensor.access import DTensorDataAccessor
 from ..checkpointer import _save_route
 from ..state import CheckpointState, Component, RankContext
-from .torch_access import TorchAccessor, _local_tensor
+from .torch_access import TorchAccessor
+from .access_checks import owned_digest
 from .torch_placements import is_strided, strided_parts
 from . import optimizer_state as _optim
 
@@ -153,8 +156,6 @@ def _ordered_shards(key, tensor):
 
 
 def _describe_tensor(key, tensor, ctx, replicated_mesh=None):
-    if tensor.device.type == "meta":
-        raise NotImplementedError(f"{key}: meta tensors are not supported")
     if tensor.dtype not in _DTYPES:
         raise NotImplementedError(f"{key}: unsupported real dtype {tensor.dtype}")
     meta = GlobalTensorMeta(
@@ -223,7 +224,7 @@ def _submesh_entries(state, world_size):
     return {
         (component.name, named.global_tensor_id): (
             named.d_tensor,
-            component.accessor.tensors[named.global_tensor_id],
+            component,
             grid,
         )
         for component in state.components
@@ -234,11 +235,10 @@ def _submesh_entries(state, world_size):
 
 def _submesh_report(entries, rank):
     report = {}
-    for key, (_, value, (ranks, _)) in entries.items():
+    for key, (_, component, (ranks, _)) in entries.items():
         digest = None
         if rank in ranks:
-            local = _local_tensor(value).contiguous().reshape(-1).view(torch.uint8)
-            digest = sha256(memoryview(local.cpu().numpy())).digest()
+            digest = owned_digest(component, key[1])
         report[key] = (ranks, digest)
     return report
 
@@ -320,7 +320,16 @@ def _optimizer_submesh_metadata(state, key, reports, ctx):
         )
 
 
-def _component(name, tensors, objects, ctx, scalar_meshes=None):
+def _component(
+    name,
+    tensors,
+    objects,
+    ctx,
+    scalar_meshes=None,
+    *,
+    data_accessor=None,
+    loading=False,
+):
     scalar_meshes = scalar_meshes or {}
     aliases = objects.get("aliases", {}) if name == "model" else {}
     entries = [
@@ -336,12 +345,38 @@ def _component(name, tensors, objects, ctx, scalar_meshes=None):
         for named in entries
         if isinstance(tensors[named.global_tensor_id], DTensor)
     }
-    component = Component(
+    mapping = TorchAccessor(tensors, {}, intervals)
+    ownership = {
+        named.global_tensor_id: tuple(
+            (
+                int(start) * named.d_tensor.global_tensor_meta.itemsize,
+                int(end) * named.d_tensor.global_tensor_meta.itemsize,
+            )
+            for start, end in owned_intervals(named, "compute", ctx.rank)
+        )
+        for named in entries
+    }
+    request = DataAccessorRequest(
         name,
-        DTensorTable(entries),
-        TorchAccessor(tensors, {}, intervals),
-        objects,
+        "load" if loading else "save",
+        MappingProxyType(dict(tensors)),
+        MappingProxyType(ownership),
+        mapping.local_offset,
     )
+    if data_accessor is None:
+        for key, tensor in tensors.items():
+            if tensor.device.type == "meta":
+                raise ValueError(
+                    f"{key}: tensor has no readable storage; a data_accessor is required"
+                )
+        accessor = mapping
+    else:
+        accessor = data_accessor(request)
+        if not isinstance(accessor, DTensorDataAccessor):
+            raise TypeError("data_accessor must return a DTensorDataAccessor")
+    component = Component(name, DTensorTable(entries), accessor, objects)
+    component.data_request = request
+
     component.logical_shapes = {
         key: [] for key, tensor in tensors.items() if tensor.ndim == 0
     }
@@ -569,7 +604,11 @@ def _optimizer_field_schema(key, value, parameter, ctx):
         "kind": "tensor",
         "shape": list(value.shape),
         "dtype": str(value.dtype).removeprefix("torch."),
-        "device": value.device.type,
+        # A distributed state's restoration device follows its mesh. Local
+        # storage may be supplied by an accessor independently of that mesh.
+        "device": value.device_mesh.device_type
+        if isinstance(value, DTensor)
+        else value.device.type,
         "layout": layout,
     }
 
@@ -794,8 +833,9 @@ def _load_adamw_slots(parameters, target, groups, field_keys):
 
 
 class FSDP2Adapter:
-    def __init__(self, *, loading=False, common_only=False):
+    def __init__(self, *, loading=False, common_only=False, data_accessor=None):
         self.loading, self.common_only = loading, common_only
+        self.data_accessor = data_accessor
         self.model_state: dict | None = None
         self.optimizer_state: dict | None = None
         self.optimizer_paths = {}
@@ -818,7 +858,16 @@ class FSDP2Adapter:
             self.model_aliases = _model_aliases(checkpoint_state["model"])
             self.model_state = _model_values(checkpoint_state["model"])
             objects = {"aliases": self.model_aliases} if self.model_aliases else {}
-            state.components.append(_component("model", self.model_state, objects, ctx))
+            state.components.append(
+                _component(
+                    "model",
+                    self.model_state,
+                    objects,
+                    ctx,
+                    data_accessor=self.data_accessor,
+                    loading=self.loading,
+                )
+            )
         if "optimizer" in checkpoint_state:
             self._optimizer(checkpoint_state, state, ctx)
         if self.loading:
@@ -936,7 +985,15 @@ class FSDP2Adapter:
             and isinstance(p := parameters[self.optimizer_paths[key][0]], DTensor)
             and p.device_mesh.size() < ctx.world_size
         }
-        component = _component("optimizer", tensors, objects, ctx, scalar_meshes)
+        component = _component(
+            "optimizer",
+            tensors,
+            objects,
+            ctx,
+            scalar_meshes,
+            data_accessor=self.data_accessor,
+            loading=self.loading,
+        )
         return component
 
     def _extra(self, checkpoint_state):
@@ -988,7 +1045,9 @@ class FSDP2Adapter:
 
 def _finish(state):
     for component in state.components:
-        component.accessor.finish()
+        finish = getattr(component.accessor, "finish", None)
+        if finish is not None:
+            finish()
 
 
 def save_checkpoint(
@@ -1000,11 +1059,18 @@ def save_checkpoint(
     hf_dtype=None,
     max_shard_size=None,
     process_group=None,
+    data_accessor=None,
     _preflight=None,
 ):
     ctx = _context(process_group)
 
     def prepare():
+        if data_accessor is not None and hf_dtype is not None:
+            raise ValueError(
+                "data_accessor cannot be combined with hf_dtype or fp32 master export"
+            )
+        if data_accessor is not None and not callable(data_accessor):
+            raise TypeError("data_accessor must be a factory")
         if _preflight is not None:
             return _preflight()
         return path, _save_route(checkpoint_format, hf_dtype, max_shard_size)
@@ -1012,7 +1078,10 @@ def save_checkpoint(
     root, route = _collective(ctx, prepare)
 
     def options():
-        return _save_agreement_options(route, max_shard_size, hf_dtype)
+        return {
+            **_save_agreement_options(route, max_shard_size, hf_dtype),
+            "custom data accessor": data_accessor is not None,
+        }
 
     def describe():
         if route == "HF weights":
@@ -1031,7 +1100,7 @@ def save_checkpoint(
         if isinstance(root, _hdfs.HdfsPath):
             _hdfs.require_client()
         state, metadata = _prepare_save_state(
-            checkpoint_state, snapshot, route, hf_dtype
+            checkpoint_state, snapshot, route, hf_dtype, data_accessor
         )
         state.global_steps = global_steps
         rank_state = dict(state.rank_state)
@@ -1077,25 +1146,29 @@ def _verify_optimizer_replicas(state, ctx):
     for component in state.components:
         if component.name != "optimizer":
             continue
-        assert isinstance(component.accessor, TorchAccessor)
+        assert component.data_request is not None
         pending = {
             key: value
-            for key, value in component.accessor.tensors.items()
+            for key, value in component.data_request.tensors.items()
             if value.ndim and not isinstance(value, DTensor)
         }
         empty = not pending
         if ctx.coordinator is not None:
             empty = ctx.coordinator.vote(empty)
         if not empty:
-            _collective(ctx, lambda: _optim.verify_plain_replicas(pending, ctx))
+            _collective(
+                ctx, lambda: _optim.verify_plain_replicas(pending, ctx, component)
+            )
 
 
-def _prepare_save_state(checkpoint_state, ctx, route, dtype):
+def _prepare_save_state(checkpoint_state, ctx, route, dtype, data_accessor=None):
     if route == "HF weights":
         from .hf import _prepare_save
 
         return _prepare_save(checkpoint_state, dtype, ctx)
-    return FSDP2Adapter().describe(checkpoint_state, ctx), None
+    return FSDP2Adapter(data_accessor=data_accessor).describe(
+        checkpoint_state, ctx
+    ), None
 
 
 def _save_agreement_options(route, max_shard_size, dtype):
@@ -1143,9 +1216,11 @@ def _latest_step(root):
     raise ValueError(f"no committed global_step_N checkpoint in {root}")
 
 
-def _load_agreement_options(path, state, preflight, validate_groups, common_only):
+def _load_agreement_options(
+    path, state, preflight, validate_groups, common_only, custom_accessor=False
+):
     fmt = _load_format(path, state)
-    options = {}
+    options = {"custom data accessor": custom_accessor}
     if fmt is None and path.is_dir() and not desc.STEP_DIRECTORY.fullmatch(path.name):
         path = _latest_step(path)
         options["generation"] = path.name
@@ -1170,10 +1245,18 @@ def _load_agreement_options(path, state, preflight, validate_groups, common_only
 
 
 def load_checkpoint(
-    path, checkpoint_state, common_only=False, *, process_group=None, _preflight=None
+    path,
+    checkpoint_state,
+    common_only=False,
+    *,
+    process_group=None,
+    data_accessor=None,
+    _preflight=None,
 ):
     ctx = _context(process_group)
-    adapter = FSDP2Adapter(loading=True, common_only=common_only)
+    adapter = FSDP2Adapter(
+        loading=True, common_only=common_only, data_accessor=data_accessor
+    )
 
     def prepare():
         if _preflight is not None:
@@ -1200,7 +1283,12 @@ def load_checkpoint(
                 state,
                 ctx,
                 lambda local: _load_agreement_options(
-                    local, state, preflight, validate_groups, common_only
+                    local,
+                    state,
+                    preflight,
+                    validate_groups,
+                    common_only,
+                    data_accessor is not None,
                 ),
                 latest=True,
             )

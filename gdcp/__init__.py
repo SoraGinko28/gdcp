@@ -1,5 +1,6 @@
 """Framework-neutral checkpoints over GDTensor, with an FSDP2 facade."""
 
+from .access import DataAccessorRequest
 from .checkpointer import FSDP2Checkpointer
 from .core import inspect, load, save
 
@@ -20,4 +21,12 @@ def load_hf(path, model_or_state, **kwargs):
     return implementation(path, model_or_state, **kwargs)
 
 
-__all__ = ["FSDP2Checkpointer", "inspect", "load", "save", "save_hf", "load_hf"]
+__all__ = [
+    "DataAccessorRequest",
+    "FSDP2Checkpointer",
+    "inspect",
+    "load",
+    "save",
+    "save_hf",
+    "load_hf",
+]

@@ -61,6 +61,7 @@ class FSDP2Checkpointer:
         barrier_rpc_tag_suffix=None,
         ignore_append_global_steps_to_folder=False,
         process_group=None,
+        data_accessor=None,
         **kwargs,
     ) -> None:
         options = {
@@ -97,6 +98,7 @@ class FSDP2Checkpointer:
             checkpoint_format=checkpoint_format,
             hf_dtype=hf_dtype,
             max_shard_size=max_shard_size,
+            data_accessor=data_accessor,
             process_group=process_group,
             _preflight=preflight,
         )
@@ -121,6 +123,7 @@ class FSDP2Checkpointer:
         dsp_size=1,
         cp_size=1,
         load_common_state_only=False,
+        data_accessor=None,
         **kwargs,
     ) -> None:
         options = {
@@ -153,6 +156,7 @@ class FSDP2Checkpointer:
             path,
             checkpoint_state,
             load_common_state_only,
+            data_accessor=data_accessor,
             process_group=process_group,
             _preflight=preflight,
         )

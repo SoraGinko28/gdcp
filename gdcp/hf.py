@@ -4,6 +4,7 @@ This module stays framework neutral. Torch-facing convenience functions import
 ``adapters.hf`` only when called. No GDCP manifest is needed to read HF files.
 """
 
+import ctypes
 import hashlib
 import json
 import re
@@ -22,12 +23,15 @@ from gdtensor.builder import (
     GlobalTensorMeta,
     NaiveDTensor,
     NamedDTensor,
+    Ok,
     Replicate,
     StorageDTensorsView,
 )
+from gdtensor.internal.ranges import RangeFromComputeView
 from gdtensor_conn._geometry import nonempty_columns
 from gdtensor_conn._layout import build_payload_index
-from gdtensor_conn.access import StorageDataAccessor
+from gdtensor_conn.access import StorageDataAccessor, call_buffer_callback
+from gdtensor_conn._result import catch
 from gdtensor_conn.formats import HF_INDEX_NAME, LoadSessionBase
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
@@ -620,19 +624,48 @@ def _read_payload_part(file, count):
     return data
 
 
+class _PayloadAccessor(DTensorDataAccessor):
+    """Read legacy alias payload checks through the public buffer contract."""
+
+    def __init__(self, file):
+        self.file = file
+
+    @catch
+    def read_to_buffer(self, global_range, read_to_buffer):
+        # Keep the existing sequential reads, including short-read handling.
+        data = _read_payload_part(self.file, global_range.size)
+        call_buffer_callback(read_to_buffer, bytearray(data))
+
+    def write_from_buffer(self, global_range, write_from_buffer):
+        raise NotImplementedError("HF alias payload checks are read-only")
+
+
 def _payload_digest(path, entry):
-    remaining = prod(entry["shape"]) * entry["itemsize"]
+    remaining = total = prod(entry["shape"]) * entry["itemsize"]
     digest = hashlib.sha256()
+
+    def consume(pointer, size):
+        nonlocal remaining
+        digest.update((ctypes.c_ubyte * size).from_address(pointer))
+        remaining -= size
+        return Ok(None)
+
     root = Path(path)
     cache = _hdfs.cache_for(root)
     if cache is not None:
         cache.fetch_payload(root, entry["file"])
     with (root / entry["file"]).open("rb") as file:
         file.seek(entry["offset"])
+        accessor = _PayloadAccessor(file)
         while remaining:
-            data = _read_payload_part(file, min(remaining, 16 * 1024**2))
-            digest.update(data)
-            remaining -= len(data)
+            result = accessor.read_to_buffer(
+                RangeFromComputeView(
+                    "payload", total - remaining, min(remaining, 16 * 1024**2)
+                ),
+                consume,
+            )
+            if type(result) is Err:
+                raise ValueError(result.value.msg)
     return digest.hexdigest()
 
 

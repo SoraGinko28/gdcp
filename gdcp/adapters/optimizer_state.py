@@ -1,7 +1,6 @@
 """Versioned optimizer schemas and lazy buffers, independent of optimizer algorithms."""
 
 from contextlib import nullcontext
-from hashlib import sha256
 from itertools import combinations, product
 from math import prod
 
@@ -16,6 +15,7 @@ from torch.distributed import (
 from torch.distributed.tensor import DTensor, Replicate
 
 from gdtensor_conn.coord import NcclCoordinator
+from .access_checks import owned_digest
 
 SCHEMA_KEY = "_gdcp_optimizer"
 SCALARS = (bool, int, float, str, type(None))
@@ -419,22 +419,13 @@ def _load_field(name, field, record, parameter, current, objects, ctx, mesh_cach
     raise ValueError(f"state.{name}.{field}: invalid optimizer field schema")
 
 
-def verify_plain_replicas(tensors, ctx):
+def verify_plain_replicas(tensors, ctx, component):
     """Compare ambiguous plain state collectively before a checkpoint can write."""
     reports = {
         key: (
             list(value.shape),
             str(value.dtype),
-            sha256(
-                memoryview(
-                    value.detach()
-                    .contiguous()
-                    .reshape(-1)
-                    .view(torch.uint8)
-                    .cpu()
-                    .numpy()
-                )
-            ).hexdigest(),
+            owned_digest(component, key).hex(),
         )
         for key, value in tensors.items()
     }

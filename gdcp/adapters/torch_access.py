@@ -134,16 +134,19 @@ class TorchAccessor(DTensorDataAccessor):
             host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
         self._key, self._tensor, self._host, self._mode = key, tensor, host, mode
 
+    def local_offset(self, key, offset, size):
+        """Translate an owned global byte range without accessing tensor data."""
+        if (runs := self.runs.get(key)) is not None:
+            return _run_offset(runs, offset, size)
+        return _local_offset(self.spans[key], offset, size)
+
     def _buffer(self, rng, mode):
         self._stage(rng.global_tensor_id, mode)
         assert self._host is not None
         data = self._host.reshape(-1).view(torch.uint8)
-        if (runs := self.runs.get(rng.global_tensor_id)) is not None:
-            offset = _run_offset(runs, rng.global_tensor_offset, rng.size)
-        else:
-            offset = _local_offset(
-                self.spans[rng.global_tensor_id], rng.global_tensor_offset, rng.size
-            )
+        offset = self.local_offset(
+            rng.global_tensor_id, rng.global_tensor_offset, rng.size
+        )
         if offset < 0 or offset + rng.size > data.numel():
             raise ValueError(
                 f"{rng.global_tensor_id}: range is outside the local tensor"
