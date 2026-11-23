@@ -57,7 +57,7 @@
 | 模型的普通 buffer，或不是 DTensor 的参数（如 `ignored_params`） | `ArrangedMesh(N)`，`[Replicate()]` |
 | 优化器状态，普通张量，`x.shape` 等于对应参数 `p` 的本地分片形状 | 先构造 `DTensor.from_local(x, p.device_mesh, p.placements)`，再按 2.2 转换 |
 | 优化器状态，普通张量，维数大于 0，不满足上一行 | `ArrangedMesh(N)`，`[Replicate()]`，且须满足不变量 I7 |
-| 优化器状态，标量，对应参数 `p` 是 DTensor 且 `|p.device_mesh| < N` | mesh 按 2.2 由 `p.device_mesh` 得出，每条轴都是 `Replicate()` |
+| 优化器状态，标量，对应参数 `p` 是 DTensor 且 `p.device_mesh.size() < N` | mesh 按 2.2 由 `p.device_mesh` 得出，每条轴都是 `Replicate()` |
 | 优化器状态，标量，其他情况 | `ArrangedMesh(N)`，`[Replicate()]` |
 
 优化器状态如果本身是 DTensor，按它自己的 `(S, d, M, P)` 套用 2.2，不参照参数的布局。
