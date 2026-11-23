@@ -724,10 +724,14 @@ def _validate_native_optimizer_fields(optimizer, group, fields):
             )
 
 
-def _validate_native_current_fields(current, field_keys):
+def _validate_native_current_fields(current, field_keys, saved_fields):
+    # Entirely absent parameter state is a valid lazy checkpoint and replaces
+    # any warmed destination slots. A saved parameter must still contain every
+    # destination field, including custom fields unknown to the optimizer class.
     wanted = {
         f"state.{name}.{field}"
         for name, fields in current["state"].items()
+        if name in saved_fields
         for field in fields
     }
     missing = wanted - field_keys
@@ -872,9 +876,11 @@ class FSDP2Adapter:
             and tensor_schema is not None
             and tensor_schema.get("__native__")
         ):
-            _validate_native_current_fields(self.optimizer_state, field_keys)
             schema = _native_optimizer_schema(
                 parameters, groups, field_keys, tensor_schema, objects, optimizer
+            )
+            _validate_native_current_fields(
+                self.optimizer_state, field_keys, schema["fields"]
             )
         if (
             schema is None

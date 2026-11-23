@@ -1411,6 +1411,56 @@ def test_native_dcp_restores_reordered_optimizer_groups_and_scalar_state(
         )
 
 
+@pytest.mark.parametrize("active_names", ("", "a"), ids=("empty", "partial"))
+@pytest.mark.parametrize("combined", (False, True), ids=("components", "bundle"))
+def test_native_dcp_lazy_state_replaces_warmed_optimizer(
+    tmp_path, monkeypatch, active_names, combined
+):
+    def snapshot(model, optimizer):
+        return model.state_dict(), {
+            name: optimizer.state.get(parameter, {})
+            for name, parameter in model.items()
+        }
+
+    monkeypatch.setattr(fsdp2, "FSDPModule", torch.nn.Module)
+    source, saved_optimizer = _native_grouped_optimizer(1.0, ("ab", "cd"))
+    saved = cast(dict[str, Any], get_optimizer_state_dict(source, saved_optimizer))
+    # Native DCP may omit every field of a parameter that has never had a
+    # gradient. Build that inventory without PyTorch materializing empty state.
+    saved["state"] = {
+        name: fields for name, fields in saved["state"].items() if name in active_names
+    }
+    for name, parameter in source.items():
+        if name not in active_names:
+            saved_optimizer.state.pop(parameter)
+    if combined:
+        torch_dcp_save(
+            {"model": source.state_dict(), "optimizer": saved},
+            checkpoint_id=tmp_path,
+            no_dist=True,
+        )
+    else:
+        torch_dcp_save(
+            source.state_dict(), checkpoint_id=tmp_path / "model", no_dist=True
+        )
+        torch_dcp_save(saved, checkpoint_id=tmp_path / "optimizer", no_dist=True)
+
+    target, optimizer = _native_grouped_optimizer(9.0, ("ab", "cd"))
+    FSDP2Checkpointer.load(tmp_path, {"model": target, "optimizer": optimizer})
+    assert set(optimizer.state) == {target[name] for name in active_names}
+    torch.testing.assert_close(
+        snapshot(target, optimizer), snapshot(source, saved_optimizer), rtol=0, atol=0
+    )
+    for model, opt in ((source, saved_optimizer), (target, optimizer)):
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, 0.125)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    torch.testing.assert_close(
+        snapshot(target, optimizer), snapshot(source, saved_optimizer), rtol=0, atol=0
+    )
+
+
 def test_native_dcp_validates_inventory_on_all_ranks_before_unrestricted_load(
     native_optimizer_checkpoint, tmp_path, monkeypatch
 ):
