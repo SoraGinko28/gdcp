@@ -20,6 +20,7 @@ SAVE_PARAMETERS = [
     ("barrier_rpc_tag_suffix", None),
     ("ignore_append_global_steps_to_folder", False),
     ("process_group", None),
+    ("data_accessor", None),
     ("kwargs", REQUIRED),
 ]
 LOAD_PARAMETERS = [
@@ -40,6 +41,7 @@ LOAD_PARAMETERS = [
     ("dsp_size", 1),
     ("cp_size", 1),
     ("load_common_state_only", False),
+    ("data_accessor", None),
     ("kwargs", REQUIRED),
 ]
 SAVE_REJECTED = {

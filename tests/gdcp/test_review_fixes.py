@@ -1266,7 +1266,10 @@ def test_facade_checks_materialized_tensor_schema(tmp_path, monkeypatch, fmt):
     monkeypatch.setattr(
         fsdp2,
         "_prepare_save_state",
-        lambda state, ctx, route, dtype: (fixture.states[ctx.rank], None),
+        lambda state, ctx, route, dtype, data_accessor=None: (
+            fixture.states[ctx.rank],
+            None,
+        ),
     )
 
     def save(ctx):

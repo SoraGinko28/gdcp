@@ -145,6 +145,7 @@ def meta_optimizer_worker(rank, world, rendezvous, root):
                 data_accessor=MemoryFactory(),
             )
             state = restored.state[target.weight]
+            assert isinstance(target.weight, DTensor)
             assert state["step"].device.type == "cpu"
             assert state["step"].item() == 5
             for field in ("exp_avg", "exp_avg_sq"):
