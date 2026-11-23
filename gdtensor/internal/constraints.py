@@ -159,7 +159,7 @@ def _naive(o):
         cache_num_steps,
         mesh_shape,
     )
-    from .products import Shard
+    from .products import Shard, StridedShard
 
     if type(o.mesh) is StCacheOuterProductMesh:
         # Cache mesh participants are (num_steps x num_nodes x concurrency_width);
@@ -182,7 +182,7 @@ def _naive(o):
         )
     nd = len(o.global_tensor_meta.global_shape)
     for p in o.placements:
-        if type(p) is Shard and not 0 <= p.axis < nd:
+        if type(p) in (Shard, StridedShard) and not 0 <= p.axis < nd:
             return _err(
                 o,
                 "placements_match_meta",
@@ -366,6 +366,16 @@ def _error(o):
     return None
 
 
+def _strided_shard(o):
+    if type(o.split_factor) is not int or o.split_factor < 1:
+        return _err(
+            o, "split_factor_positive", "split_factor must be a positive integer"
+        )
+    if type(o.axis) is not int or o.axis < 0:
+        return _err(o, "axis_nonnegative", "axis must be a nonnegative integer")
+    return None
+
+
 _EXTRA = {
     "ComputeDTensorsView": _compute_view,
     "StorageDTensorsView": _storage_view,
@@ -377,6 +387,7 @@ _EXTRA = {
     "DisjointStorageMeshList": _list,
     "ArrangedMesh": _arranged,
     "LiteralMesh": _literal,
+    "StridedShard": _strided_shard,
 }
 for _cls in ERROR_TYPES:
     _EXTRA[_cls.__name__] = _error

@@ -80,6 +80,9 @@ class Err(ErrBuilderMixin):
 # ------------------------------------------------------------------ Placement
 
 ShardBuilderMixin = make_builder_mixin("Shard", [("axis", "scalar")])
+StridedShardBuilderMixin = make_builder_mixin(
+    "StridedShard", [("axis", "scalar"), ("split_factor", "scalar")]
+)
 ReplicateBuilderMixin = make_builder_mixin("Replicate", [])
 PartialBuilderMixin = make_builder_mixin("Partial", [])
 
@@ -100,6 +103,26 @@ class Shard(ShardBuilderMixin):
 
     def __repr__(self):
         return f"Shard({self.axis!r})"
+
+
+@dataclasses.dataclass(eq=True)
+class StridedShard(StridedShardBuilderMixin):
+    """Shard each of ``split_factor`` consecutive chunks, then concatenate.
+
+    Splitting uses ceiling-sized chunks twice: first by ``split_factor``,
+    then by the mesh axis size. A coordinate owns its second-level piece of
+    every first-level chunk, packed in ascending global order.
+    """
+
+    axis: int = 0
+    split_factor: int = 1
+
+    __hash__ = field_hash
+
+    def check_constraints(self):
+        from .constraints import check_constraints
+
+        return check_constraints(self)
 
 
 @dataclasses.dataclass(eq=True)

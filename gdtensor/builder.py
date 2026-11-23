@@ -15,13 +15,14 @@ from .internal.builder_mixin import (
     make_builder_mixin as _make_builder_mixin,
 )
 
-from .internal.products import Err, Ok, Partial, Replicate, Shard
+from .internal.products import Err, Ok, Partial, Replicate, Shard, StridedShard
 from .internal.products import (
     ErrBuilderMixin,
     OkBuilderMixin,
     PartialBuilderMixin,
     ReplicateBuilderMixin,
     ShardBuilderMixin,
+    StridedShardBuilderMixin,
 )
 from .internal.dtensor import (
     DTensorTable,
@@ -298,6 +299,7 @@ __all__ = [
     "Ok",
     "Err",
     "Shard",
+    "StridedShard",
     "Replicate",
     "Partial",
     # errors
@@ -360,11 +362,13 @@ __all__ = [
     "new_ok",
     "new_err",
     "new_shard",
+    "new_strided_shard",
     "new_replicate",
     "new_partial",
     "OkBuilderMixin",
     "ErrBuilderMixin",
     "ShardBuilderMixin",
+    "StridedShardBuilderMixin",
     "ReplicateBuilderMixin",
     "PartialBuilderMixin",
 ]
@@ -414,5 +418,6 @@ new_gd_tensor_io_error = _factory(GDTensorIOError, "new_gd_tensor_io_error")
 new_ok = _factory(Ok, "new_ok")
 new_err = _factory(Err, "new_err")
 new_shard = _factory(Shard, "new_shard")
+new_strided_shard = _factory(StridedShard, "new_strided_shard")
 new_replicate = _factory(Replicate, "new_replicate")
 new_partial = _factory(Partial, "new_partial")

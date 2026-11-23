@@ -55,6 +55,7 @@ PRODUCT_FIELDS = {
     "Ok": ("value",),
     "Err": ("value",),
     "Shard": ("axis",),
+    "StridedShard": ("axis", "split_factor"),
     "Replicate": (),
     "Partial": (),
 }

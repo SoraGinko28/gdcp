@@ -1185,6 +1185,7 @@ GlobalTensorMeta =
 Placement =
     Oneof
   | Shard
+  | StridedShard
   | Replicate
   | Partial
 
@@ -1192,6 +1193,14 @@ Placement =
 Shard =
     Object
   * $axis int
+
+# Split this axis into split_factor ceiling-sized pieces; split every piece
+# by the mesh axis size; concatenate this coordinate's pieces in global order.
+# Later placements split that packed result. split_factor must be positive.
+StridedShard =
+    Object
+  * $axis int
+  * $split_factor int
 
 # Every participant holds the full tensor. Must be a field-less type: the
 # type itself carries the meaning.
@@ -1732,7 +1741,7 @@ CopyPlanChain = (
     | MixedCopyPlanChain
 )
 CacheMesh = StCacheOuterProductMesh | PermutedMesh[CacheMesh]
-Placement = Shard | Replicate | Partial
+Placement = Shard | StridedShard | Replicate | Partial
 Error = (
     ConstraintViolationError
     | CheckFailedError
@@ -1944,6 +1953,7 @@ class DTensorDataAccessor[RangeT](abc.ABC):
 | `builder` | `gdtensor.builder.Ok` | `Ok` |
 | `builder` | `gdtensor.builder.Err` | `Err` |
 | `builder` | `gdtensor.builder.Shard` | `Shard` |
+| `builder` | `gdtensor.builder.StridedShard` | `StridedShard` |
 | `builder` | `gdtensor.builder.Replicate` | `Replicate` |
 | `builder` | `gdtensor.builder.Partial` | `Partial` |
 | `builder` | `gdtensor.builder.ComputeMesh` | `ComputeMesh` |

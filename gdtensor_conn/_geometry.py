@@ -14,7 +14,8 @@ from gdtensor.builder import (
     ReshapedMesh,
     SlicedMesh,
 )
-from gdtensor.builder import Partial, Shard
+from gdtensor.builder import Partial, Shard, StridedShard
+from ._runs import axis_runs_of, axis_runs_to_intervals
 from ._result import invalid
 
 
@@ -81,6 +82,17 @@ def owned_box(nd, side, participant):
         raise invalid(
             "mesh", "ambiguous rank or placements do not match mesh dimensions"
         )
+    if any(type(p) is StridedShard for p in naive.placements):
+        axes = axis_runs_of(naive, cells.shape, hit[0])
+        if any(len(runs) > 1 for runs in axes):
+            raise invalid(
+                "placements",
+                "ownership is not one rectangular box; use owned_intervals",
+            )
+        return (
+            [runs[0][0] if runs else 0 for runs in axes],
+            [runs[0][1] if runs else 0 for runs in axes],
+        )
     lo = [0] * len(naive.global_tensor_meta.global_shape)
     hi = list(naive.global_tensor_meta.global_shape)
     for placement, size, coordinate in zip(naive.placements, cells.shape, hit[0]):
@@ -95,6 +107,18 @@ def owned_box(nd, side, participant):
 
 
 def owned_intervals(nd, side, participant):
+    naive = naive_of(nd)
+    if any(type(p) is StridedShard for p in naive.placements):
+        cells = _mesh(naive.mesh)
+        hit = np.argwhere(cells == participant)
+        if not len(hit):
+            return np.empty((0, 2), dtype=np.int64)
+        if len(hit) != 1:
+            raise invalid("mesh", "ambiguous rank")
+        return axis_runs_to_intervals(
+            naive.global_tensor_meta.global_shape,
+            axis_runs_of(naive, cells.shape, hit[0]),
+        )
     box = owned_box(nd, side, participant)
     empty = np.empty((0, 2), dtype=np.int64)
     if box is None:

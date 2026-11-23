@@ -50,7 +50,7 @@ def _placement(placement):
         Shard as TorchShard,
     )
 
-    if isinstance(placement, TorchShard):
+    if type(placement) is TorchShard:
         return Shard(placement.dim)
     if isinstance(placement, TorchReplicate):
         return Replicate()
