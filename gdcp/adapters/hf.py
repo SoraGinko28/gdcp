@@ -35,8 +35,9 @@ _SUPPORTED_CODES = set(_TORCH_DTYPE_CODES.values())
 class _CastAccessor(DTensorDataAccessor):
     """Convert local shards lazily, releasing each before visiting the next."""
 
-    def __init__(self, tensors, dtype, boxes):
+    def __init__(self, tensors, dtype, boxes, intervals=None):
         self.tensors, self.dtype, self.boxes = tensors, dtype, boxes
+        self.intervals = intervals or {}
         self.current: str | None = None
         self.accessor: TorchAccessor | None = None
 
@@ -48,7 +49,8 @@ class _CastAccessor(DTensorDataAccessor):
                 tensor.to(dtype=self.dtype) if tensor.is_floating_point() else tensor
             )
             self.current = key
-            self.accessor = TorchAccessor({key: tensor}, self.boxes)
+            intervals = {key: self.intervals[key]} if key in self.intervals else {}
+            self.accessor = TorchAccessor({key: tensor}, self.boxes, intervals)
         assert self.accessor is not None
         return self.accessor
 
@@ -175,7 +177,10 @@ def _weights(model_or_state, dtype, ctx, *, headers=None):
     if not loading:
         assert isinstance(component.accessor, TorchAccessor)
         component.accessor = _CastAccessor(
-            tensors, target_dtype, component.accessor.boxes
+            tensors,
+            target_dtype,
+            component.accessor.boxes,
+            component.accessor.intervals,
         )
     return model, CheckpointState(components=[component])
 

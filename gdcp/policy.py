@@ -8,6 +8,7 @@ from gdtensor.builder import (
     Replicate,
     ReshapedMesh,
     Shard,
+    StridedShard,
     Slice,
     SlicedMesh,
     SlotOuterProductMesh,
@@ -42,7 +43,7 @@ def _stored_tensor(named, order, world_size):
     for dim in tensor.placements:
         if type(dim) is Replicate:
             continue
-        if type(dim) is not Shard:
+        if type(dim) not in (Shard, StridedShard):
             raise ValueError(f"{named.global_tensor_id}: unsupported compute placement")
         # Use the existing row-sharded disk format for every compute layout.
         placement = Shard(0)

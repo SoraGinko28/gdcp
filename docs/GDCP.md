@@ -1,6 +1,6 @@
 # GDCP v1: FSDP2 checkpoints
 
-`gdcp.FSDP2Checkpointer` saves one real FSDP2 module, its AdamW optimizer, and
+`gdcp.FSDP2Checkpointer` saves one real FSDP2 module, its PyTorch optimizer, and
 arbitrary picklable per-rank extra state. All members of the checkpoint process group call save/load with the same
 path and compatible state. The group can use Gloo, NCCL, or
 both. For pure NCCL, bind each process to its assigned CUDA device before
@@ -55,10 +55,14 @@ FSDP and 2D HSDP or change the number of replicas and shards.
 
 On a two-dimensional DP × TP mesh, apply PyTorch tensor parallelism to the
 layer on the TP submesh, then call `fully_shard` on the DP submesh. GDCP
-supports sharding a weight and its AdamW moments along two different tensor
+supports sharding a weight and optimizer tensors along two different tensor
 dimensions. When FSDP2 subdivides existing TP shards along the same dimension,
 GDCP maps `(_StridedShard(dim, split_factor=tp_size), Shard(dim))` in TP-first
-order. Either layout can be restored into 1D FSDP and vice versa.
+order. General `_StridedShard` placements also work: a single strided axis,
+`(Shard(d), _StridedShard(d, split_factor=k))`, and placements produced by
+DTensor flatten/view on meshes with one to three axes. Split factors may differ
+from the sizes of other mesh axes, and uneven and empty shards are supported.
+Either layout can be restored into 1D FSDP and vice versa.
 
 For HSDP + TP, apply tensor parallelism on `mesh["tp"]` and call
 `fully_shard` on `mesh["replica", "dp"]`. GDCP reads
@@ -73,9 +77,24 @@ Return `Shard(dim)` to change the tensor dimension or `ShardPlacementResult` to
 choose a parameter-specific mesh. PyTorch requires a nonzero sharding dimension
 to divide evenly by the shard group size. GDCP maps each global byte range into
 the packed local shard, including column slices and slices on higher axes.
-Model weights and AdamW moment tensors follow the parameter layout. Scalar
-AdamW steps remain scalars. The on-disk tensor keys and shapes permit recovery
-into another supported layout with the same logical model.
+Each optimizer DTensor follows its own global shape, mesh and placements.
+Flattened parameter views, per-row or per-column statistics, and unrelated
+replicated tensors therefore retain their own geometry. Plain scalar tensors
+are replicated. A plain tensor shaped like its parameter's local shard follows
+that shard. For other plain tensors, all checkpoint ranks must have identical
+shape, dtype and bytes; GDCP checks this collectively before opening any files.
+Different values fail with the key and a request to use a DTensor.
+
+GDTensor's generic `StridedShard(axis, split_factor)` describes the interleaved
+ownership as contiguous runs. The accessor maps each global byte range into
+the packed local buffer. Storage remains a single logical copy in global order
+with the existing row-sharded disk layout. Ownership work scales with runs,
+rather than enumerating every element. Private PyTorch placement access is
+isolated in `gdcp/adapters/torch_placements.py`.
+
+The [GDCP v1 optimizer and strided evidence](../../docs/gdcp/review-fixes-evidence/optimizers-strided/REPORT.md)
+records actual PyTorch element ownership, verification counts and unavailable
+gates separately.
 
 A checkpoint key identifies one logical tensor. If several disjoint parameter
 meshes supply the same key, saving compares corresponding local shard digests
@@ -120,13 +139,13 @@ broadcast of rank 0's 64-bit digest, and comparison take 66 votes regardless
 of tensor count or world size. The low-level save includes the schema in
 its existing digest. FSDP2 checks the request before extracting optimizer
 state, so disagreement on the target, components or format leaves a fresh
-AdamW at its initial step. For coordinated saves with model or optimizer
+optimizer at its initial step. For coordinated saves with model or optimizer
 components, FSDP2 then checks the extracted tensor schema in a second digest.
 On disagreement, ranks report the compared fields and log their own
 description at debug level.
 
 The FSDP2 adapter rejects
-AdamW parameter and field names that produce the same flattened checkpoint
+optimizer parameter and field names that produce the same flattened checkpoint
 key. The exception includes both source paths.
 
 Agreement does not write any files. Loads can read from a read-only checkpoint
@@ -363,17 +382,36 @@ weights. Generic legacy optimizer sidecars without parameter groups use the
 `optimizer.` prefix for unmatched keys.
 Optimizer restoration precedes model restoration.
 
-Saving a fresh AdamW preserves its empty state and step counter. Restoring
-creates slots only for parameters with saved state, including when the target
-optimizer has already trained other parameters. A branch receiving its first
-gradient after restore initializes its moments on that first update.
+Any `torch.optim.Optimizer` is accepted when each parameter's state is a flat
+mapping from field names to tensors or `bool`, `int`, `float`, `str`, and `None`.
+Nested state is rejected with its checkpoint key. The GDCP v1 tests cover SGD
+with and without momentum, Adam, AdamW with AMSGrad, Adagrad, RMSprop, and a
+custom optimizer with additional tensor and scalar fields.
+
+Saving a fresh optimizer preserves its empty state. A versioned optimizer
+schema records the class, exact field names, tensor shapes and dtypes, and each
+field's layout relative to its parameter. Restoring creates slots only for
+parameters with saved state, without calling `step()` or changing gradients.
+Parameter-shaped, reshape, projected-dimension and replicated recipes follow
+the new parameter layout. Independent layouts preserve their saved mesh topology
+and map checkpoint-local coordinates into a new group of the same size. To
+change their topology or world size, supply a destination state DTensor.
+An initialized destination field always supplies its own
+requested layout. Checkpoints written before this schema remain readable using
+the legacy AdamW buffer construction.
+
+A different optimizer class is accepted only when state field sets and group
+option keys match exactly. Otherwise validation names both classes and fails
+before modifying state. Native PyTorch DCP does not record an optimizer class;
+its field inventory and group options supply the compatibility checks. Native
+SGD and Adam optimizer directories are supported.
 
 Optimizer groups are matched by their model parameter names. The target may
 reorder groups or parameters within a group. Load restores the saved group
 options and order, and fills each group's `param_names` with the corresponding
 fully qualified model names in `params` order. This also applies to unnamed
-optimizers, and a subsequent save records the restored names. AdamW moments
-and steps follow their parameters. Per-rank safetensors, DCP, and HF report
+optimizers, and a subsequent save records the restored names. Optimizer fields
+follow their recorded layouts. Per-rank safetensors, DCP, and HF report
 incompatible or ambiguous groups before checking requested tensor keys or
 reading tensor and extra-state payloads. For Torch-written native DCP, GDCP
 decodes membership with a restricted loader. Every rank must pass the group and
@@ -407,6 +445,10 @@ environment and exact verification commands are recorded in the task report.
 
 ## Known limitations
 
+- Optimizer state must be flat. `Partial` placements, meshes with more than
+  three axes, invalid dimensions, meta tensors and unsupported dtypes are
+  rejected before payload writes. When an independent optimizer mesh changes
+  topology or world size, a destination DTensor must specify the new layout.
 - The process group or coordinator must supply unique rank IDs, including
   rank 0. GDCP agrees on world size but does not census rank IDs.
 - Concurrent writers to the checkpoint target during a save are unsupported. If

@@ -13,7 +13,7 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     parallelize_module,
 )
-from torch.distributed.tensor.placement_types import _StridedShard
+from gdcp.adapters.torch_placements import is_strided, strided_parts
 
 from gdcp import FSDP2Checkpointer
 from tests.support.gdcp_fsdp2 import local
@@ -48,9 +48,7 @@ def _check_placements(model, mesh):
     prefix = (Replicate(),) if mesh.ndim == 3 else ()
     dp, tp = first.placements[-2:]
     assert first.placements[:-2] == prefix
-    assert (
-        type(dp) is _StridedShard and dp.dim == 0 and dp.split_factor == mesh.size(-1)
-    )
+    assert is_strided(dp) and strided_parts(dp) == (0, mesh.size(-1))
     assert tp == Shard(0)
     assert second.placements == (*prefix, Shard(0), Shard(1))
 

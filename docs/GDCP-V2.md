@@ -1,4 +1,4 @@
-# GDCP v2 formats and real models
+# GDCP v1 formats and real models
 
 The synchronous `FSDP2Checkpointer` retains every positional parameter and default of the reference checkpointer. New save options are passed as keyword arguments:
 
@@ -36,9 +36,39 @@ gdcp.load_hf(path, model)
 
 Per-rank safetensors, DCP, and HF all preserve `uint16`, `uint32`, and `uint64` buffers and `int16` buffers with `Shard(0)` placement. HF uses the native safetensors dtype codes `U16`, `U32`, `U64`, and `I16` in both export modes.
 
-Apply FSDP2 `fully_shard` to every decoder layer and then the root. Tied embedding keys are represented by a canonical parameter and aliases: payload and optimizer state are stored once. The adapter restores the complete state dictionary while preserving parameter identity. AdamW subclasses may keep any number of per-parameter tensor fields matching parameter geometry, plus replicated scalar fields. Optimizer fields must already exist in the target, including custom fields. The mixed-precision validation fixture uses a real AdamW implementation that updates fp32 masters and casts them to bf16 parameters.
+Apply FSDP2 `fully_shard` to every decoder layer and then the root. Tied embedding keys are represented by a canonical parameter and aliases: payload and optimizer state are stored once. The adapter restores the complete state dictionary while preserving parameter identity. Any PyTorch optimizer with flat per-parameter tensor and plain scalar fields is accepted. The GDCP v1 tests include SGD (with and without momentum), Adam, AdamW with AMSGrad, Adagrad, RMSprop, and a custom optimizer. Nested state is rejected with its key. The mixed-precision validation fixture uses a real AdamW implementation that updates fp32 masters and casts them to bf16 parameters.
 
-In all three full-state formats, AdamW group membership is matched by fully
+Every state DTensor is planned from its own global shape, mesh and placements,
+including flattened parameter views, projected row/column statistics and
+unrelated replicated shapes. A plain scalar tensor is replicated; a plain tensor
+with the parameter's local shape follows that shard. Other plain tensors must
+have identical shape, dtype and bytes on every checkpoint rank. This collective
+check runs before file creation; divergent values require an explicit DTensor.
+
+New optimizer metadata records the class and a versioned field schema, including
+shapes, dtypes and layout recipes. Lazy targets acquire buffers without an
+optimizer step or gradient modification. Parameter, reshape, projected-dimension
+and replicated recipes adapt to the destination parameter layout. Independent
+layouts retain their topology and map checkpoint-local coordinates into another
+group of the same size. Provide a destination state DTensor to change their
+topology or world size. Old checkpoints retain the AdamW fallback. A different optimizer
+class must have exactly matching state fields and group option keys, or load
+fails before mutation and names both classes. Native PyTorch DCP lacks class
+metadata and is validated using its fields and options, including SGD and Adam.
+
+General `_StridedShard` layouts work on meshes with one to three axes, including
+strided placement alone, `(Shard(d), _StridedShard(d, split_factor=k))`, FSDP2 + TP,
+and DTensor flatten/view outputs. Uneven and empty shards and factors unrelated
+to other axis sizes use the same run geometry. GDTensor's generic `StridedShard`
+and the packed local accessor preserve global element order. All formats still
+store one logical copy, row-sharded. Unsupported placements (including `Partial`),
+invalid dimensions, meta tensors, unsupported dtypes, and meshes outside the
+checkpoint group fail before payload writes and name the tensor.
+
+See the [GDCP v1 optimizer and strided evidence](../../docs/gdcp/review-fixes-evidence/optimizers-strided/REPORT.md)
+for the actual PyTorch ownership probes and final verification results.
+
+In all three full-state formats, optimizer group membership is matched by fully
 qualified model parameter name. Group and parameter order in the target may
 differ from the checkpoint. Load restores the saved order and group options,
 populates `param_names` to match `params` in every group, and restores moments
@@ -84,7 +114,7 @@ All three formats use the coordinator to compare a digest of the live
 world size, rank-state keys, the ordered component list, and format options,
 including FSDP2 dispatch, before payload I/O. Saves also check the resolved
 target and the ordered per-tensor schema. FSDP2 checks the schema after
-extracting state and before staging. GDCP rejects ambiguous flattened AdamW
+extracting state and before staging. GDCP rejects ambiguous flattened optimizer
 fields. POSIX loads can use read-only checkpoints. HDFS URI loads use a
 rank-local temporary directory and read-only remote access. See [HDFS checkpoints](GDCP.md#hdfs-checkpoints). Independent
 loads and saves to distinct targets can overlap in one parent. See the

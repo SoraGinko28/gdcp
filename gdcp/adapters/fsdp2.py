@@ -32,8 +32,6 @@ from torch.distributed.tensor import (
 )
 
 
-from torch.distributed.tensor.placement_types import _StridedShard
-
 from gdtensor.builder import (
     ArrangedMesh,
     DTensorTable,
@@ -45,15 +43,17 @@ from gdtensor.builder import (
     NamedDTensor,
     Replicate,
     Shard,
+    StridedShard,
 )
 from gdtensor.tag import WorldSize
-from gdtensor_conn._geometry import _mesh, owned_box
+from gdtensor_conn._geometry import _mesh, owned_intervals
 from gdtensor_conn.coord import GlooCoordinator, NcclCoordinator
 
 from .. import _hdfs, core, desc, hf
 from ..checkpointer import _save_route
 from ..state import CheckpointState, Component, RankContext
 from .torch_access import TorchAccessor, _local_tensor
+from .torch_placements import is_strided, strided_parts
 from . import optimizer_state as _optim
 
 _NO_EXTRA_STATE = object()
@@ -147,27 +147,9 @@ def _validate_state(state, *, common_only):
 
 
 def _ordered_shards(key, tensor):
-    ranks = tensor.device_mesh.mesh
-    placements = list(tensor.placements)
-    # Replication does not change shard boundaries. Keep replica axes and their
-    # rank coordinates fixed while expressing FSDP's TP-first split order.
-    axes = [i for i, p in enumerate(placements) if not isinstance(p, TorchReplicate)]
-    if len(axes) > 2:
-        raise NotImplementedError(
-            f"{key}: expected a replica axis on the HSDP + TP mesh"
-        )
-    if len(axes) == 2 and isinstance(dp := placements[axes[0]], _StridedShard):
-        dp_axis, tp_axis = axes
-        tp = placements[tp_axis]
-        if not (
-            type(tp) is TorchShard
-            and tp.dim == dp.dim
-            and dp.split_factor == ranks.size(tp_axis)
-        ):
-            raise NotImplementedError(f"{key}: unsupported strided DP/TP placement")
-        ranks = ranks.transpose(dp_axis, tp_axis)
-        placements[dp_axis], placements[tp_axis] = tp, TorchShard(dp.dim)
-    return ranks, placements
+    # A strided axis chunks the packed index set left-to-right, just as PyTorch
+    # does. GDTensor's run geometry handles both this and ordinary shard axes.
+    return tensor.device_mesh.mesh, tensor.placements
 
 
 def _describe_tensor(key, tensor, ctx, replicated_mesh=None):
@@ -197,17 +179,20 @@ def _describe_tensor(key, tensor, ctx, replicated_mesh=None):
         # A CPU AdamW step uses the parameter's replica topology for I/O, but
         # the accessor reads and restores the original scalar on its own device.
         return NaiveDTensor(meta, [Replicate() for _ in range(device_mesh.ndim)], mesh)
-    placements = []
-    for placement in torch_placements:
-        if isinstance(placement, TorchReplicate):
-            placements.append(Replicate())
-        elif type(placement) is TorchShard and 0 <= placement.dim < tensor.ndim:
-            placements.append(Shard(placement.dim))
-        else:
-            raise NotImplementedError(
-                f"{key}: expected Replicate or Shard on a valid tensor dimension"
-            )
+    placements = [_torch_placement(key, p, tensor.ndim) for p in torch_placements]
     return NaiveDTensor(meta, placements, mesh, torch_d_tensor=tensor)
+
+
+def _torch_placement(key, placement, ndim):
+    if isinstance(placement, TorchReplicate):
+        return Replicate()
+    if is_strided(placement):
+        dim, factor = strided_parts(placement)
+        if 0 <= dim < ndim and factor >= 1:
+            return StridedShard(dim, factor)
+    if type(placement) is TorchShard and 0 <= placement.dim < ndim:
+        return Shard(placement.dim)
+    raise NotImplementedError(f"{key}: unsupported placement {placement!r}")
 
 
 def _compute_mesh(key, ranks, shape, ctx):
@@ -346,15 +331,15 @@ def _component(name, tensors, objects, ctx, scalar_meshes=None):
         )
         for key, tensor in tensors.items()
     ]
-    boxes = {
-        named.global_tensor_id: owned_box(named, "compute", ctx.rank)
+    intervals = {
+        named.global_tensor_id: owned_intervals(named, "compute", ctx.rank)
         for named in entries
         if isinstance(tensors[named.global_tensor_id], DTensor)
     }
     component = Component(
         name,
         DTensorTable(entries),
-        TorchAccessor(tensors, boxes),
+        TorchAccessor(tensors, {}, intervals),
         objects,
     )
     component.logical_shapes = {

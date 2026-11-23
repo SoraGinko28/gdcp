@@ -1,5 +1,7 @@
 """Access live local torch tensors as raw bytes, including BF16 and scalars."""
 
+from bisect import bisect_right
+from itertools import accumulate
 from math import prod
 
 import torch
@@ -51,6 +53,26 @@ def _finish_write(key, tensor, host, written):
             tensor.copy_(host)
 
 
+def _byte_runs(key, tensor, owned):
+    width = tensor.element_size()
+    starts = [int(start) * width for start, _ in owned]
+    ends = [int(end) * width for _, end in owned]
+    prefix = list(
+        accumulate((end - start for start, end in zip(starts, ends)), initial=0)
+    )
+    if prefix[-1] != _local_tensor(tensor).numel() * width:
+        raise ValueError(f"{key}: planned runs differ from the local DTensor shape")
+    return starts, ends, prefix
+
+
+def _run_offset(runs, offset, size):
+    starts, ends, prefix = runs
+    index = bisect_right(starts, offset) - 1
+    if index < 0 or offset + size > ends[index]:
+        raise ValueError("range is outside the local shard")
+    return prefix[index] + offset - starts[index]
+
+
 class TorchAccessor(DTensorDataAccessor):
     """Stage at most one local tensor, independent of its number of I/O ranges.
 
@@ -60,12 +82,19 @@ class TorchAccessor(DTensorDataAccessor):
     staging buffer. CPU contiguous tensors need no staging allocation at all.
     """
 
-    def __init__(self, tensors, boxes):
+    def __init__(self, tensors, boxes, intervals=None):
         self.tensors = tensors
         self.boxes = boxes
+        self.intervals = intervals or {}
         self.spans = {
-            key: _shard_spans(value, boxes[key]) if isinstance(value, DTensor) else ()
+            key: _shard_spans(value, boxes[key])
+            if isinstance(value, DTensor) and key in boxes
+            else ()
             for key, value in tensors.items()
+        }
+        self.runs = {
+            key: _byte_runs(key, tensors[key], owned)
+            for key, owned in (intervals or {}).items()
         }
         self._key = None
         self._tensor = None
@@ -109,9 +138,12 @@ class TorchAccessor(DTensorDataAccessor):
         self._stage(rng.global_tensor_id, mode)
         assert self._host is not None
         data = self._host.reshape(-1).view(torch.uint8)
-        offset = _local_offset(
-            self.spans[rng.global_tensor_id], rng.global_tensor_offset, rng.size
-        )
+        if (runs := self.runs.get(rng.global_tensor_id)) is not None:
+            offset = _run_offset(runs, rng.global_tensor_offset, rng.size)
+        else:
+            offset = _local_offset(
+                self.spans[rng.global_tensor_id], rng.global_tensor_offset, rng.size
+            )
         if offset < 0 or offset + rng.size > data.numel():
             raise ValueError(
                 f"{rng.global_tensor_id}: range is outside the local tensor"

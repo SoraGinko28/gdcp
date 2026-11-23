@@ -470,6 +470,22 @@ def param_layouts(args):
     parameter_layouts(args)
 
 
+def strided(args):
+    from tests.support.gdcp_strided import strided as run
+
+    run(args)
+
+
+def strided_save(args):
+    args.phase = "save"
+    strided(args)
+
+
+def strided_load(args):
+    args.phase = "load"
+    strided(args)
+
+
 def dp_tp(args):
     from tests.support.gdcp_dp_tp import dp_tp as run
 
@@ -528,7 +544,10 @@ def main():
             "hsdp",
             "param_layouts",
             "dp_tp",
+            "strided",
             "optimizer_matrix",
+            "strided_save",
+            "strided_load",
             "hsdp_tp",
             "lazy_adamw",
             "hsdp_tp_source",

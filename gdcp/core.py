@@ -20,6 +20,7 @@ from gdtensor.builder import (
     GDTensorIOError,
     Ok,
     Shard,
+    StridedShard,
     global_tensor_meta_of,
     file_path_of,
 )
@@ -488,6 +489,14 @@ def _save_request(path, ctx: RankContext, components, rank_keys, format_options)
     }
 
 
+def _placement_schema(placement):
+    if type(placement) is StridedShard:
+        return ("StridedShard", placement.axis, placement.split_factor)
+    if type(placement) is Shard:
+        return ("Shard", placement.axis)
+    return (type(placement).__name__,)
+
+
 def _tensor_schema(state):
     # Record each distinct rank grid once, even for thousands of model tensors.
     meshes = {}
@@ -510,10 +519,7 @@ def _tensor_schema(state):
             "logical_shape": logical_shapes.get(named.global_tensor_id, shape),
             "dtype": meta.dtype,
             "itemsize": meta.itemsize,
-            "placements": [
-                ("Shard", p.axis) if type(p) is Shard else (type(p).__name__,)
-                for p in tensor.placements
-            ],
+            "placements": [_placement_schema(p) for p in tensor.placements],
             "mesh": mesh_index(tensor.mesh),
         }
 

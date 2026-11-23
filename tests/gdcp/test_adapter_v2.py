@@ -977,24 +977,20 @@ def test_context_rejects_unsupported_backend(monkeypatch):
         fsdp2._context()
 
 
-def test_strided_hsdp_keeps_replica_coordinates_on_rectangular_mesh():
-    from itertools import product
+def test_strided_hsdp_keeps_original_mesh_and_placements():
     from torch.distributed.tensor import Replicate
-    from torch.distributed.tensor.placement_types import _StridedShard
+    from gdcp.adapters.torch_placements import strided_shard
 
     ranks = torch.arange(12).reshape(2, 3, 2)
     source = SimpleNamespace(
         device_mesh=SimpleNamespace(mesh=ranks),
-        placements=(Replicate(), _StridedShard(1, split_factor=2), Shard(1)),
+        placements=(Replicate(), strided_shard(1, split_factor=2), Shard(1)),
     )
     ordered, placements = fsdp2._ordered_shards("weight", source)
-    assert placements == [Replicate(), Shard(1), Shard(1)]
-    assert ordered.shape == (2, 2, 3)
-    for replica, dp, tp in product(range(2), range(3), range(2)):
-        assert ordered[replica, tp, dp] == ranks[replica, dp, tp]
-    source.placements = (Replicate(), _StridedShard(1, split_factor=3), Shard(1))
-    with pytest.raises(NotImplementedError, match="strided DP/TP"):
-        fsdp2._ordered_shards("weight", source)
+    assert placements == source.placements
+    assert ordered is ranks
+    source.placements = (Replicate(), strided_shard(1, split_factor=3), Shard(1))
+    assert fsdp2._ordered_shards("weight", source)[1] == source.placements
 
 
 def test_tied_parameter_has_one_tensor_and_alias_metadata():
