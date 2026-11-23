@@ -1,6 +1,6 @@
 # GDCP v1: FSDP2 checkpoints
 
-`gdcp.FSDP2Checkpointer` saves one real FSDP2 module, its PyTorch optimizer, and
+`gdcp.FSDP2Checkpointer` saves one FSDP2 module, its PyTorch optimizer, and
 arbitrary picklable per-rank extra state. All members of the checkpoint process group call save/load with the same
 path and compatible state. The group can use Gloo, NCCL, or
 both. For pure NCCL, bind each process to its assigned CUDA device before
@@ -92,6 +92,55 @@ with the existing row-sharded disk layout. Ownership work scales with runs,
 rather than enumerating every element. Private PyTorch placement access is
 isolated in `gdcp/adapters/torch_placements.py`.
 
+## Custom tensor data access
+
+`FSDP2Checkpointer.save` and `.load` accept `data_accessor=None`. The default
+uses `TorchAccessor` with the existing checkpoint bytes and file I/O behavior.
+It requires readable tensor storage: a meta tensor fails during preparation,
+before any file is written, with its key and a request for `data_accessor`.
+
+Supply a factory to provide or receive tensor bytes independently of the
+model's storage:
+
+```python
+from gdcp import DataAccessorRequest, FSDP2Checkpointer
+from gdtensor.access import DTensorDataAccessor
+
+
+def make_accessor(request: DataAccessorRequest) -> DTensorDataAccessor:
+    return MyAccessor(request)  # Your DTensorDataAccessor implementation.
+
+
+FSDP2Checkpointer.save(path, state, data_accessor=make_accessor)
+FSDP2Checkpointer.load(path, state, data_accessor=make_accessor)
+```
+
+`DataAccessorRequest` is a frozen dataclass. GDCP calls the factory for each
+component and operation. Its fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `component` | `"model"` or `"optimizer"`. |
+| `mode` | `"save"` or `"load"`. |
+| `tensors` | Checkpoint key to this rank's tensor, either DTensor or plain, on any device. |
+| `ownership` | Checkpoint key to owned global byte intervals `(start, end)`, in packed local order. |
+| `local_offset` | Call `local_offset(key, global_offset, size)` to translate a contained global byte range to its packed local byte offset. |
+
+The returned object implements GDTensor's public `DTensorDataAccessor` interface.
+Its `read_to_buffer` and `write_from_buffer` methods receive a global range and a
+callback taking a buffer address and byte length, and return GDTensor `Result`
+values. Supply the requested bytes on save and receive them on load. GDCP also
+uses `read_to_buffer` for the plain optimizer-state replica comparison and the
+parameter submesh SHA-256 comparison. The accessor therefore supplies the
+bytes used by both validation and checkpoint I/O.
+
+All participating ranks must agree on whether they supply a custom factory.
+HF full-state saves work with custom accessors. Combining a custom factory with
+`hf_dtype` weights-only conversion, including fp32 master-weight export, fails
+before writing. Optimizer layout handling and lazy initialization are unchanged;
+GDCP never calls `step()` to create state, and restored slots reuse their
+parameter's mesh.
+
 The [GDCP v1 optimizer and strided evidence](../../docs/gdcp/review-fixes-evidence/optimizers-strided/REPORT.md)
 records actual PyTorch element ownership, verification counts and unavailable
 gates separately.
@@ -128,7 +177,8 @@ exports weights only or full state. All three formats require the same ordered
 component list on every rank during load and before staging a save.
 
 Coordinated saves and loads compare the live world size, ordered component
-names, rank-state keys, and built-in format options, including FSDP2 dispatch.
+names, rank-state keys, and built-in format options, including FSDP2 dispatch
+and whether a custom data accessor is supplied.
 Saves also compare the resolved target and each component's ordered tensor
 schema (names, aliases, global and logical shapes, dtype, item size, mesh and
 placements) before opening the checkpoint transaction. Loads compare the

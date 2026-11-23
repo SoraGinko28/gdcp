@@ -2,7 +2,7 @@
 
 本文定义 GDCP 如何把 PyTorch DTensor 的布局转换成 GDTensor 的计算视图和存储视图，以及转换必须满足的不变量。实现见 [`gdcp/adapters/fsdp2.py`](../gdcp/adapters/fsdp2.py) 的 `_describe_tensor`、[`gdcp/adapters/optimizer_state.py`](../gdcp/adapters/optimizer_state.py) 和 [`gdcp/policy.py`](../gdcp/policy.py)；持有集合的计算见 [`gdtensor_conn/_runs.py`](../gdtensor_conn/_runs.py) 和 [`gdtensor_conn/_geometry.py`](../gdtensor_conn/_geometry.py)。
 
-对应提交 `27e1f4a`。项目声明的最低 PyTorch 版本是 2.12；第 4 节的 PyTorch 语义在 2.12、2.14、2.15 上实测一致。
+映射语义以提交 `27e1f4a` 为基础，本文同时规定公开的数据访问扩展点。项目声明的最低 PyTorch 版本是 2.12；第 4 节的 PyTorch 语义在 2.12、2.14、2.15 上实测一致。
 
 ## 1 记号
 
@@ -21,16 +21,17 @@
 
 ### 2.1 前置条件
 
-以下任一条件成立时，GDCP 在建立暂存目录、写任何文件之前报错：
+映射只依赖形状、数据类型、mesh 和分片方式，与张量设备及是否有实际存储无关；meta 张量也可建立同一映射。以下任一条件成立时，GDCP 在建立暂存目录、写任何文件之前报错：
 
 | 条件 | 报错位置 |
 |-|-|
-| `T` 在 meta 设备上 | `_describe_tensor` |
 | `d` 不在支持列表中。支持：bool、uint8/16/32/64、int8/16/32/64、float16、bfloat16、float32、float64 | `_describe_tensor` |
 | `k ∉ {1, 2, 3}` | `_describe_tensor`、`policy._stored_tensor` |
 | `M` 中有重复 rank，或含 `G` 以外的 rank | `_compute_mesh` |
 | 某个 `p_a` 不是 `Shard`、`Replicate`、`_StridedShard` 三者之一（如 `Partial`） | `_torch_placement`、`axis_runs_of` |
 | `Shard(e)` 或 `_StridedShard(e, ·)` 的 `e ∉ [0, m)`，或 `split_factor < 1` | `_torch_placement` |
+
+数据访问的前置条件独立于上述映射：省略 `data_accessor` 时，默认 `TorchAccessor` 要求每个张量有可读的实际存储；meta 张量在准备阶段报错，消息包含存档键并说明需要 `data_accessor`。传入自定义工厂时，由工厂返回的 `gdtensor.access.DTensorDataAccessor` 提供或接收字节。各 rank 必须一致选择默认或自定义访问器；自定义访问器与 HF `hf_dtype` 权重转换（含 fp32 master 导出）的组合在写文件前拒绝，HF 完整状态格式不受此限制。
 
 ### 2.2 映射规则
 
@@ -60,7 +61,7 @@
 | 优化器状态，标量，对应参数 `p` 是 DTensor 且 `p.device_mesh.size() < N` | mesh 按 2.2 由 `p.device_mesh` 得出，每条轴都是 `Replicate()` |
 | 优化器状态，标量，其他情况 | `ArrangedMesh(N)`，`[Replicate()]` |
 
-优化器状态如果本身是 DTensor，按它自己的 `(S, d, M, P)` 套用 2.2，不参照参数的布局。
+优化器状态如果本身是 DTensor，按它自己的 `(S, d, M, P)` 套用 2.2，不参照参数的布局。这些规则对实际存储张量和 meta 张量相同；标量 `step` 保持原有的 CPU 标量规则，不因使用自定义访问器改变。
 
 ## 3 GDTensor 的持有序列
 
@@ -74,6 +75,8 @@
 3. `own_G = A_0 × A_1 × … × A_{m-1}` 的行优先展开，每个元组换成全局下标。
 
 `L = 0` 时各步都得到空序列。实现中 `A_e` 以“有序的连续区间列表”表示，相邻区间合并，运算量与区间数成正比，与元素个数无关（`axis_runs_of`）。当所有 `A_e` 都是单个区间时，持有范围是一个矩形块（`owned_box`）。
+
+公开的冻结数据类 `gdcp.DataAccessorRequest` 把这些持有区间转换成全局字节区间，按本地打包顺序提供为 `ownership[key]`。`tensors[key]` 是本 rank 的原始张量（DTensor 或普通张量），`local_offset(key, global_offset, size)` 使用 GDCP 原有的区间翻译，返回请求范围在打包后的本地字节序列中的偏移。访问器不能假定本地持有范围是单个矩形，也不能用全局偏移直接索引本地缓冲区。每个组件、每次保存或加载分别调用工厂，`component` 为 `"model"` 或 `"optimizer"`，`mode` 为 `"save"` 或 `"load"`。
 
 ## 4 PyTorch 侧的语义
 
@@ -95,7 +98,7 @@ PyTorch 在 `flatten`、`view`、`reshape`、`transpose`、`permute` 等操作�
 
 `Σ` 只依赖 `S`、`d`、`j`、`N` 以及“是否有分片轴”，与 `M` 的形状、rank 排列和具体分片方式无关。safetensors 和 DCP 格式按这个逻辑布局每个组内 rank 写一个文件；HF 格式使用同一逻辑布局，再按 `max_shard_size` 组织文件。
 
-同一个存档键出现在多个互不相交的参数子 mesh 上时，GDCP 先比对各子 mesh 对应位置的分片内容（SHA-256），一致后选定其中一个子 mesh 作为写入方（`_select_submesh_writers`）。
+同一个存档键出现在多个互不相交的参数子 mesh 上时，GDCP 先通过访问器的 `read_to_buffer` 读取持有区间，比对各子 mesh 对应位置的分片内容（SHA-256），一致后选定其中一个子 mesh 作为写入方（`_select_submesh_writers`）。
 
 ## 6 加载时的目标布局
 
@@ -122,10 +125,12 @@ PyTorch 在 `flatten`、`view`、`reshape`、`transpose`、`permute` 等操作�
 | I3 | **整体覆盖**：由 I2，所有 rank 的持有集合之并等于全部 `Π s_e` 个元素；两个 rank 持有同一元素，当且仅当它们的坐标只在 `Replicate` 轴上不同。 | 由 I2 推出；保存前的全局计划检查（GDTensor `validate_rank_save`）逐 rank 核对覆盖。 |
 | I4 | **只存一份**：`Σ` 中每个元素恰好属于一个存储槽，与计算侧有多少副本无关。 | [`tests/gdcp/test_fsdp2.py`](../tests/gdcp/test_fsdp2.py) `test_06_replicated_tensor_dedup`；HSDP、HSDP + TP 的写入方统计。 |
 | I5 | **存储与计算无关**：`Σ` 不随 `M` 和 `P` 变化（只区分“全复制”和“有分片”），因此任何满足 2.1 的目标布局都能从同一份存档读取。 | 跨布局、跨进程数恢复的回归（`test_02_reshard_matrix`、`test_parameter_layouts`、`test_dp_tp_same_and_different_dimensions`、`test_hsdp_tp_checkpoint_layouts`、`test_real_fsdp2_strided_cross_world`）。 |
-| I6 | **先拒绝后写入**：2.1 中的任一条件，以及各 rank 对张量清单（键、全局形状、数据类型、元素宽度、mesh、分片方式、别名）不一致，都在建立暂存目录前报错，已发布的存档不受影响。 | `tests/gdcp/test_strided.py`（`Partial` 拒绝且无文件）；[`tests/gdcp/test_review_fixes.py`](../tests/gdcp/test_review_fixes.py) `test_facade_checks_materialized_tensor_schema`。 |
+| I6 | **先拒绝后写入**：2.1 中的任一条件，以及各 rank 对是否使用自定义访问器或张量清单（键、全局形状、数据类型、元素宽度、mesh、分片方式、别名）不一致，都在建立暂存目录前报错，已发布的存档不受影响。 | `tests/gdcp/test_strided.py`（`Partial` 拒绝且无文件）；[`tests/gdcp/test_review_fixes.py`](../tests/gdcp/test_review_fixes.py) `test_facade_checks_materialized_tensor_schema`。 |
 | I7 | **普通张量的副本**：2.3 第三行的普通张量，保存前各 rank 比对 SHA-256，不一致就报错。模型的普通 buffer 不做比对，取组内 rank `j mod N` 的值。 | [`tests/gdcp/test_optimizer_audit.py`](../tests/gdcp/test_optimizer_audit.py) `test_plain_optimizer_state_requires_collective_byte_agreement`。 |
 | I8 | **复用参数的 mesh**：加载后，与参数 mesh 等价的优化器状态 mesh 是同一个 `DeviceMesh` 对象，保证优化器的下一步可以运行。 | `test_restored_optimizer_state_reuses_parameter_meshes`（Gloo、纯 NCCL、混合，4 卡和 8 卡）。 |
 | I9 | **组内编号**：存档中的 rank 编号、文件名和每 rank 额外状态都使用组内编号 `λ`，与全局 rank 无关。 | `test_independent_process_subgroups`（非连续子组 `[0,2]`、`[1,3]`）。 |
+| I10 | **只经访问器存取数据**：GDCP 对模型及优化器张量的所有数据读取和写入都通过 `DTensorDataAccessor`；普通优化器副本和参数子 mesh 的 SHA-256 比对也通过 `read_to_buffer` 读取持有区间，不直接读取张量存储。布局及元数据检查只访问形状、数据类型和分片信息。 | 自定义访问器回归覆盖保存、加载、普通优化器副本和参数子 mesh 比对；工厂请求的持有区间及偏移覆盖连续、非连续和一般 `StridedShard` 布局。 |
+| I11 | **默认行为不变**：不传 `data_accessor` 时继续使用 `TorchAccessor`，对有实际存储的既有输入，发布文件的每个字节和文件 I/O 行为与 `5e805c2` 相同。 | 对同一输入，在 `5e805c2` 和最终实现分别保存 safetensors、DCP、HF 完整状态，覆盖 1D FSDP、HSDP、模型及 AdamW，逐文件比较内容和 I/O。结果见[数据访问扩展验证报告](../../docs/gdcp/review-fixes-evidence/data-accessor/REPORT.md)。 |
 
 ## 8 示例
 
