@@ -129,11 +129,7 @@ def _stride(shape):
 def allocate(record, parameter, current=None, ctx=None, mesh_cache=None):
     shape, dtype = record["shape"], getattr(torch, record["dtype"])
     if current is not None and isinstance(current, torch.Tensor):
-        if list(current.shape) != shape:
-            raise ValueError(
-                "optimizer destination tensor shape differs from the checkpoint"
-            )
-        return torch.empty_like(current, dtype=dtype)
+        return _allocate_current(shape, dtype, current, parameter, mesh_cache)
     device = "cpu" if record.get("device") == "cpu" else parameter.device
     layout = record["layout"]
     kind = layout["kind"]
@@ -177,6 +173,33 @@ def allocate(record, parameter, current=None, ctx=None, mesh_cache=None):
     raise ValueError(f"unsupported optimizer layout recipe {kind!r}")
 
 
+def _allocate_current(shape, dtype, current, parameter, mesh_cache):
+    if list(current.shape) != shape:
+        raise ValueError(
+            "optimizer destination tensor shape differs from the checkpoint"
+        )
+    if not isinstance(current, DTensor) or not isinstance(parameter, DTensor):
+        return torch.empty_like(current, dtype=dtype)
+    mesh = _matching_parameter_mesh(
+        current.device_mesh.mesh.reshape(-1).tolist(),
+        current.device_mesh.mesh.shape,
+        current.device_mesh.mesh_dim_names,
+        current.device_mesh.device_type,
+        parameter.device_mesh,
+        mesh_cache,
+    )
+    if mesh is None:
+        return torch.empty_like(current, dtype=dtype)
+    return DTensor.from_local(
+        torch.empty_like(current.to_local(), dtype=dtype),
+        mesh,
+        current.placements,
+        run_check=False,
+        shape=current.shape,
+        stride=current.stride(),
+    )
+
+
 def _independent_mesh(layout, parameter_mesh, ctx, mesh_cache=None):
 
     groups = layout.get("mesh_groups", [layout["mesh_ranks"]])
@@ -198,6 +221,22 @@ def _independent_mesh(layout, parameter_mesh, ctx, mesh_cache=None):
     # same. This mapping is unique and preserves the independent mesh topology.
     rank_map = dict(zip(checkpoint_members, members, strict=True))
     groups = [tuple(rank_map[rank] for rank in ranks) for ranks in groups]
+    # A DeviceMesh carries its root layout as well as its visible ranks. In
+    # particular, rebuilding a DP axis of DP+TP makes its stride contiguous and
+    # DTensor then rejects operations with the parameter. Resolve each parameter
+    # before consulting the shared cache: another parameter may have the same
+    # ranks but belong to a different root layout.
+    for ranks in groups:
+        mesh = _matching_parameter_mesh(
+            ranks,
+            layout["mesh_shape"],
+            layout.get("mesh_dim_names"),
+            layout.get("mesh_device_type", parameter_mesh.device_type),
+            parameter_mesh,
+            mesh_cache,
+        )
+        if mesh is not None:
+            return mesh
     # A load owns its cache: process groups must not survive job teardown through
     # a global cache. Every rank traverses the same saved mesh and fiber order.
     key = (
@@ -210,6 +249,48 @@ def _independent_mesh(layout, parameter_mesh, ctx, mesh_cache=None):
     if key not in cache:
         cache[key] = _independent_mesh_groups(layout, groups, parameter_mesh, ctx)
     return cache[key]
+
+
+def _matching_parameter_mesh(ranks, shape, names, device_type, parameter_mesh, cache):
+    """Reuse the parameter's topology, including named views of its root mesh."""
+    root = parameter_mesh._get_root_mesh()
+    candidates = [parameter_mesh, root, *root._flatten_mapping.values()]
+    # Other parameters/current slots can already hold the requested root slice.
+    # Keep those actual objects instead of asking PyTorch for another view.
+    if cache is not None:
+        candidates.extend(
+            mesh
+            for mesh in cache.get("parameter_meshes", ())
+            if mesh._get_root_mesh() is root
+        )
+    names = tuple(names) if names is not None else None
+
+    def matches(mesh):
+        return (
+            mesh.device_type == device_type
+            and tuple(mesh.mesh.shape) == tuple(shape)
+            and mesh.mesh_dim_names == names
+            and mesh.mesh.reshape(-1).tolist() == list(ranks)
+        )
+
+    for mesh in candidates:
+        if matches(mesh):
+            return mesh
+    # Slicing reuses the root's layout and communicators; it does not initialize
+    # an equivalent standalone DeviceMesh or create any process groups.
+    available = set(root.mesh_dim_names or ()) | set(root._flatten_mapping)
+    if not names or not set(names) <= available:
+        return None
+    try:
+        mesh = root[names]
+    except (KeyError, RuntimeError):
+        # An unrelated mesh can reuse names that overlap a flattened axis.
+        return None
+    if not matches(mesh):
+        return None
+    if cache is not None:
+        cache.setdefault("parameter_meshes", []).append(mesh)
+    return mesh
 
 
 def _independent_mesh_groups(layout, groups, parameter_mesh, ctx):
@@ -298,7 +379,20 @@ def _mesh_axis_group(cells, axis, backend):
 
 
 def load_slots(parameters, current, saved, objects, ctx=None):
-    slots, mesh_cache = {}, {}
+    slots = {}
+    mesh_cache = {
+        "parameter_meshes": [
+            value.device_mesh
+            for value in parameters.values()
+            if isinstance(value, DTensor)
+        ]
+        + [
+            value.device_mesh
+            for fields in current["state"].values()
+            for value in fields.values()
+            if isinstance(value, DTensor)
+        ]
+    }
     for name, fields in saved["fields"].items():
         if name not in parameters:
             raise ValueError(f"optimizer state has no model parameter {name}")

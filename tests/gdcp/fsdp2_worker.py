@@ -528,6 +528,12 @@ def optimizer_matrix(args):
     run(args)
 
 
+def optimizer_meshes(args):
+    from tests.support.gdcp_optimizer_mesh import optimizer_meshes as run
+
+    run(args)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -546,6 +552,7 @@ def main():
             "dp_tp",
             "strided",
             "optimizer_matrix",
+            "optimizer_meshes",
             "strided_save",
             "strided_load",
             "hsdp_tp",

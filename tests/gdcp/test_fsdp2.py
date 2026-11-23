@@ -364,3 +364,15 @@ def test_general_optimizer_state_layouts(tmp_path, backend):
         pytest.skip("requires four CUDA devices and NCCL")
     output = _run(4, "optimizer_matrix", tmp_path, "--backend", backend)
     assert output.count("optimizer matrix PASS") == 4
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl", "cuda:nccl,cpu:gloo"])
+@pytest.mark.parametrize("world", [4, 8])
+def test_restored_optimizer_state_reuses_parameter_meshes(tmp_path, backend, world):
+    torch = pytest.importorskip("torch")
+    if backend != "gloo" and (
+        torch.cuda.device_count() < world or not torch.distributed.is_nccl_available()
+    ):
+        pytest.skip(f"requires {world} CUDA devices and NCCL")
+    output = _run(world, "optimizer_meshes", tmp_path, "--backend", backend)
+    assert output.count("optimizer meshes PASS") == world
