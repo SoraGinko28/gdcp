@@ -21,9 +21,10 @@ class ReplicaFactory(MemoryFactory):
 
     def __call__(self, request):
         accessor = super().__call__(request)
-        if request.component == self.component:
-            for value in accessor.storage.values():
-                value.add_(self.delta)
+        if request.component != self.component:
+            return accessor
+        for value in accessor.storage.values():
+            value.add_(self.delta)
         return accessor
 
 
@@ -119,44 +120,47 @@ def meta_optimizer_worker(rank, world, rendezvous, root):
     try:
         mesh = DeviceMesh("cpu", list(range(world)), mesh_dim_names=("fsdp",))
         for fmt in FORMATS:
-            source = torch.nn.Linear(4, 8, bias=False, device="meta")
-            fully_shard(source, mesh=mesh)
-            optimizer = torch.optim.AdamW(source.parameters())
-            optimizer.state[source.weight].update(
-                step=torch.tensor(5.0),
-                exp_avg=torch.empty_like(source.weight),
-                exp_avg_sq=torch.empty_like(source.weight),
-            )
-            optimizer.step = _no_step
-            path = Path(root) / fmt
-            FSDP2Checkpointer.save(
-                path,
-                {"model": source, "optimizer": optimizer},
-                checkpoint_format=fmt,
-                data_accessor=MemoryFactory(),
-            )
-            target = torch.nn.Linear(4, 8, bias=False, device="meta")
-            fully_shard(target, mesh=mesh)
-            restored = torch.optim.AdamW(target.parameters())
-            restored.step = _no_step
-            FSDP2Checkpointer.load(
-                path,
-                {"model": target, "optimizer": restored},
-                data_accessor=MemoryFactory(),
-            )
-            state = restored.state[target.weight]
-            assert isinstance(target.weight, DTensor)
-            assert state["step"].device.type == "cpu"
-            assert state["step"].item() == 5
-            for field in ("exp_avg", "exp_avg_sq"):
-                value = state[field]
-                assert isinstance(value, DTensor)
-                assert value.device.type == "meta"
-                assert value.device_mesh is target.weight.device_mesh
-                assert value.placements == target.weight.placements
+            _meta_optimizer_case(mesh, Path(root) / fmt, fmt)
         print(f"accessor meta optimizer rank {rank} PASS", flush=True)
     finally:
         destroy_process_group()
+
+
+def _meta_optimizer_case(mesh, path, fmt):
+    source = torch.nn.Linear(4, 8, bias=False, device="meta")
+    fully_shard(source, mesh=mesh)
+    optimizer = torch.optim.AdamW(source.parameters())
+    optimizer.state[source.weight].update(
+        step=torch.tensor(5.0),
+        exp_avg=torch.empty_like(source.weight),
+        exp_avg_sq=torch.empty_like(source.weight),
+    )
+    optimizer.step = _no_step
+    FSDP2Checkpointer.save(
+        path,
+        {"model": source, "optimizer": optimizer},
+        checkpoint_format=fmt,
+        data_accessor=MemoryFactory(),
+    )
+    target = torch.nn.Linear(4, 8, bias=False, device="meta")
+    fully_shard(target, mesh=mesh)
+    restored = torch.optim.AdamW(target.parameters())
+    restored.step = _no_step
+    FSDP2Checkpointer.load(
+        path,
+        {"model": target, "optimizer": restored},
+        data_accessor=MemoryFactory(),
+    )
+    state = restored.state[target.weight]
+    assert isinstance(target.weight, DTensor)
+    assert state["step"].device.type == "cpu"
+    assert state["step"].item() == 5
+    for field in ("exp_avg", "exp_avg_sq"):
+        value = state[field]
+        assert isinstance(value, DTensor)
+        assert value.device.type == "meta"
+        assert value.device_mesh is target.weight.device_mesh
+        assert value.placements == target.weight.placements
 
 
 def _no_step(*args, **kwargs):

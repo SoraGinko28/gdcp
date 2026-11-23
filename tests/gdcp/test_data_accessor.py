@@ -48,14 +48,16 @@ def _assert_request(request):
         assert sum(end - start for start, end in runs) == (
             tensor.numel() * tensor.element_size()
         )
-        packed = 0
-        for start, end in runs:
-            assert request.local_offset(key, start, end - start) == packed
-            if end - start > 1:
-                assert (
-                    request.local_offset(key, start + 1, end - start - 1) == packed + 1
-                )
-            packed += end - start
+        _assert_owned_runs(request, key, runs)
+
+
+def _assert_owned_runs(request, key, runs):
+    packed = 0
+    for start, end in runs:
+        assert request.local_offset(key, start, end - start) == packed
+        if end - start > 1:
+            assert request.local_offset(key, start + 1, end - start - 1) == packed + 1
+        packed += end - start
 
 
 @pytest.mark.parametrize("fmt", FORMATS)

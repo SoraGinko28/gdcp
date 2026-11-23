@@ -363,24 +363,38 @@ def _component(
         MappingProxyType(ownership),
         mapping.local_offset,
     )
-    if data_accessor is None:
-        for key, tensor in tensors.items():
-            if tensor.device.type == "meta":
-                raise ValueError(
-                    f"{key}: tensor has no readable storage; a data_accessor is required"
-                )
-        accessor = mapping
-    else:
-        accessor = data_accessor(request)
-        if not isinstance(accessor, DTensorDataAccessor):
-            raise TypeError("data_accessor must return a DTensorDataAccessor")
-    component = Component(name, DTensorTable(entries), accessor, objects)
-    component.data_request = request
+    accessor = _prepare_accessor(request, mapping, data_accessor)
+    component = Component(
+        name,
+        DTensorTable(entries),
+        accessor,
+        objects,
+        data_request=request,
+        source_accessor=mapping if data_accessor is None else None,
+    )
 
     component.logical_shapes = {
         key: [] for key, tensor in tensors.items() if tensor.ndim == 0
     }
     return component
+
+
+def _prepare_accessor(request, mapping, factory):
+    if factory is None:
+        _require_readable_storage(request.tensors)
+        return mapping
+    accessor = factory(request)
+    if not isinstance(accessor, DTensorDataAccessor):
+        raise TypeError("data_accessor must return a DTensorDataAccessor")
+    return accessor
+
+
+def _require_readable_storage(tensors):
+    for key, tensor in tensors.items():
+        if tensor.device.type == "meta":
+            raise ValueError(
+                f"{key}: tensor has no readable storage; a data_accessor is required"
+            )
 
 
 def _optimizer_values(state):

@@ -136,24 +136,28 @@ def worker(rank, world, rendezvous, output, layout):
             finish = _record_io(root.parent)
             FSDP2Checkpointer.load(root, {"model": target, "optimizer": restored})
             trace["load"] = finish()
-            for source, actual in zip(
-                model.parameters(), target.parameters(), strict=True
-            ):
-                assert isinstance(source, DTensor) and isinstance(actual, DTensor)
-                torch.testing.assert_close(
-                    source.to_local(), actual.to_local(), rtol=0, atol=0
-                )
-                for key, value in optimizer.state[source].items():
-                    got = restored.state[actual][key]
-                    if isinstance(value, DTensor):
-                        value, got = value.to_local(), got.to_local()
-                    torch.testing.assert_close(value, got, rtol=0, atol=0)
+            _assert_restored(model, optimizer, target, restored)
             (root.parent / f"{fmt}-rank-{rank}-io.json").write_text(
                 json.dumps(trace, indent=2, sort_keys=True) + "\n"
             )
             barrier()
     finally:
         destroy_process_group()
+
+
+def _assert_restored(model, optimizer, target, restored):
+    for source, actual in zip(model.parameters(), target.parameters(), strict=True):
+        assert isinstance(source, DTensor) and isinstance(actual, DTensor)
+        torch.testing.assert_close(source.to_local(), actual.to_local(), rtol=0, atol=0)
+        _assert_optimizer_state(optimizer.state[source], restored.state[actual])
+
+
+def _assert_optimizer_state(source, restored):
+    for key, value in source.items():
+        got = restored[key]
+        if isinstance(value, DTensor):
+            value, got = value.to_local(), got.to_local()
+        torch.testing.assert_close(value, got, rtol=0, atol=0)
 
 
 def manifest(root):
@@ -167,44 +171,46 @@ def manifest(root):
     }
 
 
+def comparison(left, right):
+    first, second = manifest(left), manifest(right)
+    first.pop("manifest.json", None)
+    second.pop("manifest.json", None)
+    names = sorted(first.keys() | second.keys())
+    changed = [name for name in names if first.get(name) != second.get(name)]
+    cases = []
+    for layout in ("fsdp", "hsdp"):
+        for fmt in ("safetensors", "dcp", "hf"):
+            cases.append(_comparison_case(layout, fmt, names, changed))
+    return {
+        "status": "fail" if changed else "pass",
+        "cases": cases,
+        "changed": changed,
+        "normalization": "output-parent absolute path only",
+    }
+
+
+def _comparison_case(layout, fmt, names, changed):
+    files = [name for name in names if name.startswith(f"{layout}/{fmt}/")]
+    traces = [name for name in names if name.startswith(f"{layout}/{fmt}-rank-")]
+    return {
+        "layout": layout,
+        "format": fmt,
+        "published_files": len(files),
+        "rank_traces": len(traces),
+        "changed_files": [name for name in files if name in changed],
+        "changed_traces": [name for name in traces if name in changed],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compare", type=Path, nargs=2)
     args = parser.parse_args()
     if args.compare:
-        left, right = args.compare
-        first, second = manifest(left), manifest(right)
-        first.pop("manifest.json", None)
-        second.pop("manifest.json", None)
-        names = sorted(first.keys() | second.keys())
-        changed = [name for name in names if first.get(name) != second.get(name)]
-        cases = []
-        for layout in ("fsdp", "hsdp"):
-            for fmt in ("safetensors", "dcp", "hf"):
-                prefix = f"{layout}/{fmt}/"
-                files = [name for name in names if name.startswith(prefix)]
-                traces = [
-                    name for name in names if name.startswith(f"{layout}/{fmt}-rank-")
-                ]
-                cases.append(
-                    {
-                        "layout": layout,
-                        "format": fmt,
-                        "published_files": len(files),
-                        "rank_traces": len(traces),
-                        "changed_files": [name for name in files if name in changed],
-                        "changed_traces": [name for name in traces if name in changed],
-                    }
-                )
-        result = {
-            "status": "fail" if changed else "pass",
-            "cases": cases,
-            "changed": changed,
-            "normalization": "output-parent absolute path only",
-        }
+        result = comparison(*args.compare)
         args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-        if changed:
+        if result["changed"]:
             raise SystemExit(1)
         return
     for layout, world in (("fsdp", 2), ("hsdp", 4)):

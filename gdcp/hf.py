@@ -15,6 +15,7 @@ from math import prod
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 from gdtensor.access import DTensorDataAccessor
 from gdtensor.builder import (
@@ -27,7 +28,6 @@ from gdtensor.builder import (
     Replicate,
     StorageDTensorsView,
 )
-from gdtensor.internal.ranges import RangeFromComputeView
 from gdtensor_conn._geometry import nonempty_columns
 from gdtensor_conn._layout import build_payload_index
 from gdtensor_conn.access import StorageDataAccessor, call_buffer_callback
@@ -658,15 +658,19 @@ def _payload_digest(path, entry):
         file.seek(entry["offset"])
         accessor = _PayloadAccessor(file)
         while remaining:
-            result = accessor.read_to_buffer(
-                RangeFromComputeView(
-                    "payload", total - remaining, min(remaining, 16 * 1024**2)
-                ),
-                consume,
+            rng = SimpleNamespace(
+                global_tensor_id="payload",
+                global_tensor_offset=total - remaining,
+                size=min(remaining, 16 * 1024**2),
             )
-            if type(result) is Err:
-                raise ValueError(result.value.msg)
+            _read_checked_payload(accessor, rng, consume)
     return digest.hexdigest()
+
+
+def _read_checked_payload(accessor, rng, consume):
+    result = accessor.read_to_buffer(rng, consume)
+    if type(result) is Err:
+        raise ValueError(result.value.msg)
 
 
 def _legacy_optimizer_keys(keys, optimizer):
