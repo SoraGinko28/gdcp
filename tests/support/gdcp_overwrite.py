@@ -60,8 +60,9 @@ def _operation(fmt, loading, fixture):
     return (core.load if loading else core.save), options
 
 
-def _run(fmt, path, fixture, *, loading=False):
+def _run(fmt, path, fixture, *, loading=False, **format_options):
     call, options = _operation(fmt, loading, fixture)
+    options.update(format_options)
     world = len(fixture.states)
     coordinator = ThreadCoordinator(world, timeout=30)
 

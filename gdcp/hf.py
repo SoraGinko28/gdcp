@@ -32,7 +32,7 @@ from gdtensor_conn.formats import HF_INDEX_NAME, LoadSessionBase
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
 
-from . import core, desc
+from . import _hdfs, core, desc
 from .backend import (
     _CoordinatedSaveSession,
     _InterruptIO,
@@ -212,7 +212,7 @@ class _HFSaveSession(_CoordinatedSaveSession):
     def my_files(self):
         paths = set(super().my_files())
         if self.rank == 0:
-            paths.update(_tensor_files(self.assignment))
+            paths.update(_tensor_files(self.assignment) - self.index.files.keys())
         return sorted(paths)
 
     def _header(self, path):
@@ -347,8 +347,10 @@ def _group_storage_rows(combined, table):
     return combined, DTensorTable([row[1] for row in rows])
 
 
-def _save_prepare(path, state, ctx, max_shard_size, *, observe=None):
-    combined, objects = _combined(state, observe=observe)
+def _save_prepare(path, state, ctx, max_shard_size, *, agreement=None):
+    combined, objects = _combined(
+        state, observe=agreement.observe if agreement else None
+    )
     for component in state.components:
         if component.name == "optimizer":
             objects[_OPTIMIZER_TENSORS] = sorted(
@@ -370,6 +372,8 @@ def _save_prepare(path, state, ctx, max_shard_size, *, observe=None):
         path, table, layout, ctx.coordinator
     )
     core._require(storage.check_constraints())
+    if agreement is not None:
+        agreement.check_file_writers(compute, storage)
     return combined, objects, compute, storage
 
 
@@ -410,9 +414,7 @@ def _save_staged(
     ctx, rank_state = agreement.ctx, agreement.rank_state
     prepared = agreement.phase(
         "HF prepare save",
-        lambda: _save_prepare(
-            path, state, ctx, max_shard_size, observe=agreement.observe
-        ),
+        lambda: _save_prepare(path, state, ctx, max_shard_size, agreement=agreement),
     )
     if type(prepared) is Err:
         return prepared
@@ -500,13 +502,17 @@ def _save_agreed(path, agreement, max_shard_size, write_metadata):
 
 def _read_header_file(path):
     with path.open("rb") as file:
-        prefix = file.read(8)
-        if len(prefix) != 8:
-            raise ValueError(f"{path.name}: truncated safetensors header")
-        length = struct.unpack("<Q", prefix)[0]
-        if length > 100_000_000:
-            raise ValueError(f"{path.name}: safetensors header exceeds 100 MB")
-        raw = file.read(length)
+        return _read_header(file, path)
+
+
+def _read_header(file, path):
+    prefix = file.read(8)
+    if len(prefix) != 8:
+        raise ValueError(f"{path.name}: truncated safetensors header")
+    length = struct.unpack("<Q", prefix)[0]
+    if length > 100_000_000:
+        raise ValueError(f"{path.name}: safetensors header exceeds 100 MB")
+    raw = file.read(length)
     if len(raw) != length:
         raise ValueError(f"{path.name}: truncated safetensors header")
     return length, json.loads(raw)
@@ -541,7 +547,11 @@ def _header_entry(filename, name, entry, length):
 
 def _add_header_file(root, filename, weight_map, headers):
     desc._safe_relative(filename)
-    length, document = _read_header_file(root / filename)
+    path = root / filename
+    cache = _hdfs.cache_for(path)
+    length, document = (
+        cache.header(path) if cache is not None else _read_header_file(path)
+    )
     entries = []
     for name, entry in document.items():
         if name == "__metadata__":
@@ -557,7 +567,7 @@ def _add_header_file(root, filename, weight_map, headers):
         if start != expected:
             raise ValueError(f"{filename}: noncontiguous/overlapping payload at {name}")
         expected = end
-    if (root / filename).stat().st_size != 8 + length + expected:
+    if _hdfs.file_size(root / filename) != 8 + length + expected:
         raise ValueError(f"{filename}: payload size does not match header")
 
 
@@ -582,13 +592,13 @@ def read_headers(path):
         raise ValueError("HF checkpoint has an incomplete save (.gdcp_pending)")
     index_file = root / HF_INDEX_NAME
     weight_map = (
-        json.loads(index_file.read_bytes())["weight_map"]
-        if index_file.is_file()
+        json.loads(_hdfs.local_file(index_file).read_bytes())["weight_map"]
+        if _hdfs.is_file(index_file)
         else None
     )
     if weight_map is not None and (not isinstance(weight_map, dict) or not weight_map):
         raise ValueError("HF weight_map must be a nonempty mapping")
-    if weight_map is None and not (root / _SINGLE_FILE).is_file():
+    if weight_map is None and not _hdfs.is_file(root / _SINGLE_FILE):
         # Older GDCP saves with zero tensors only wrote the completion marker.
         if _read_completion_marker(root).get("files") == []:
             return {}
@@ -613,7 +623,11 @@ def _read_payload_part(file, count):
 def _payload_digest(path, entry):
     remaining = prod(entry["shape"]) * entry["itemsize"]
     digest = hashlib.sha256()
-    with (Path(path) / entry["file"]).open("rb") as file:
+    root = Path(path)
+    cache = _hdfs.cache_for(root)
+    if cache is not None:
+        cache.fetch_payload(root, entry["file"])
+    with (root / entry["file"]).open("rb") as file:
         file.seek(entry["offset"])
         while remaining:
             data = _read_payload_part(file, min(remaining, 16 * 1024**2))
@@ -692,7 +706,9 @@ def _validate_alias_payloads(path, headers, duplicates):
 
 def _load_objects(path, components):
     filename = Path(path) / _OBJECTS
-    objects = desc.read_objects(filename) if filename.is_file() else {}
+    objects = (
+        desc.read_objects(_hdfs.local_file(filename)) if _hdfs.is_file(filename) else {}
+    )
     if not isinstance(objects, dict):
         raise ValueError("HF optimizer.json must contain a mapping")
     if "optimizer" in components and "optimizer" not in objects:
@@ -782,10 +798,10 @@ def _load_rank_state(path, state, ctx, *, optional):
     blobs = {}
     for name in state.rank_state:
         filename = root / name / f"{name}_rank_{ctx.rank}.pt"
-        if not filename.is_file():
+        if not _hdfs.is_file(filename):
             filename = filename.with_name(f"{name}_rank_0.pt")
-        if not optional or filename.is_file():
-            blobs[name] = filename.read_bytes()
+        if not optional or _hdfs.is_file(filename):
+            blobs[name] = _hdfs.local_file(filename).read_bytes()
     return blobs
 
 
@@ -868,7 +884,7 @@ def _load_agreed(path, state, ctx, *, preflight, validate_groups, optional_rank_
     combined, compute, storage, objects, headers, duplicates = prepared.value
 
     result = core._load_payloads(
-        [(combined.name, compute, storage)],
+        [(combined.name, compute, storage, Path(path))],
         ctx,
         lambda: _load_rank_state(path, state, ctx, optional=optional_rank_state),
         preflight=lambda: _validate_load_objects(state, objects, preflight),

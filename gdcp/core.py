@@ -21,8 +21,14 @@ from gdtensor.builder import (
     Ok,
     Shard,
     global_tensor_meta_of,
+    file_path_of,
 )
-from gdtensor.io import rank_load, rank_save
+from gdtensor.io import (
+    validate_single_writer_save,
+    rank_load,
+    rank_load_files,
+    rank_save,
+)
 from gdtensor_conn._geometry import _mesh, naive_of
 
 from . import _hdfs, desc
@@ -186,7 +192,7 @@ def _read_agreement(stack, path, state, ctx, options_for, *, latest=False):
 
     def options():
         nonlocal local
-        local, identity = _hdfs.localize(path, stack, latest=latest)
+        local, identity = _hdfs.localize(path, stack, latest=latest, selective=True)
         return {**options_for(local), **identity}
 
     agreed = _agree_load(state, ctx, options)
@@ -223,6 +229,7 @@ def _prepare_save(path, state, agreement, policy, backend):
         )
         agreement.observe()
         _require(storage.check_constraints())
+        agreement.check_file_writers(compute, storage)
         prepared.append((component, compute, storage))
     return prepared
 
@@ -406,6 +413,16 @@ def _initialize_transaction(transaction, state, prepared, ctx, rank_state):
     _initialize_save(transaction.stage, state, ctx, rank_state)
 
 
+def _file_writers(prepared):
+    return {
+        component.name: {
+            path: leader.rank
+            for leader, path in storage.physical_layout.file_paths.items()
+        }
+        for component, _, storage in prepared
+    }
+
+
 def _save_staged(transaction, state, agreement, inventory, policy, backend):
     path = transaction.stage
     ctx, rank_state = agreement.ctx, agreement.rank_state
@@ -414,6 +431,14 @@ def _save_staged(transaction, state, agreement, inventory, policy, backend):
     )
     if type(prepared) is Err:
         return prepared
+    if agreement.single_writer:
+        # A caller-supplied policy can return a different filename-to-rank
+        # mapping on each worker even when every local layout looks valid.
+        writers = _agree(
+            ctx, lambda: (None, {"HDFS file writers": _file_writers(prepared.value)})
+        )
+        if type(writers) is Err:
+            return writers
     initialized = agreement.phase(
         PREFLIGHT,
         lambda: _initialize_transaction(
@@ -511,7 +536,11 @@ def _validate_rank_state_inventory(path, inventory):
 
 
 class _SaveAgreement:
-    def __init__(self, state, context, ctx, rank_state, components):
+    def __init__(self, path, state, context, ctx, rank_state, components):
+        self.single_writer = (
+            isinstance(_hdfs.checkpoint_path(path), _hdfs.HdfsPath)
+            and ctx.world_size > 1
+        )
         self.state = state
         self.context = context
         self.ctx = ctx
@@ -520,6 +549,22 @@ class _SaveAgreement:
         self.configuration_changed = False
         self.keys_changed = False
         self.components_changed = False
+
+    def check_file_writers(self, compute, storage):
+        if not self.single_writer:
+            return
+        result = validate_single_writer_save(self.ctx.rank, compute, storage)
+        if type(result) is Err:
+            raise ValueError(f"HDFS requires one writer per file: {result.value.msg}")
+        layout = storage.physical_layout
+        # Native DCP also opens its reserved object file on rank zero.
+        if layout.container_format == "distcp" and any(
+            path == "__0_0.distcp" and leader.rank != 0
+            for leader, path in layout.file_paths.items()
+        ):
+            raise ValueError(
+                "HDFS requires one writer per file: __0_0.distcp is reserved for rank 0"
+            )
 
     def observe(self):
         # Accessors may run at different times on different ranks. Remember
@@ -568,7 +613,7 @@ def _agree_save(path, state, context, format_options):
         return agreed
     assert agreed.value is not None
     ctx, rank_state, components = agreed.value
-    return Ok(_SaveAgreement(state, context, ctx, rank_state, components))
+    return Ok(_SaveAgreement(path, state, context, ctx, rank_state, components))
 
 
 def _transactional_save(path, agreement, action):
@@ -754,7 +799,9 @@ def _load_objects(path, component, saved, strict, validate_groups=None):
     objects = {}
     if saved["objects"] is not None:
         desc._safe_relative(saved["objects"])
-        objects = desc.read_objects(Path(path) / component.name / saved["objects"])
+        objects = desc.read_objects(
+            _hdfs.local_file(Path(path) / component.name / saved["objects"])
+        )
     if validate_groups is not None:
         _validate_load_call(lambda: validate_groups(objects.get("param_groups")))
     missing = component.objects.keys() - objects.keys()
@@ -810,8 +857,14 @@ def _prepare_load_component(
     root = Path(path) / component.name
     for name, info in saved["files"].items():
         size = info.get("bytes")
-        if size and (root / name).stat().st_size != size:
+        if size and _hdfs.file_size(root / name) != size:
             raise ValueError(f"{component.name}: file size mismatch for {name}")
+    if _hdfs.cache_for(root) is not None:
+        metadata = (
+            ".metadata" if saved["format"] == "distcp" else desc.HF_COMMITTED_NAME
+        )
+        if _hdfs.is_file(root / metadata):
+            _hdfs.local_file(root / metadata)
     storage = backend.open(root, table, layout, ctx.coordinator)
     _require(storage.check_constraints())
     # The copy planner requires matching row order in both tables.
@@ -843,7 +896,7 @@ def _declared_rank_files(path, name, info):
         filename = info["pattern"].format(rank=rank)
         desc._safe_relative(filename)
         file = Path(path) / name / filename
-        if not file.is_file():
+        if not _hdfs.is_file(file):
             raise FileNotFoundError(f"missing declared rank state file {file}")
         files[rank] = file
     return files
@@ -851,11 +904,11 @@ def _declared_rank_files(path, name, info):
 
 def _load_rank_blob(name, files, rank, saved_world):
     if rank in files:
-        return files[rank].read_bytes()
+        return _hdfs.local_file(files[rank]).read_bytes()
     if rank < saved_world or 0 not in files:
         raise ValueError(f"rank state {name} has no declaration for rank {rank}")
     _LOG.warning("%s rank %d is absent; loading rank 0's state", name, rank)
-    return files[0].read_bytes()
+    return _hdfs.local_file(files[0]).read_bytes()
 
 
 def _load_one(ctx, compute, storage):
@@ -868,15 +921,19 @@ def _load_one(ctx, compute, storage):
     return result
 
 
-def _prepare_load_view(ctx, compute, storage, stack):
-    # The public executor validates the rank plan before calling begin_load.
-    # Stop there on the first pass, then resolve headers without copying bytes.
-    planned = GDTensorIOError(operation="prepare load", msg="rank plan validated")
-    probe = replace(storage, begin_load=lambda view, rank: Err(planned))
-    result = rank_load(ctx.rank, compute, probe)
-    if type(result) is not Err or result.value is not planned:
-        _require(result)
-        raise RuntimeError("rank load skipped plan validation")
+def _prepare_load_view(ctx, compute, storage, stack, root):
+    filenames = _require(rank_load_files(ctx.rank, compute, storage))
+    positions = storage.physical_layout.tensor_entries.keys()
+    cache = _hdfs.cache_for(root)
+    if cache is not None:
+        for filename in filenames:
+            cache.fetch_payload(root, filename)
+        needed = set(filenames)
+        positions = [
+            pos
+            for pos in positions
+            if _require(file_path_of(storage.physical_layout, pos)) in needed
+        ]
     if not storage.physical_layout.tensor_entries:
         return storage
     assert storage.begin_load is not None
@@ -893,7 +950,7 @@ def _prepare_load_view(ctx, compute, storage, stack):
         return Ok(session)
 
     stack.callback(close_unused)
-    for pos in storage.physical_layout.tensor_entries:
+    for pos in positions:
         _require(session.get_file_offset(pos))
     return replace(storage, begin_load=begin_load)
 
@@ -944,8 +1001,8 @@ def _validate_load_call(validate):
 def _validate_load(views, ctx, validate, stack):
     _validate_load_call(validate)
     return [
-        (name, compute, _prepare_load_view(ctx, compute, storage, stack))
-        for name, compute, storage in views
+        (name, compute, _prepare_load_view(ctx, compute, storage, stack, root))
+        for name, compute, storage, root in views
     ]
 
 
@@ -959,9 +1016,14 @@ def _copy_load_payloads(views, ctx):
     return Ok(None)
 
 
-def _load_components(prepared, ctx, state, load_rank_state, preflight):
+def _load_components(prepared, ctx, state, load_rank_state, preflight, *, root=None):
     views = [
-        (component.name, compute, storage)
+        (
+            component.name,
+            compute,
+            storage,
+            Path(root) / component.name if root is not None else None,
+        )
         for component, compute, storage, _ in prepared
     ]
     objects = {component.name: objects for component, _, _, objects in prepared}
@@ -1061,4 +1123,6 @@ def _load_agreed(
             optional=optional_rank_state,
         )
 
-    return _load_components(components, ctx, state, load_rank_state, preflight)
+    return _load_components(
+        components, ctx, state, load_rank_state, preflight, root=path
+    )

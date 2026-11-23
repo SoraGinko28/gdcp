@@ -13,6 +13,9 @@ from gdtensor_conn.formats import SafeTensorsLoadSession, SafeTensorsSaveSession
 from gdtensor_conn.iobackend import FileIO
 
 
+from . import _hdfs
+
+
 class _InterruptIO(FileIO):
     """Remember interrupts that connector commit converts to an error Result."""
 
@@ -163,5 +166,12 @@ class SafeTensorsBackend:
             StorageDataAccessor(index, io),
             layout,
             _collective_begin(begin_save, coordinator) if coordinator else begin_save,
-            partial(_begin_session, SafeTensorsLoadSession, str(root), index, io),
+            partial(
+                _begin_session,
+                SafeTensorsLoadSession,
+                str(root),
+                index,
+                io,
+                eager_headers=_hdfs.cache_for(root) is None,
+            ),
         )

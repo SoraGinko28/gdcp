@@ -546,7 +546,7 @@ def save_checkpoint(
                 "checkpoint components or rank_state keys changed during state preparation"
             )
         return core._SaveAgreement(
-            state, ctx, snapshot, rank_state, components
+            root, state, ctx, snapshot, rank_state, components
         ), metadata
 
     agreement, write_metadata = _collective(ctx, materialize)

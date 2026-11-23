@@ -247,7 +247,7 @@ def load_hf(path, model_or_state, dtype=None):
     with ExitStack() as stack:
 
         def prepare():
-            local, identity = localize(path, stack)
+            local, identity = localize(path, stack, selective=True)
             _, state = _weights(
                 model_or_state, dtype, ctx, headers=_model_headers(local)
             )

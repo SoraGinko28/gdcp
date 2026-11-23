@@ -97,9 +97,23 @@ creates the checkpoint in a private POSIX staging directory. Single-host jobs
 use the system temporary directory by default. For multi-host jobs set
 `GDCP_HDFS_STAGING_DIR` to a writable POSIX directory shared by all saving
 ranks. Allow space for the complete checkpoint there. Rank zero streams the
-finished files to HDFS. On load, each rank downloads the selected checkpoint
-into its own system temporary directory. Allow one checkpoint's worth of
-temporary space per loading rank. An HDFS load only needs read access remotely.
+finished files to HDFS. HDFS saves require one writer per payload file. Multiple
+ranks may save separate files in the same checkpoint. A layout that assigns
+one file to several writing ranks fails before payload I/O, including HF shards
+that span writers. Reducing the HF shard size does not split a sharded tensor
+by rank. Use the per-rank safetensors or DCP format for these saves.
+Existing shared-file checkpoints remain readable. During restore, each rank reads the metadata and downloads
+only the whole payload files in its GDTensor load plan into a private temporary
+directory. Model-only loads skip optimizer payloads. An extra-state-only load
+reads its declared rank file (or the saved rank-zero fallback) without downloading
+tensor shards. Temporary space depends on the selected files. Shared files can
+be needed by several ranks, and a single-file HF model may be needed in full
+by every rank. An HDFS load only needs read access remotely.
+
+New GDCP HF revisions on HDFS include a small safetensors header catalog. Readers
+check downloaded files against it before copying tensors. For earlier revisions,
+readers obtain the headers from the remote shards and download only the required
+payload files. The HF file layout and public save/load signatures are unchanged.
 
 Each checkpoint directory contains immutable `.gdcp-revision-…` directories
 and a small `.gdcp-current` file naming the published revision. A single HDFS

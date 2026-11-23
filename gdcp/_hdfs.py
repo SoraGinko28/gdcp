@@ -1,9 +1,11 @@
 """Native HDFS transport for GDCP checkpoint directories."""
 
+import json
 import os
 import re
 import shutil
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path, PurePosixPath
@@ -15,6 +17,8 @@ from . import desc
 
 _CURRENT = ".gdcp-current"
 _REVISION = re.compile(r"\.gdcp-revision-[0-9a-f]{32}")
+_HF_HEADERS = ".gdcp-hf-headers.json"
+_ACTIVE: ContextVar["_ReadCache | None"] = ContextVar("gdcp_hdfs_read", default=None)
 _BLOCK = 8 * 1024 * 1024
 
 
@@ -86,7 +90,7 @@ def _resolve(client, root, latest):
     if revision:
         return root / revision
     if latest and not desc.STEP_DIRECTORY.fullmatch(root.name):
-        entries = (root / name for name, isdir in _children(client, root) if isdir)
+        entries = (root / name for name, info in _children(client, root) if info.isdir)
         return _latest_revision(client, entries, root)
     raise FileNotFoundError(f"no committed GDCP HDFS checkpoint in {root}")
 
@@ -131,6 +135,10 @@ def publish(client, target, local):
     previous = _revision(client, root)
     try:
         _upload(client, local, data)
+        if (local / desc.HF_COMMITTED_NAME).is_file() and not (
+            local / _HF_HEADERS
+        ).exists():
+            _publish_hf_headers(client, local, data)
         with client.create(str(pending)) as output:
             output.write(revision.encode("ascii"))
     except BaseException:
@@ -156,28 +164,131 @@ def _children(client, remote):
         entry = PurePosixPath(info.path)
         if entry.parent != remote or entry.name in ("", ".", ".."):
             raise ValueError("invalid child in HDFS checkpoint listing")
-        yield entry.name, info.isdir
+        yield entry.name, info
 
 
-def _download(client, remote, local, manifest_only):
-    names = (
-        [(desc.MANIFEST_NAME, False)] if manifest_only else _children(client, remote)
-    )
-    for name, isdir in names:
+def _publish_hf_headers(client, local, remote):
+    from .hf import _read_header_file
+
+    files = json.loads((local / desc.HF_COMMITTED_NAME).read_bytes())["files"]
+    headers = {}
+    for name in files:
+        desc._safe_relative(name)
+        headers[name] = _read_header_file(local / name)
+    with client.create(str(remote / _HF_HEADERS)) as out:
+        out.write(json.dumps(headers, separators=(",", ":"), allow_nan=False).encode())
+
+
+def _list_revision(client, remote, local, sizes):
+    for name, info in _children(client, remote):
         path = local / name
-        if isdir:
+        if info.isdir:
             path.mkdir()
-            _download(client, remote / name, path, False)
+            _list_revision(client, remote / name, path, sizes)
         else:
-            _download_file(client, remote / name, path)
+            sizes[path] = info.length
 
 
-def localize(path, stack, *, latest=False, manifest_only=False):
+class _ReadCache:
+    """One rank's private cache, pinned to one immutable remote revision."""
+
+    def __init__(self, client, remote, root):
+        self.client, self.remote, self.root = client, remote, root
+        self.sizes = {}
+        self.headers = None
+        self.fetched = set()
+        _list_revision(client, remote, root, self.sizes)
+
+    def fetch(self, path):
+        if path in self.fetched:
+            return path
+        if path not in self.sizes:
+            raise FileNotFoundError(path)
+        remote = self.remote / path.relative_to(self.root)
+        _download_file(self.client, remote, path)
+        if path.stat().st_size != self.sizes[path]:
+            raise OSError(f"incomplete HDFS download: {remote}")
+        self.fetched.add(path)
+        return path
+
+    def header(self, path):
+        from .hf import _read_header
+
+        catalog = self.root / _HF_HEADERS
+        if self.headers is None:
+            self.headers = (
+                json.loads(self.fetch(catalog).read_bytes())
+                if catalog in self.sizes
+                else {}
+            )
+        if catalog in self.sizes or path.name in self.headers:
+            return self.headers[path.name]
+        # Older revisions have no catalog. Read only header metadata here.
+        with self.client.read(str(self.remote / path.relative_to(self.root))) as stream:
+            entry = list(_read_header(stream, path))
+        self.headers[path.name] = entry
+        return entry
+
+    def fetch_payload(self, root, filename):
+        desc._safe_relative(filename)
+        path = self.fetch(root / filename)
+        if root != self.root or self.headers is None:
+            return
+        from .hf import _read_header_file
+
+        if list(_read_header_file(path)) != self.headers[filename]:
+            raise ValueError(f"{filename}: HF header disagrees with HDFS catalog")
+
+
+def cache_for(path):
+    cache = _ACTIVE.get()
+    if cache is not None and path is not None and Path(path).is_relative_to(cache.root):
+        return cache
+    return None
+
+
+def local_file(path):
+    cache = cache_for(path)
+    return cache.fetch(path) if cache is not None else path
+
+
+def is_file(path):
+    cache = cache_for(path)
+    return path in cache.sizes if cache is not None else path.is_file()
+
+
+def file_size(path):
+    cache = cache_for(path)
+    if cache is not None:
+        if path not in cache.sizes:
+            raise FileNotFoundError(path)
+        return cache.sizes[path]
+    return path.stat().st_size
+
+
+def localize(path, stack, *, latest=False, manifest_only=False, selective=False):
     target = checkpoint_path(path)
     if not isinstance(target, HdfsPath):
         return target, {}
     client = _client(target)
     remote = _resolve(client, target.path, latest)
     local = Path(stack.enter_context(TemporaryDirectory(prefix="gdcp-hdfs-read-")))
-    _download(client, remote, local, manifest_only)
+    if manifest_only:
+        _download_file(client, remote / desc.MANIFEST_NAME, local / desc.MANIFEST_NAME)
+    else:
+        cache = _ReadCache(client, remote, local)
+        _stage_metadata(cache, selective, stack)
     return local, {"HDFS revision": str(HdfsPath(target.authority, remote))}
+
+
+def _stage_metadata(cache, selective, stack):
+    root = cache.root
+    markers = (desc.MANIFEST_NAME, desc.HF_COMMITTED_NAME)
+    if not selective or not any(root / name in cache.sizes for name in markers):
+        for file in cache.sizes:
+            cache.fetch(file)
+        return
+    for name in (*markers, desc.PENDING_NAME):
+        if root / name in cache.sizes:
+            cache.fetch(root / name)
+    stack.callback(_ACTIVE.reset, _ACTIVE.set(cache))

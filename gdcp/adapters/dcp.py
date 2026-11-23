@@ -60,7 +60,7 @@ from gdtensor_conn.access import StorageDataAccessor, call_buffer_callback
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
 
-from .. import _dcp_metadata, core, desc
+from .. import _dcp_metadata, _hdfs, core, desc
 from ..backend import _collective_begin
 from ..policy import PerRankPolicy, storage_mesh
 
@@ -434,10 +434,12 @@ class _LoadSession(_Session, StorageLoadSession):
             }
             return
         metadata = read_metadata(self.root)
-        for pos, (path, slot) in self.index.slots.items():
-            self.offsets[pos] = _find_offset(
-                self.root, self.table, pos, path, slot, metadata
-            )
+        cache = _hdfs.cache_for(self.root)
+        self.offsets = {
+            pos: _find_offset(self.root, self.table, pos, path, slot, metadata)
+            for pos, (path, slot) in self.index.slots.items()
+            if cache is None or Path(self.root) / path in cache.fetched
+        }
 
     @catch
     def init_data_accessor(self):
