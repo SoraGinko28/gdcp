@@ -149,12 +149,13 @@ def _layout_paths(layout):
         if group is not None:
             paths[id(group)] = canonical.setdefault(group, path)
     for pos, group in layout.tensor_entries.items():
-        if id(group) not in paths:
-            try:
-                paths[id(group)] = canonical[group]
-            except KeyError:
-                key = (pos.tensor_id, pos.rank)
-                raise ValueError(f"{key} list has no file path") from None
+        if id(group) in paths:
+            continue
+        try:
+            paths[id(group)] = canonical[group]
+        except KeyError:
+            key = (pos.tensor_id, pos.rank)
+            raise ValueError(f"{key} list has no file path") from None
     return paths
 
 
@@ -299,12 +300,12 @@ def read_manifest(path, *, _validate_components=True, _rebuilt_components=None):
         raise ValueError(f"unsupported gdcp_version {manifest['gdcp_version']!r}")
     if type(manifest["world_size"]) is not int or manifest["world_size"] < 1:
         raise ValueError("invalid saved world_size")
-    if _validate_components:
-        for name, component in manifest["components"].items():
-            _safe_relative(name)
-            rebuilt = rebuild_component(component, manifest["world_size"])
-            if _rebuilt_components is not None and name in _rebuilt_components:
-                _rebuilt_components[name] = rebuilt
+    components = manifest["components"].items() if _validate_components else ()
+    for name, component in components:
+        _safe_relative(name)
+        rebuilt = rebuild_component(component, manifest["world_size"])
+        if _rebuilt_components is not None and name in _rebuilt_components:
+            _rebuilt_components[name] = rebuilt
     for name in manifest["rank_state"]:
         _safe_relative(name)
     return CheckpointDesc(manifest)

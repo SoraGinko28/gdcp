@@ -323,8 +323,9 @@ def test_full_state_votes_are_independent_of_names_and_world(
     more = roundtrip(tmp_path / "morekeys", more_keys)
     larger = roundtrip(tmp_path / "bigworld", _fixture(world=4))
     assert standard == longer == more == larger
+    # DCP adds two record-admission votes for each of the two components.
     assert (
-        standard == {"safetensors": (115, 73), "dcp": (116, 73), "hf": (100, 73)}[fmt]
+        standard == {"safetensors": (115, 73), "dcp": (120, 73), "hf": (100, 73)}[fmt]
     )
 
 

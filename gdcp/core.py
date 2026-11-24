@@ -979,22 +979,27 @@ def _load_positions(compute, storage, session, rank, filenames):
     for pos, (path, slot) in index.slots.items():
         if path not in needed:
             continue
+        if pos.tensor_id not in names:
+            raise ValueError(f"{pos.tensor_id}: saved slot has no target tensor")
         if pos.tensor_id not in ownership:
-            if pos.tensor_id not in names:
-                raise ValueError(f"{pos.tensor_id}: saved slot has no target tensor")
             ownership[pos.tensor_id] = owned_intervals(
                 names[pos.tensor_id], "compute", rank
             )
         local = ownership[pos.tensor_id]
-        ends = local[:, 1]
-        for left, right in slot.intervals:
-            # Searching sorted interval ends avoids rescanning a fragmented
-            # StridedShard ownership list for every saved storage column.
-            first = bisect_right(ends, left)
-            if first < len(local) and local[first, 0] < right:
-                positions.append(pos)
-                break
+        if _slot_intersects(local, slot.intervals):
+            positions.append(pos)
     return positions
+
+
+def _slot_intersects(local, intervals):
+    # Search sorted ends instead of rescanning fragmented StridedShard runs
+    # for every saved storage column.
+    ends = local[:, 1]
+    for left, right in intervals:
+        first = bisect_right(ends, left)
+        if first < len(local) and local[first, 0] < right:
+            return True
+    return False
 
 
 def _prepare_load_view(ctx, compute, storage, stack, root):

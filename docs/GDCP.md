@@ -185,6 +185,9 @@ ordinary ranks' nonlocal preflight reads; payload I/O and published bytes stay
 unchanged. DCP metadata is still decoded on every rank, and the core and
 connector still retain global storage indexes. HDFS retains its existing
 selective download and fetched-file validation scope.
+When ranks use different rank-local checkpoint copies, complete preflight
+covers the coordinator's copy and each other rank's read slots. Unread slots
+in another rank's private copy are not inspected there.
 
 All three formats support empty checkpoints, extra-state-only checkpoints,
 and model checkpoints with or without optimizer or extra state. Pass the keys

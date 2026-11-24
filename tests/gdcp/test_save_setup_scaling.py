@@ -200,6 +200,24 @@ def test_save_records_and_metadata_have_distinct_rank_duties(tmp_path, monkeypat
     }
 
 
+def _corrupt_nonlocal_geometry(original):
+    def corrupt(component, named, pos, slot):
+        if pos.rank == 3:
+            raise ValueError("injected nonlocal geometry failure")
+        return original(component, named, pos, slot)
+
+    return corrupt
+
+
+def _reject_local_preparation(original):
+    def reject(component, table, index, paths, named=None):
+        if "__1_0.distcp" in paths:
+            raise ValueError("injected local preparation failure")
+        return original(component, table, index, paths, named)
+
+    return reject
+
+
 @pytest.mark.parametrize("failure", ["global", "local"])
 def test_record_preparation_failure_votes_before_any_file_creation(
     tmp_path, monkeypatch, failure
@@ -207,23 +225,13 @@ def test_record_preparation_failure_votes_before_any_file_creation(
     fixture = _fixture(8, 4)
     monkeypatch.setattr(dcp, "_envelope", _envelope)
     if failure == "global":
-        original = dcp._chunk_envelope
-
-        def corrupt(component, named, pos, slot):
-            if pos.rank == 3:
-                raise ValueError("injected nonlocal geometry failure")
-            return original(component, named, pos, slot)
-
-        monkeypatch.setattr(dcp, "_chunk_envelope", corrupt)
+        monkeypatch.setattr(
+            dcp, "_chunk_envelope", _corrupt_nonlocal_geometry(dcp._chunk_envelope)
+        )
     else:
-        original_local = dcp._local_plan
-
-        def reject(component, table, index, paths, named=None):
-            if "__1_0.distcp" in paths:
-                raise ValueError("injected local preparation failure")
-            return original_local(component, table, index, paths, named)
-
-        monkeypatch.setattr(dcp, "_local_plan", reject)
+        monkeypatch.setattr(
+            dcp, "_local_plan", _reject_local_preparation(dcp._local_plan)
+        )
     io = _RecordIO()
     errors = _sessions(tmp_path, fixture, 4, io)
     assert all(isinstance(error, ValueError) for error in errors), errors

@@ -252,37 +252,37 @@ def _admit_plan[T](action: Callable[[], T], coordinator, message) -> T:
     return cast(T, value)
 
 
+def _validate_slot_size(component, named, pos, slot):
+    # Preserve nonlocal size admission without constructing a ZIP envelope.
+    _, shape = _slot_geometry(component, named, pos.rank)
+    dtype = _DTYPES[global_tensor_meta_of(named).dtype]
+    if prod(shape) * dtype.itemsize != slot.nbytes:
+        raise ValueError(f"{pos.tensor_id}: DCP envelope payload size mismatch")
+
+
+def _prepare_plan(component, table, index, rank, named):
+    for item in table.named_d_tensors:
+        named.setdefault(item.global_tensor_id, item)
+    # Preserve payload-index order, including ranks of uneven shards. Only
+    # the coordinator needs a global tensor-to-slot inventory.
+    slots = defaultdict(list) if rank in (None, 0) else None
+    paths = set()
+    for pos, (path, slot) in index.slots.items():
+        if slots is not None:
+            slots[pos.tensor_id].append((pos, path, slot))
+        else:
+            _validate_slot_size(component, named[pos.tensor_id], pos, slot)
+        if rank is None or pos.rank == rank:
+            paths.add(path)
+    value = _global_plan(component, table, slots, paths) if slots is not None else None
+    return value, paths
+
+
 def _plan(
     component, table, layout, index, *, rank=None, coordinator=None, named=None
 ) -> _Plan:
     named = {} if named is None else named
-
-    def prepare():
-        for item in table.named_d_tensors:
-            named.setdefault(item.global_tensor_id, item)
-        # Preserve the payload index's order, including ranks of uneven shards.
-        # Only the coordinator needs a global tensor-to-slot inventory.
-        slots = defaultdict(list) if rank in (None, 0) else None
-        paths = set()
-        for pos, (path, slot) in index.slots.items():
-            if slots is not None:
-                slots[pos.tensor_id].append((pos, path, slot))
-            else:
-                # Retain every rank's former nonlocal payload-size check using
-                # geometry and dtype width, without constructing ZIP envelopes.
-                item = named[pos.tensor_id]
-                _, shape = _slot_geometry(component, item, pos.rank)
-                dtype = _DTYPES[global_tensor_meta_of(item).dtype]
-                if prod(shape) * dtype.itemsize != slot.nbytes:
-                    raise ValueError(
-                        f"{pos.tensor_id}: DCP envelope payload size mismatch"
-                    )
-            if rank is None or pos.rank == rank:
-                paths.add(path)
-        value = (
-            _global_plan(component, table, slots, paths) if slots is not None else None
-        )
-        return value, paths
+    prepare = partial(_prepare_plan, component, table, index, rank, named)
 
     if rank is None:
         plan, _ = prepare()
@@ -609,35 +609,38 @@ class _SaveSession(_Session, StorageSaveSession):
 
     @catch
     def get_file_offset(self, pos):
-        if pos not in self.offsets:
-            hit = self.index.slots.get(pos)
-            if hit is None:
-                raise invalid(
-                    "file_offset", f"{pos.tensor_id}:{pos.rank}: DCP payload is absent"
-                )
-            path, slot = hit
-            file = self.index.files[path]
-            order = bisect_right(file.starts, slot.contiguous_payload_offset) - 1
-            starts = self._record_starts.setdefault(path, [0])
-            # A compute writer can target another logical rank's file (HSDP
-            # and TP). Build compact prefixes only for a file actually touched;
-            # retain offsets only for requested slots, with no remote records.
-            while len(starts) <= order:
-                previous = file.slots[len(starts) - 1]
-                _, _, length, _, _ = _chunk_envelope(
-                    self.component,
-                    self._named[previous.pos.tensor_id],
-                    previous.pos,
-                    previous,
-                )
-                starts.append(starts[-1] + length)
-            _, _, length, _, raw_offset = _chunk_envelope(
-                self.component, self._named[pos.tensor_id], pos, slot
-            )
-            if len(starts) == order + 1:
-                starts.append(starts[-1] + length)
-            self.offsets[pos] = starts[order] + raw_offset
+        if pos in self.offsets:
+            return self.offsets[pos]
+        self.offsets[pos] = self._resolve_offset(pos)
         return self.offsets[pos]
+
+    def _resolve_offset(self, pos):
+        hit = self.index.slots.get(pos)
+        if hit is None:
+            raise invalid(
+                "file_offset", f"{pos.tensor_id}:{pos.rank}: DCP payload is absent"
+            )
+        path, slot = hit
+        file = self.index.files[path]
+        order = bisect_right(file.starts, slot.contiguous_payload_offset) - 1
+        starts = self._record_starts.setdefault(path, [0])
+        # Compute writers can target other logical ranks' files. Advance
+        # compact prefixes only for touched files; retain no remote records.
+        while len(starts) <= order:
+            previous = file.slots[len(starts) - 1]
+            _, _, length, _, _ = _chunk_envelope(
+                self.component,
+                self._named[previous.pos.tensor_id],
+                previous.pos,
+                previous,
+            )
+            starts.append(starts[-1] + length)
+        _, _, length, _, raw_offset = _chunk_envelope(
+            self.component, self._named[pos.tensor_id], pos, slot
+        )
+        if len(starts) == order + 1:
+            starts.append(starts[-1] + length)
+        return starts[order] + raw_offset
 
     def _create_records(self):
         for path in self.my_files():
@@ -715,24 +718,32 @@ class _LoadMetadataIndex:
         if self.records is None:
             raise ValueError("native DCP .metadata has no storage_data")
         for named in table.named_d_tensors:
-            tensor_id = named.global_tensor_id
-            if tensor_id in self.named:
-                continue
-            item = _tensor_metadata(metadata, tensor_id)
-            meta = global_tensor_meta_of(named)
-            if (list(item.size) or [1]) != list(meta.global_shape):
-                raise ValueError(f"{tensor_id}: DCP shape mismatch")
-            if _CODES.get(item.properties.dtype) != meta.dtype:
-                raise ValueError(f"{tensor_id}: DCP dtype mismatch")
-            geometry = set()
-            for chunk in item.chunks:
-                key = (chunk.offsets, chunk.sizes)
-                if key in geometry:
-                    raise ValueError(f"{tensor_id}: duplicate DCP chunk geometry")
-                geometry.add(key)
-            self.named[tensor_id], self.chunks[tensor_id] = named, geometry
-            if len(item.size) == 0:
-                self.scalars.add(tensor_id)
+            self._add_tensor(named, metadata)
+
+    def _add_tensor(self, named, metadata):
+        tensor_id = named.global_tensor_id
+        if tensor_id in self.named:
+            return
+        item = _tensor_metadata(metadata, tensor_id)
+        meta = global_tensor_meta_of(named)
+        if (list(item.size) or [1]) != list(meta.global_shape):
+            raise ValueError(f"{tensor_id}: DCP shape mismatch")
+        if _CODES.get(item.properties.dtype) != meta.dtype:
+            raise ValueError(f"{tensor_id}: DCP dtype mismatch")
+        self.named[tensor_id] = named
+        self.chunks[tensor_id] = _chunk_geometries(tensor_id, item.chunks)
+        if len(item.size) == 0:
+            self.scalars.add(tensor_id)
+
+
+def _chunk_geometries(tensor_id, chunks):
+    geometry = set()
+    for chunk in chunks:
+        key = (chunk.offsets, chunk.sizes)
+        if key in geometry:
+            raise ValueError(f"{tensor_id}: duplicate DCP chunk geometry")
+        geometry.add(key)
+    return geometry
 
 
 class _LoadSession(_Session, StorageLoadSession):
@@ -748,24 +759,28 @@ class _LoadSession(_Session, StorageLoadSession):
 
     @catch
     def get_file_offset(self, pos):
-        if pos not in self.offsets:
-            if self._sealed:
-                raise invalid(
-                    "file_offset",
-                    f"{pos.tensor_id}:{pos.rank}: offset was not admitted by preflight",
-                )
-            hit = self.index.slots.get(pos)
-            if hit is None:
-                raise invalid(
-                    "file_offset", f"{pos.tensor_id}:{pos.rank}: DCP payload is absent"
-                )
-            path, slot = hit
-            self.offsets[pos] = (
-                slot.contiguous_payload_offset
-                if self.native_ranges is not None
-                else _find_offset(self.root, self._metadata_index, pos, path, slot)
-            )
+        if pos in self.offsets:
+            return self.offsets[pos]
+        self.offsets[pos] = self._resolve_offset(pos)
         return self.offsets[pos]
+
+    def _resolve_offset(self, pos):
+        if self._sealed:
+            raise invalid(
+                "file_offset",
+                f"{pos.tensor_id}:{pos.rank}: offset was not admitted by preflight",
+            )
+        hit = self.index.slots.get(pos)
+        if hit is None:
+            raise invalid(
+                "file_offset", f"{pos.tensor_id}:{pos.rank}: DCP payload is absent"
+            )
+        path, slot = hit
+        return (
+            slot.contiguous_payload_offset
+            if self.native_ranges is not None
+            else _find_offset(self.root, self._metadata_index, pos, path, slot)
+        )
 
     def _finish_preflight(self, positions):
         self.offsets = {pos: self.offsets[pos] for pos in positions}
