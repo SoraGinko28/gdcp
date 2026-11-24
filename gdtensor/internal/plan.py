@@ -405,9 +405,7 @@ def validate_rank_save(rank: int, compute_view, storage_view, plan: CopyPlan) ->
     for nd in compute_view.d_tensor_table.named_d_tensors:
         tid = nd.global_tensor_id
         pairs = by_tensor.get(tid, [])
-        designated = is_designated_writer(
-            nd, rank, tensors.order(tid)
-        )
+        designated = is_designated_writer(nd, rank, tensors.order(tid))
         owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
         if designated and owns:
             _covers_owned(nd, rank, pairs, CHECK)
