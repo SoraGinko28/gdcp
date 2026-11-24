@@ -61,7 +61,7 @@ from gdtensor_conn.access import StorageDataAccessor, call_buffer_callback
 from gdtensor_conn.iobackend import FileIO
 from gdtensor_conn.models import build_layout
 
-from .. import _dcp_metadata, _hdfs, core, desc
+from .. import _dcp_metadata, core, desc
 from ..backend import _collective_begin
 from ..policy import _storage_table, storage_mesh
 
@@ -697,23 +697,71 @@ class _SaveSession(_Session, StorageSaveSession):
         self.state = "aborted"
 
 
+class _LoadMetadataIndex:
+    """Normalize names and chunk geometry once for one load admission."""
+
+    def __init__(self, table, metadata):
+        self.named, self.chunks, self.scalars = {}, {}, set()
+        self.records = metadata.storage_data
+        if self.records is None:
+            raise ValueError("native DCP .metadata has no storage_data")
+        for named in table.named_d_tensors:
+            tensor_id = named.global_tensor_id
+            if tensor_id in self.named:
+                continue
+            item = _tensor_metadata(metadata, tensor_id)
+            meta = global_tensor_meta_of(named)
+            if (list(item.size) or [1]) != list(meta.global_shape):
+                raise ValueError(f"{tensor_id}: DCP shape mismatch")
+            if _CODES.get(item.properties.dtype) != meta.dtype:
+                raise ValueError(f"{tensor_id}: DCP dtype mismatch")
+            geometry = set()
+            for chunk in item.chunks:
+                key = (chunk.offsets, chunk.sizes)
+                if key in geometry:
+                    raise ValueError(f"{tensor_id}: duplicate DCP chunk geometry")
+                geometry.add(key)
+            self.named[tensor_id], self.chunks[tensor_id] = named, geometry
+            if len(item.size) == 0:
+                self.scalars.add(tensor_id)
+
+
 class _LoadSession(_Session, StorageLoadSession):
     def __init__(self, *args, native_ranges=None):
         super().__init__(*args)
         self.native_ranges = native_ranges
-        if native_ranges is not None:
-            self.offsets = {
-                pos: slot.contiguous_payload_offset
-                for pos, (_, slot) in self.index.slots.items()
-            }
-            return
-        metadata = read_metadata(self.root)
-        cache = _hdfs.cache_for(self.root)
-        self.offsets = {
-            pos: _find_offset(self.root, self.table, pos, path, slot, metadata)
-            for pos, (path, slot) in self.index.slots.items()
-            if cache is None or Path(self.root) / path in cache.fetched
-        }
+        self._sealed = False
+        self._metadata_index = (
+            _LoadMetadataIndex(self.table, read_metadata(self.root))
+            if native_ranges is None
+            else None
+        )
+
+    @catch
+    def get_file_offset(self, pos):
+        if pos not in self.offsets:
+            if self._sealed:
+                raise invalid(
+                    "file_offset",
+                    f"{pos.tensor_id}:{pos.rank}: offset was not admitted by preflight",
+                )
+            hit = self.index.slots.get(pos)
+            if hit is None:
+                raise invalid(
+                    "file_offset", f"{pos.tensor_id}:{pos.rank}: DCP payload is absent"
+                )
+            path, slot = hit
+            self.offsets[pos] = (
+                slot.contiguous_payload_offset
+                if self.native_ranges is not None
+                else _find_offset(self.root, self._metadata_index, pos, path, slot)
+            )
+        return self.offsets[pos]
+
+    def _finish_preflight(self, positions):
+        self.offsets = {pos: self.offsets[pos] for pos in positions}
+        self._metadata_index = None
+        self._sealed = True
 
     @catch
     def init_data_accessor(self):
@@ -727,43 +775,20 @@ class _LoadSession(_Session, StorageLoadSession):
         self.state = "finished"
 
 
-def _find_offset(root, table, pos, path, slot, metadata):
-    named = next(
-        named
-        for named in table.named_d_tensors
-        if named.global_tensor_id == pos.tensor_id
-    )
+def _find_offset(root, index, pos, path, slot):
+    named = index.named[pos.tensor_id]
     box = owned_box(named, "storage", pos.rank)
     if box is None:
         raise ValueError("DCP slot is outside its storage mesh")
     lo, hi = box
-    item = _tensor_metadata(metadata, pos.tensor_id)
-    meta = global_tensor_meta_of(named)
-    if (list(item.size) or [1]) != list(meta.global_shape):
-        raise ValueError(f"{pos.tensor_id}: DCP shape mismatch")
-    if _CODES.get(item.properties.dtype) != meta.dtype:
-        raise ValueError(f"{pos.tensor_id}: DCP dtype mismatch")
-    offsets = () if len(item.size) == 0 else tuple(lo)
-    sizes = (
-        ()
-        if len(item.size) == 0
-        else tuple(right - left for left, right in zip(lo, hi))
-    )
-    chunk = next(
-        (
-            chunk
-            for chunk in item.chunks
-            if tuple(chunk.offsets) == offsets and tuple(chunk.sizes) == sizes
-        ),
-        None,
-    )
-    if chunk is None:
+    scalar = pos.tensor_id in index.scalars
+    offsets = () if scalar else tuple(lo)
+    sizes = () if scalar else tuple(right - left for left, right in zip(lo, hi))
+    if (offsets, sizes) not in index.chunks[pos.tensor_id]:
         raise ValueError(
             f"{pos.tensor_id}: DCP chunk geometry cannot represent storage slot {pos.rank}"
         )
-    record = metadata.storage_data.get(
-        MetadataIndex(pos.tensor_id, torch.Size(offsets))
-    )
+    record = index.records.get(MetadataIndex(pos.tensor_id, torch.Size(offsets)))
     if record is None or record.relative_path != path:
         raise ValueError(f"{pos.tensor_id}: DCP storage record does not match {path}")
     return _record_payload(root, record, slot.nbytes, pos.tensor_id)

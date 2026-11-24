@@ -1,5 +1,7 @@
 """Connector-backed storage views; file formats remain in gdtensor_conn."""
 
+import json
+import struct
 from dataclasses import dataclass
 from functools import partial
 
@@ -9,11 +11,12 @@ from gdtensor.session import StorageSaveSession
 from gdtensor_conn._layout import build_payload_index
 from gdtensor_conn._result import catch, invalid, io_error
 from gdtensor_conn.access import StorageDataAccessor
-from gdtensor_conn.formats import SafeTensorsLoadSession, SafeTensorsSaveSession
+from gdtensor_conn.formats import (
+    SafeTensorsLoadSession,
+    SafeTensorsSaveSession,
+    _safetensors_slot_offset,
+)
 from gdtensor_conn.iobackend import FileIO
-
-
-from . import _hdfs
 
 
 class _InterruptIO(FileIO):
@@ -48,6 +51,54 @@ def _raise_io_interrupt(storage):
     io = getattr(storage.data_accessor, "io", None)
     if isinstance(io, _InterruptIO) and io.interrupt is not None:
         raise io.interrupt
+
+
+class _LocalSafeTensorsLoadSession(SafeTensorsLoadSession):
+    """Validate selected offsets, then seal the session before payload reads."""
+
+    def __init__(self, *args, **kwargs):
+        self._preflight_slots = None
+        self._sealed = False
+        super().__init__(*args, **kwargs)
+
+    def _prepare_offsets(self, positions):
+        self._preflight_slots = {}
+        for pos in positions:
+            path, slot = self.index.slots[pos]
+            self._preflight_slots.setdefault(path, []).append(slot)
+
+    def _read_file_offsets(self, path):
+        if self._sealed:
+            raise invalid(
+                "file_offset", f"{path}: offset was not admitted by preflight"
+            )
+        full = self.abspath(path)
+        try:
+            length = struct.unpack("<Q", self.io.pread(self.rank, full, 0, 8))[0]
+            header = json.loads(self.io.pread(self.rank, full, 8, length))
+        except OSError as exc:
+            raise io_error("read", str(exc), full) from None
+        # Whole-tensor headers address the first saved slot, even when this
+        # rank only reads a later slot of the same shared file.
+        first = {}
+        for slot in self.index.files[path].slots:
+            first.setdefault(slot.tensor_order, slot.contiguous_payload_offset)
+        slots = (
+            self.index.files[path].slots
+            if self._preflight_slots is None
+            else self._preflight_slots.get(path, ())
+        )
+        for slot in slots:
+            self.offsets[slot.pos] = (
+                8
+                + length
+                + _safetensors_slot_offset(self.table, slot, header, first, path, full)
+            )
+
+    def _finish_preflight(self, positions):
+        self.offsets = {pos: self.offsets[pos] for pos in positions}
+        self._preflight_slots = None
+        self._sealed = True
 
 
 class _CoordinatedSaveSession(SafeTensorsSaveSession):
@@ -168,10 +219,10 @@ class SafeTensorsBackend:
             _collective_begin(begin_save, coordinator) if coordinator else begin_save,
             partial(
                 _begin_session,
-                SafeTensorsLoadSession,
+                _LocalSafeTensorsLoadSession,
                 str(root),
                 index,
                 io,
-                eager_headers=_hdfs.cache_for(root) is None,
+                eager_headers=False,
             ),
         )

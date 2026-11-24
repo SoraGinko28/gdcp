@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import tempfile
+from bisect import bisect_right
 from uuid import uuid4
 from contextlib import ExitStack
 from dataclasses import replace
@@ -22,7 +23,6 @@ from gdtensor.builder import (
     Shard,
     StridedShard,
     global_tensor_meta_of,
-    file_path_of,
 )
 from gdtensor.io import (
     validate_single_writer_save,
@@ -30,7 +30,7 @@ from gdtensor.io import (
     rank_load_files,
     rank_save,
 )
-from gdtensor_conn._geometry import _mesh, naive_of
+from gdtensor_conn._geometry import _mesh, naive_of, owned_intervals
 
 from . import _hdfs, desc
 from ._transaction import PREFLIGHT, DirectoryTransaction
@@ -959,19 +959,50 @@ def _load_one(ctx, compute, storage):
     return result
 
 
+def _load_positions(compute, storage, session, rank, filenames):
+    """Select saved slots intersecting the validated plan's target ownership."""
+    needed = set(filenames)
+    index = getattr(session, "index", None)
+    if index is None:
+        # Third-party session implementations need not expose a payload index.
+        layout = storage.physical_layout
+        paths = desc._layout_paths(layout)
+        return [
+            pos
+            for pos, group in layout.tensor_entries.items()
+            if paths[id(group)] in needed
+        ]
+    names = {}
+    for named in compute.d_tensor_table.named_d_tensors:
+        names.setdefault(named.global_tensor_id, named)
+    ownership, positions = {}, []
+    for pos, (path, slot) in index.slots.items():
+        if path not in needed:
+            continue
+        if pos.tensor_id not in ownership:
+            if pos.tensor_id not in names:
+                raise ValueError(f"{pos.tensor_id}: saved slot has no target tensor")
+            ownership[pos.tensor_id] = owned_intervals(
+                names[pos.tensor_id], "compute", rank
+            )
+        local = ownership[pos.tensor_id]
+        ends = local[:, 1]
+        for left, right in slot.intervals:
+            # Searching sorted interval ends avoids rescanning a fragmented
+            # StridedShard ownership list for every saved storage column.
+            first = bisect_right(ends, left)
+            if first < len(local) and local[first, 0] < right:
+                positions.append(pos)
+                break
+    return positions
+
+
 def _prepare_load_view(ctx, compute, storage, stack, root):
     filenames = _require(rank_load_files(ctx.rank, compute, storage))
-    positions = storage.physical_layout.tensor_entries.keys()
     cache = _hdfs.cache_for(root)
     if cache is not None:
         for filename in filenames:
             cache.fetch_payload(root, filename)
-        needed = set(filenames)
-        positions = [
-            pos
-            for pos in positions
-            if _require(file_path_of(storage.physical_layout, pos)) in needed
-        ]
     if not storage.physical_layout.tensor_entries:
         return storage
     assert storage.begin_load is not None
@@ -988,8 +1019,23 @@ def _prepare_load_view(ctx, compute, storage, stack, root):
         return Ok(session)
 
     stack.callback(close_unused)
+    local = (
+        list(storage.physical_layout.tensor_entries)
+        if cache is None and getattr(session, "index", None) is None
+        else _load_positions(compute, storage, session, ctx.rank, filenames)
+    )
+    # Preserve complete checkpoint admission on the coordinator. HDFS keeps
+    # its existing selective download boundary; all ranks validate their read
+    # sources before the enclosing collective admits any target writes.
+    positions = (
+        list(storage.physical_layout.tensor_entries)
+        if ctx.rank == 0 and cache is None
+        else local
+    )
+    getattr(session, "_prepare_offsets", lambda positions: None)(positions)
     for pos in positions:
         _require(session.get_file_offset(pos))
+    getattr(session, "_finish_preflight", lambda positions: None)(local)
     return replace(storage, begin_load=begin_load)
 
 
