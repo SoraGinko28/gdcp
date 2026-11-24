@@ -10,7 +10,6 @@ from gdtensor.builder import (
     ArrangedMesh,
     DTensorTable,
     DisjointStorageMeshList,
-    Err,
     GlobalTensorMeta,
     NaiveDTensor,
     NamedDTensor,
@@ -21,7 +20,6 @@ from gdtensor.builder import (
     SlicedMesh,
     SlotOuterProductMesh,
     TensorComponentPos,
-    file_path_of,
 )
 from gdtensor.tag import TensorCount, WorldSize
 
@@ -114,6 +112,7 @@ def describe_component(
     table, layout, world_size, *, objects=False, logical_shapes=None, root=None
 ):
     files = {}
+    paths = _layout_paths(layout)
     orders = {
         named.global_tensor_id: i for i, named in enumerate(table.named_d_tensors)
     }
@@ -121,17 +120,14 @@ def describe_component(
         layout.tensor_entries, key=lambda pos: (orders[pos.tensor_id], pos.rank)
     )
     for pos in positions:
-        path = file_path_of(layout, pos)
-        if type(path) is Err:
-            raise ValueError(path.value.msg)
-        files.setdefault(
-            path.value,
-            {
+        path = paths[id(layout.tensor_entries[pos])]
+        if path not in files:
+            files[path] = {
                 "bytes": 0,
                 "slots": [],
                 "rectangles": _layout_rectangles(layout.tensor_entries[pos]),
-            },
-        )["slots"].append([pos.tensor_id, pos.rank])
+            }
+        files[path]["slots"].append([pos.tensor_id, pos.rank])
     if root is not None:
         _record_sizes(files, root)
     return {
@@ -143,6 +139,23 @@ def describe_component(
         "files": files,
         "objects": "objects.json" if objects else None,
     }
+
+
+def _layout_paths(layout):
+    """Resolve each distinct physical list once, preserving first equal leader."""
+    canonical, paths = {}, {}
+    for leader, path in layout.file_paths.items():
+        group = layout.tensor_entries.get(leader)
+        if group is not None:
+            paths[id(group)] = canonical.setdefault(group, path)
+    for pos, group in layout.tensor_entries.items():
+        if id(group) not in paths:
+            try:
+                paths[id(group)] = canonical[group]
+            except KeyError:
+                key = (pos.tensor_id, pos.rank)
+                raise ValueError(f"{key} list has no file path") from None
+    return paths
 
 
 def _record_sizes(files, root):
@@ -280,7 +293,7 @@ def write_manifest(path, desc):
     atomic_write(Path(path) / MANIFEST_NAME, json_bytes(manifest))
 
 
-def read_manifest(path, *, _validate_components=True):
+def read_manifest(path, *, _validate_components=True, _rebuilt_components=None):
     manifest = json.loads((Path(path) / MANIFEST_NAME).read_bytes())
     if manifest["gdcp_version"] != 1:
         raise ValueError(f"unsupported gdcp_version {manifest['gdcp_version']!r}")
@@ -289,7 +302,9 @@ def read_manifest(path, *, _validate_components=True):
     if _validate_components:
         for name, component in manifest["components"].items():
             _safe_relative(name)
-            rebuild_component(component, manifest["world_size"])
+            rebuilt = rebuild_component(component, manifest["world_size"])
+            if _rebuilt_components is not None and name in _rebuilt_components:
+                _rebuilt_components[name] = rebuilt
     for name in manifest["rank_state"]:
         _safe_relative(name)
     return CheckpointDesc(manifest)

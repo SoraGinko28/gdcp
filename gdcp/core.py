@@ -139,13 +139,14 @@ def _agree(ctx, prepare):
         value, fields = prepare()
         canonical = desc.json_bytes(fields)
         digest = int.from_bytes(sha256(canonical).digest()[:_DIGEST_BYTES], "big")
-        return value, fields, canonical, digest
+        diagnostic = canonical.decode() if _LOG.isEnabledFor(logging.DEBUG) else None
+        return value, tuple(fields), diagnostic, digest
 
     prepared = _collective(ctx, _AGREEMENT, describe)
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    value, fields, canonical, digest = prepared.value
+    value, fields, diagnostic, digest = prepared.value
     coordinator = ctx.coordinator
     if coordinator is None:
         return Ok(value)
@@ -156,7 +157,7 @@ def _agree(ctx, prepare):
             reference |= mask
     if coordinator.vote(digest == reference):
         return Ok(value)
-    _LOG.debug("Checkpoint agreement rank %s: %s", ctx.rank, canonical.decode())
+    _LOG.debug("Checkpoint agreement rank %s: %s", ctx.rank, diagnostic)
     return _agreement_error(f"ranks disagree on {', '.join(fields)}")
 
 
@@ -412,6 +413,7 @@ def _planned_files(state, prepared, ctx, rank_state):
             files.add(prefix / ".metadata")
         if component.objects and saved["format"] == "distcp":
             files.add(prefix / "__0_0.distcp")
+        del saved
     return files
 
 
@@ -841,7 +843,12 @@ def _prepare_load(path, state, ctx, backend, strict, validate_groups):
             "strict=False is not supported; v1 requires strict=True"
         )
     _require_not_pending(path)
-    description = desc.read_manifest(path, _validate_components=bool(state.components))
+    rebuilt = dict.fromkeys(component.name for component in state.components)
+    description = desc.read_manifest(
+        path,
+        _validate_components=bool(state.components),
+        _rebuilt_components=rebuilt,
+    )
     optimizer_objects = None
     if validate_groups is not None and "optimizer" in description.components:
         optimizer = next(c for c in state.components if c.name == "optimizer")
@@ -856,14 +863,21 @@ def _prepare_load(path, state, ctx, backend, strict, validate_groups):
     for component in state.components:
         objects = optimizer_objects if component.name == "optimizer" else None
         item = _prepare_load_component(
-            path, component, description, ctx, backend, strict, objects
+            path,
+            component,
+            description,
+            ctx,
+            backend,
+            strict,
+            objects,
+            rebuilt=rebuilt.pop(component.name, None),
         )
         prepared.append(item)
-    return prepared, description
+    return prepared, (description.rank_state, description.world_size)
 
 
 def _prepare_load_component(
-    path, component, description, ctx, backend, strict, objects
+    path, component, description, ctx, backend, strict, objects, *, rebuilt=None
 ):
     if component.name not in description.components:
         raise ValueError(f"missing component {component.name}")
@@ -873,7 +887,11 @@ def _prepare_load_component(
         objects = _load_objects(path, component, saved, strict)
     compute = _compute_view(component)
     _require(compute.check_constraints())
-    table, layout = desc.rebuild_component(saved, description.world_size)
+    table, layout = (
+        desc.rebuild_component(saved, description.world_size)
+        if rebuilt is None
+        else rebuilt
+    )
     root = Path(path) / component.name
     for name, info in saved["files"].items():
         size = info.get("bytes")
@@ -1131,15 +1149,16 @@ def _load_agreed(
     if type(prepared) is Err:
         return prepared
     assert prepared.value is not None
-    components, description = prepared.value
+    components, (inventory, saved_world) = prepared.value
+    del prepared
 
     def load_rank_state():
         return _load_rank_state(
             path,
             state,
-            description.rank_state,
+            inventory,
             ctx,
-            saved_world=description.world_size,
+            saved_world=saved_world,
             optional=optional_rank_state,
         )
 
