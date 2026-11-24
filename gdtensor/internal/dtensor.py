@@ -223,6 +223,32 @@ def named_of(table: DTensorTable, tensor_id: str) -> NamedDTensor:
     return table.named_d_tensors[order_of(table, tensor_id)]
 
 
+class _TensorIndex:
+    """First matching row/name, scoped to one read-only operation.
+
+    Builders remain mutable: never retain this index on a table or across
+    calls. ``setdefault`` preserves the lookup helpers' first-row semantics
+    even on a table whose duplicate-id constraint has not yet run.
+    """
+
+    def __init__(self, table: DTensorTable) -> None:
+        self.rows = {}
+        for row, nd in enumerate(table.named_d_tensors):
+            self.rows.setdefault(nd.global_tensor_id, (row, nd))
+
+    def order(self, tid: str) -> int:
+        return self._row(tid)[0]
+
+    def named(self, tid: str) -> NamedDTensor:
+        return self._row(tid)[1]
+
+    def _row(self, tid: str):
+        try:
+            return self.rows[tid]
+        except KeyError:
+            raise not_found("tensor_id", tid, f"tensor {tid!r} not in DTensorTable")
+
+
 # ---------------------------------------------------------------- intervals (internal)
 
 EMPTY = np.zeros((0, 2), dtype=np.int64)

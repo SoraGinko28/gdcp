@@ -116,8 +116,13 @@ def _storage_view(o):
     # Every list's row labels must equal the full DTensorTable header order.
     # A standalone list cannot know the table; the view (which holds the table)
     # enforces full-row labels here before any session opens.
+    checked_labels = set()
     for lst in entries.values():
-        if list(lst.tensor_ids) != list(table_ids):
+        labels_id = id(lst.tensor_ids)
+        if labels_id in checked_labels:
+            continue
+        checked_labels.add(labels_id)
+        if list(lst.tensor_ids) != table_ids:
             return _err(
                 o,
                 "list_labels_match_table",

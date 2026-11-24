@@ -25,16 +25,15 @@ import numpy as np
 from .dtensor import (
     EMPTY,
     DTensorTable,
+    _TensorIndex,
     global_tensor_meta_of,
     iv_intersect,
     iv_normalize,
     iv_prefix,
     iv_subtract,
     iv_total,
-    named_of,
     nbytes_of,
     is_designated_writer,
-    order_of,
     owned_intervals,
     participants_of,
 )
@@ -105,9 +104,10 @@ if hasattr(os, "register_at_fork"):
 class _Side:
     """Uniform 'who owns which elements, and how to address them' for one view."""
 
-    def __init__(self, view, index=None) -> None:
+    def __init__(self, view, index=None, tensors=None) -> None:
         self.view = view
         self.table: DTensorTable = view.d_tensor_table
+        self.tensors = tensors if tensors is not None else _TensorIndex(self.table)
         self.is_storage = type(view) is StorageDTensorsView
         self._storage_by_tid = {}
         if self.is_storage:
@@ -122,13 +122,13 @@ class _Side:
     def _collect_storage_pieces(self, tid):
         hits = (
             self.index.slots.get(TensorComponentPos(tid, rank))
-            for rank in participants_of(named_of(self.table, tid), "storage")
+            for rank in participants_of(self.tensors.named(tid), "storage")
         )
         return [_storage_piece(hit) for hit in hits if hit is not None]
 
     def dst_intervals(self, tid: str, rank: int):
         """Destination share of a rank: list of (intervals, address)."""
-        nd = named_of(self.table, tid)
+        nd = self.tensors.named(tid)
         if not self.is_storage:
             iv = owned_intervals(nd, "compute", rank)
             return (
@@ -149,7 +149,7 @@ class _Side:
 
     def src_candidates(self, tid: str, rank: int):
         """Ordered source owners: list of (intervals, address)."""
-        nd = named_of(self.table, tid)
+        nd = self.tensors.named(tid)
         if self.is_storage:
             return [
                 (iv, ("storage", p, cpo, isz))
@@ -231,14 +231,16 @@ def _save_pieces(tid, intervals, itemsize, storage):
     return plan
 
 
-def _check_same_tensors(a, b) -> None:
+def _check_same_tensors(a, b, a_tensors=None, b_tensors=None) -> None:
     if list(a.tensor_ids) != list(b.tensor_ids):
         raise invalid(
             "tensor_ids", f"tensor_ids differ: {a.tensor_ids} vs {b.tensor_ids}"
         )
+    a_tensors = a_tensors if a_tensors is not None else _TensorIndex(a.d_tensor_table)
+    b_tensors = b_tensors if b_tensors is not None else _TensorIndex(b.d_tensor_table)
     for tid in a.tensor_ids:
-        ma = global_tensor_meta_of(named_of(a.d_tensor_table, tid))
-        mb = global_tensor_meta_of(named_of(b.d_tensor_table, tid))
+        ma = global_tensor_meta_of(a_tensors.named(tid))
+        mb = global_tensor_meta_of(b_tensors.named(tid))
         if ma != mb:
             raise invalid(
                 "global_tensor_meta",
@@ -255,13 +257,15 @@ def d_tensors_view_rank_plan_save(
     compute_view: ComputeDTensorsView,
     storage_view: StorageDTensorsView,
 ) -> Result[CopyPlan]:
-    _check_same_tensors(compute_view, storage_view)
-    c = _Side(compute_view)
-    s = _Side(storage_view, payload_index_of(storage_view))
+    c_tensors = _TensorIndex(compute_view.d_tensor_table)
+    s_tensors = _TensorIndex(storage_view.d_tensor_table)
+    _check_same_tensors(compute_view, storage_view, c_tensors, s_tensors)
+    c = _Side(compute_view, tensors=c_tensors)
+    s = _Side(storage_view, payload_index_of(storage_view), s_tensors)
     plan: CopyPlan = []
     for tid in compute_view.tensor_ids:
-        nd = named_of(c.table, tid)
-        if not is_designated_writer(nd, rank, order_of(c.table, tid)):
+        nd = c.tensors.named(tid)
+        if not is_designated_writer(nd, rank, c.tensors.order(tid)):
             continue
         iv = owned_intervals(nd, "compute", rank)
         if iv.size == 0:
@@ -277,9 +281,11 @@ def d_tensors_view_rank_plan_load(
     compute_view: ComputeDTensorsView,
     storage_view: StorageDTensorsView,
 ) -> Result[CopyPlan]:
-    _check_same_tensors(compute_view, storage_view)
-    c = _Side(compute_view)
-    s = _Side(storage_view, payload_index_of(storage_view))
+    c_tensors = _TensorIndex(compute_view.d_tensor_table)
+    s_tensors = _TensorIndex(storage_view.d_tensor_table)
+    _check_same_tensors(compute_view, storage_view, c_tensors, s_tensors)
+    c = _Side(compute_view, tensors=c_tensors)
+    s = _Side(storage_view, payload_index_of(storage_view), s_tensors)
     plan: CopyPlan = []
     for tid in compute_view.tensor_ids:
         plan.extend(_pair(c.dst_intervals(tid, rank), s.src_candidates(tid, rank)))
@@ -354,12 +360,16 @@ def _ranges(plan: CopyPlan, pred) -> List[DTensorRange]:
 CHECK = "runtime_plan_check"
 
 
-def _dst_compute_pairs(plan: CopyPlan, tid: str):
-    return [
-        (dst.global_tensor_offset, dst.size)
-        for _, dst in plan
-        if is_compute(dst) and dst.global_tensor_id == tid
-    ]
+def _compute_pairs_by_tensor(plan: CopyPlan, which: int):
+    """Group only the selected side; retain range order and every check."""
+    out = {}
+    for pair in plan:
+        value = pair[which]
+        if is_compute(value):
+            out.setdefault(value.global_tensor_id, []).append(
+                (value.global_tensor_offset, value.size)
+            )
+    return out
 
 
 def _storage_side_within(view, plan: CopyPlan, which: str):
@@ -390,15 +400,13 @@ def validate_rank_save(rank: int, compute_view, storage_view, plan: CopyPlan) ->
     Coverage is per rank. The union of all ranks' plans looking complete
     cannot hide one rank that persisted only half of its shard.
     """
+    by_tensor = _compute_pairs_by_tensor(plan, 0)
+    tensors = _TensorIndex(compute_view.d_tensor_table)
     for nd in compute_view.d_tensor_table.named_d_tensors:
         tid = nd.global_tensor_id
-        pairs = [
-            (src.global_tensor_offset, src.size)
-            for src, _ in plan
-            if is_compute(src) and src.global_tensor_id == tid
-        ]
+        pairs = by_tensor.get(tid, [])
         designated = is_designated_writer(
-            nd, rank, order_of(compute_view.d_tensor_table, tid)
+            nd, rank, tensors.order(tid)
         )
         owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
         if designated and owns:
@@ -462,12 +470,13 @@ def validate_rank_load(rank: int, compute_view, storage_view, plan: CopyPlan) ->
     nd_by_id = {
         nd.global_tensor_id: nd for nd in compute_view.d_tensor_table.named_d_tensors
     }
-    got_ids = {dst.global_tensor_id for _, dst in plan if is_compute(dst)}
+    by_tensor = _compute_pairs_by_tensor(plan, 1)
+    got_ids = set(by_tensor)
     extra = got_ids - set(nd_by_id)
     if extra:
         raise check_failed(CHECK, f"compute range on unknown tensor {sorted(extra)}")
     for tid, nd in nd_by_id.items():
-        pairs = _dst_compute_pairs(plan, tid)
+        pairs = by_tensor.get(tid, [])
         owns = iv_total(owned_intervals(nd, "compute", rank)) > 0
         _check_rank_writes_only_owned(rank, tid, pairs, owns)
         if owns:

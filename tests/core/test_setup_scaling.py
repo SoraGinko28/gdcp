@@ -222,3 +222,86 @@ def test_setup_work_grows_near_linearly_with_ranks_times_tensors():
     # Twelve times ranks x tensors: linear is 12x. The old setup gave 50x,
     # and either old behavior alone gave more than 35x.
     assert large < 20 * small, (small, large)
+
+
+class _VisitedList(list):
+    """Count actual row/label visits, independent of CPU speed."""
+
+    __slots__ = ()
+    _visits = {}
+
+    def __init__(self, values):
+        super().__init__(values)
+        self._visits[id(self)] = 0
+
+    @property
+    def visits(self):
+        # Keep instrumentation outside the metadata being pickled for the
+        # mutation signature; counting reads must not look like an edit.
+        return self._visits[id(self)]
+
+    def __iter__(self):
+        for value in super().__iter__():
+            self._visits[id(self)] += 1
+            yield value
+
+
+@pytest.mark.parametrize("load", [False, True], ids=["save", "load"])
+def test_plan_and_validation_visit_table_rows_linearly(load):
+    rows = 96
+    compute, storage = _tables(rows, 2)
+    layout = build_layout(storage, 2, "safetensors", _file_namer(True))
+    trace = Trace()
+    cv, sv = compute_view(compute, trace), storage_view(storage, layout, trace)
+    compute.named_d_tensors = _VisitedList(compute.named_d_tensors)
+    storage.named_d_tensors = _VisitedList(storage.named_d_tensors)
+    operation = gio.rank_load if load else gio.rank_save
+    result = operation(0, cv, sv)
+    assert type(result) is gb.Ok, result
+    visits = compute.named_d_tensors.visits + storage.named_d_tensors.visits
+    # Includes index construction, the payload column pass, and validation.
+    # Repeated first-match name/order scans consume many thousands of visits.
+    assert visits <= 12 * rows, visits
+
+
+def test_storage_view_and_index_visit_shared_labels_linearly():
+    rows = 96
+    compute, storage = _tables(rows, 2)
+    layout = build_layout(storage, 2, "safetensors", _file_namer(True))
+    group = next(iter(layout.tensor_entries.values()))
+    group.tensor_ids = _VisitedList(group.tensor_ids)
+    trace = Trace()
+    view = storage_view(storage, layout, trace)
+    assert type(view.check_constraints()) is gb.Ok
+    assert type(gio.rank_save(0, compute_view(compute, trace), view)) is gb.Ok
+    # All mesh/label safety checks still run; the full list is simply no
+    # longer copied for each of the O(rows) entries.
+    assert group.tensor_ids.visits <= 24 * rows, group.tensor_ids.visits
+
+
+@pytest.mark.parametrize("load", [False, True], ids=["save", "load"])
+def test_validation_classifies_plan_pairs_once(load):
+    compute, storage = _tables(96, 2)
+    layout = build_layout(storage, 2, "safetensors", _file_namer(True))
+    trace = Trace()
+    cv, sv = compute_view(compute, trace), storage_view(storage, layout, trace)
+    calls = []
+
+    def counted(frame, event, arg):
+        if (
+            event == "call"
+            and frame.f_code.co_name == "is_compute"
+            and "/gdtensor/internal/plan.py" in frame.f_code.co_filename
+        ):
+            calls.append(None)
+
+    previous = sys.getprofile()
+    sys.setprofile(counted)
+    try:
+        operation = gio.rank_load if load else gio.rank_save
+        result = operation(0, cv, sv)
+    finally:
+        sys.setprofile(previous)
+    assert type(result) is gb.Ok, result
+    # The public executor records one read and one write per copy pair.
+    assert len(calls) == len(trace.ranges) // 2

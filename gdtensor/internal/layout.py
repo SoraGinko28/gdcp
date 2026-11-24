@@ -19,9 +19,9 @@ from .builder_mixin import field_hash, make_builder_mixin
 from .dtensor import (
     DTensorTable,
     NamedDTensor,
+    _TensorIndex,
     global_tensor_meta_of,
     iv_total,
-    order_of,
     owned_intervals,
     participants_of,
 )
@@ -259,8 +259,9 @@ def unique_lists(
     rank. This is independent of dict insertion order or file row order.
     """
     leaders: Dict[TensorComponentPos, DisjointStorageMeshList] = {}
+    tensors = _TensorIndex(table)
     for lst, positions in grouped_lists(layout):
-        leader = min(positions, key=lambda p: (order_of(table, p.tensor_id), p.rank))
+        leader = min(positions, key=lambda p: (tensors.order(p.tensor_id), p.rank))
         if leader in leaders and leaders[leader] != lst:
             raise invalid("tensor_entries", "different physical lists share a leader")
         leaders[leader] = lst
@@ -292,10 +293,16 @@ def build_payload_index(
     slots: Dict[TensorComponentPos, Tuple[str, SlotPayload]] = {}
     cols_by_row = [nonempty_columns(nd) for nd in table.named_d_tensors]
     table_ids = [n.global_tensor_id for n in table.named_d_tensors]
+    checked_labels = set()
     for lst in layout.tensor_entries.values():
+        labels_id = id(lst.tensor_ids)
+        if labels_id in checked_labels:
+            continue
+        checked_labels.add(labels_id)
         if list(lst.tensor_ids) != table_ids:
             raise invalid("tensor_ids", "labels order != DTensorTable header order")
     lists = unique_lists(layout, table)
+    entry_matches = {}
     for leader, lst in sorted(
         lists.items(), key=lambda kv: _path_for_list(layout, kv[1])
     ):
@@ -317,7 +324,7 @@ def build_payload_index(
         for t, w, iv in _nonempty_cells(lst, cols_by_row):
             nd = table.named_d_tensors[t]
             pos = TensorComponentPos(nd.global_tensor_id, w)
-            _check_slot_entry(layout, pos, lst, slots)
+            _check_slot_entry(layout, pos, lst, slots, entry_matches)
             sp = SlotPayload(pos, t, iv, global_tensor_meta_of(nd).itemsize, off)
             off += sp.nbytes
             fp.slots.append(sp)
@@ -328,8 +335,16 @@ def build_payload_index(
     return PayloadIndex(files, slots)
 
 
-def _check_slot_entry(layout, pos, meshes, slots):
-    if layout.tensor_entries.get(pos) != meshes:
+def _check_slot_entry(layout, pos, meshes, slots, entry_matches=None):
+    entry = layout.tensor_entries.get(pos)
+    if entry_matches is None:
+        matches = entry == meshes
+    else:
+        key = (id(entry), id(meshes))
+        if key not in entry_matches:
+            entry_matches[key] = entry == meshes
+        matches = entry_matches[key]
+    if not matches:
         raise invalid(
             "tensor_entries", f"nonempty slot {pos_key(pos)} has no matching entry"
         )
