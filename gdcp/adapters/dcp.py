@@ -19,7 +19,7 @@ from itertools import accumulate
 from math import prod
 from contextlib import ExitStack
 from pathlib import Path
-from typing import IO, cast
+from typing import IO, Callable, NoReturn, cast
 
 import numpy as np
 import torch
@@ -238,7 +238,7 @@ class _Plan:
     metadata: Metadata | None
 
 
-def _admit_plan(action, coordinator, message):
+def _admit_plan[T](action: Callable[[], T], coordinator, message) -> T:
     value, error = None, None
     try:
         value = action()
@@ -249,10 +249,12 @@ def _admit_plan(action, coordinator, message):
         succeeded = coordinator.vote(succeeded)
     if not succeeded:
         _commit_failure(error, message)
-    return value
+    return cast(T, value)
 
 
-def _plan(component, table, layout, index, *, rank=None, coordinator=None, named=None):
+def _plan(
+    component, table, layout, index, *, rank=None, coordinator=None, named=None
+) -> _Plan:
     named = {} if named is None else named
 
     def prepare():
@@ -283,7 +285,9 @@ def _plan(component, table, layout, index, *, rank=None, coordinator=None, named
         return value, paths
 
     if rank is None:
-        return prepare()[0]
+        plan, _ = prepare()
+        assert plan is not None
+        return plan
     # Schema, coverage, one-copy and digest admission still happen in GDCP's
     # earlier preflight. Admit the complete native inventory before any rank
     # constructs its local records, and local construction before file I/O.
@@ -292,16 +296,21 @@ def _plan(component, table, layout, index, *, rank=None, coordinator=None, named
         coordinator,
         "DCP global record preparation failed",
     )
+
+    def prepare_local():
+        if rank == 0:
+            assert plan is not None
+            return plan
+        return _local_plan(component, table, index, paths, named)
+
     return _admit_plan(
-        lambda: (
-            plan if rank == 0 else _local_plan(component, table, index, paths, named)
-        ),
+        prepare_local,
         coordinator,
         "DCP local record preparation failed",
     )
 
 
-def _global_plan(component, table, slots, paths):
+def _global_plan(component, table, slots, paths) -> _Plan:
     offsets, records, sizes, tensors, storage, planner = {}, {}, {}, {}, {}, {}
     storage_keys = defaultdict(dict)
     for named in table.named_d_tensors:
@@ -330,7 +339,7 @@ def _named_index(table):
     return named
 
 
-def _local_plan(component, table, index, paths, named=None):
+def _local_plan(component, table, index, paths, named=None) -> _Plan:
     offsets, records, sizes = {}, {}, {}
     named = _named_index(table) if named is None else named
     for path in sorted(paths):
@@ -442,21 +451,21 @@ def _plan_tensor(
     meta = global_tensor_meta_of(named)
     chunks = []
     for pos, path, slot in slots:
-        chunks.append(
-            _plan_chunk(
-                component,
-                named,
-                pos,
-                path,
-                slot,
-                offsets,
-                records,
-                sizes,
-                storage,
-                storage_keys=storage_keys,
-                keep_record=path in paths,
-            )
+        chunk = _plan_chunk(
+            component,
+            named,
+            pos,
+            path,
+            slot,
+            offsets,
+            records,
+            sizes,
+            storage,
+            storage_keys=storage_keys,
+            keep_record=path in paths,
         )
+        assert chunk is not None
+        chunks.append(chunk)
     properties = TensorProperties(dtype=_DTYPES[meta.dtype])
     tensors[tensor_id] = TensorStorageMetadata(
         properties, torch.Size(_logical_shape(component, named)), chunks
@@ -565,7 +574,7 @@ class _Session:
         return StorageDataAccessor(self.index, self.io, session=self)
 
 
-def _commit_failure(error, message):
+def _commit_failure(error, message) -> NoReturn:
     if error is not None and not isinstance(error, Exception):
         raise error
     raise ValueError(f"{message}: {error or 'another rank failed'}")

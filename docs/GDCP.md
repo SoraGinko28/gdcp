@@ -166,6 +166,26 @@ such as lazy negation with PyTorch's copy semantics. An unsupported flag or
 dtype, such as a conjugate view of a complex tensor, produces an error naming
 the tensor.
 
+DCP saves construct complete native `.metadata` only on the coordinator.
+Each rank prepares the ZIP envelopes for the files it creates and publishes,
+and resolves offsets for every payload range it writes, including ranges in
+other ranks' logical files under HSDP. Global record preparation and local
+envelope preparation each complete a success vote before record files are
+created. Every rank also checks all saved slots' geometry and payload sizes
+without constructing remote envelopes. Tensor coverage, one-copy ownership, schema and replica checks remain
+in their existing admission phases. The v1 checkpoint bytes are unchanged.
+
+Load preflight validates offsets for the saved slots intersecting each rank's
+validated load plan. On a local filesystem, the coordinator also validates
+every saved slot, including nonlocal DCP records and safetensors headers.
+The collective preflight completes for all requested components before any
+target tensor is modified. Sessions then retain only admitted local offsets
+and cannot read another header or record during payload copying. This removes
+ordinary ranks' nonlocal preflight reads; payload I/O and published bytes stay
+unchanged. DCP metadata is still decoded on every rank, and the core and
+connector still retain global storage indexes. HDFS retains its existing
+selective download and fetched-file validation scope.
+
 All three formats support empty checkpoints, extra-state-only checkpoints,
 and model checkpoints with or without optimizer or extra state. Pass the keys
 you want to restore to `load`. Optimizer state needs the accompanying model to
@@ -187,7 +207,10 @@ requested state and can read rank-local copies at different paths.
 Each rank hashes its canonical description with SHA-256. Preparation,
 broadcast of rank 0's 64-bit digest, and comparison take 66 votes regardless
 of tensor count or world size. The low-level save includes the schema in
-its existing digest. FSDP2 checks the request before extracting optimizer
+its existing digest. The schema and canonical JSON are released before the
+digest votes; debug logging retains only diagnostic text. Load admission
+reuses each validated manifest layout once and releases the manifest before
+payload copying. FSDP2 checks the request before extracting optimizer
 state, so disagreement on the target, components or format leaves a fresh
 optimizer at its initial step. For coordinated saves with model or optimizer
 components, FSDP2 then checks the extracted tensor schema in a second digest.

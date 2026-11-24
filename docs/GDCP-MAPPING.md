@@ -130,7 +130,7 @@ PyTorch 在 `flatten`、`view`、`reshape`、`transpose`、`permute` 等操作�
 | I8 | **复用参数的 mesh**：加载后，与参数 mesh 等价的优化器状态 mesh 是同一个 `DeviceMesh` 对象，保证优化器的下一步可以运行。 | `test_restored_optimizer_state_reuses_parameter_meshes`（Gloo、纯 NCCL、混合，4 卡和 8 卡）。 |
 | I9 | **组内编号**：存档中的 rank 编号、文件名和每 rank 额外状态都使用组内编号 `λ`，与全局 rank 无关。 | `test_independent_process_subgroups`（非连续子组 `[0,2]`、`[1,3]`）。 |
 | I10 | **只经访问器存取数据**：GDCP 对模型及优化器张量的所有数据读取和写入都通过 `DTensorDataAccessor`；普通优化器副本和参数子 mesh 的 SHA-256 比对也通过 `read_to_buffer` 读取持有区间，不直接读取张量存储。布局及元数据检查只访问形状、数据类型和分片信息。 | 自定义访问器回归覆盖保存、加载、普通优化器副本和参数子 mesh 比对；工厂请求的持有区间及偏移覆盖连续、非连续和一般 `StridedShard` 布局。 |
-| I11 | **默认行为不变**：不传 `data_accessor` 时继续使用 `TorchAccessor`，对有实际存储的既有输入，发布文件的每个字节和文件 I/O 行为与 `5e805c2` 相同。 | 对同一输入，在 `5e805c2` 和最终实现分别保存 safetensors、DCP、HF 完整状态，覆盖 1D FSDP、HSDP、模型及 AdamW，逐文件比较内容和 I/O。结果见[数据访问扩展验证报告](../../docs/gdcp/review-fixes-evidence/data-accessor/REPORT.md)。 |
+| I11 | **默认数据访问与存档字节不变**：不传 `data_accessor` 时继续使用 `TorchAccessor`，既有输入的发布文件字节、保存 I/O 和载入 payload I/O 不变。载入预检查的例外：本地文件系统由协调 rank 检查全部存储槽，其他 rank 只检查与其已验证计划相交的槽；所有 rank 通过集体预检查后才修改目标。省略非本地 DCP 记录及 safetensors 头读取，因此完整预检查 I/O 轨迹会变化。HDFS 保留原有按需下载和已下载文件检查范围。 | 原有逐文件内容和 I/O 证明见[数据访问扩展验证报告](../../docs/gdcp/review-fixes-evidence/data-accessor/REPORT.md)。本次与 `6da99a2` 比较计划、发布字节、保存及 payload I/O，单独列出预检查读取差异；不把完整 I/O 轨迹宣称为相同。见[本地元数据验证报告](../../docs/gdcp/review-fixes-evidence/local-metadata/REPORT.md)。 |
 
 ## 8 示例
 
