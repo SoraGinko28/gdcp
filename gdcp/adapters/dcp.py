@@ -63,7 +63,7 @@ from gdtensor_conn.models import build_layout
 
 from .. import _dcp_metadata, _hdfs, core, desc
 from ..backend import _collective_begin
-from ..policy import PerRankPolicy, storage_mesh
+from ..policy import _storage_table, storage_mesh
 
 _DTYPES = {
     "BOOL": torch.bool,
@@ -181,7 +181,7 @@ class _Window:
 
 class DcpPolicy:
     def plan(self, component, world_size):
-        table, _ = PerRankPolicy().plan(component, world_size)
+        table = _storage_table(component, world_size)
         layout = build_layout(
             table, world_size, "distcp", lambda order, rank, named: f"__{rank}_0.distcp"
         )
@@ -235,18 +235,136 @@ class _Plan:
     offsets: dict
     records: dict
     sizes: dict
-    metadata: Metadata
+    metadata: Metadata | None
 
 
-def _plan(component, table, layout, index):
+def _admit_plan(action, coordinator, message):
+    value, error = None, None
+    try:
+        value = action()
+    except BaseException as exc:
+        error = exc
+    succeeded = error is None
+    if coordinator is not None:
+        succeeded = coordinator.vote(succeeded)
+    if not succeeded:
+        _commit_failure(error, message)
+    return value
+
+
+def _plan(component, table, layout, index, *, rank=None, coordinator=None, named=None):
+    named = {} if named is None else named
+
+    def prepare():
+        for item in table.named_d_tensors:
+            named.setdefault(item.global_tensor_id, item)
+        # Preserve the payload index's order, including ranks of uneven shards.
+        # Only the coordinator needs a global tensor-to-slot inventory.
+        slots = defaultdict(list) if rank in (None, 0) else None
+        paths = set()
+        for pos, (path, slot) in index.slots.items():
+            if slots is not None:
+                slots[pos.tensor_id].append((pos, path, slot))
+            else:
+                # Retain every rank's former nonlocal payload-size check using
+                # geometry and dtype width, without constructing ZIP envelopes.
+                item = named[pos.tensor_id]
+                _, shape = _slot_geometry(component, item, pos.rank)
+                dtype = _DTYPES[global_tensor_meta_of(item).dtype]
+                if prod(shape) * dtype.itemsize != slot.nbytes:
+                    raise ValueError(
+                        f"{pos.tensor_id}: DCP envelope payload size mismatch"
+                    )
+            if rank is None or pos.rank == rank:
+                paths.add(path)
+        value = (
+            _global_plan(component, table, slots, paths) if slots is not None else None
+        )
+        return value, paths
+
+    if rank is None:
+        return prepare()[0]
+    # Schema, coverage, one-copy and digest admission still happen in GDCP's
+    # earlier preflight. Admit the complete native inventory before any rank
+    # constructs its local records, and local construction before file I/O.
+    plan, paths = _admit_plan(
+        prepare,
+        coordinator,
+        "DCP global record preparation failed",
+    )
+    return _admit_plan(
+        lambda: (
+            plan if rank == 0 else _local_plan(component, table, index, paths, named)
+        ),
+        coordinator,
+        "DCP local record preparation failed",
+    )
+
+
+def _global_plan(component, table, slots, paths):
     offsets, records, sizes, tensors, storage, planner = {}, {}, {}, {}, {}, {}
+    storage_keys = defaultdict(dict)
     for named in table.named_d_tensors:
         _plan_tensor(
-            component, named, index, offsets, records, sizes, tensors, storage, planner
+            component,
+            named,
+            slots.get(named.global_tensor_id, ()),
+            offsets,
+            records,
+            sizes,
+            tensors,
+            storage,
+            planner,
+            storage_keys,
+            paths,
         )
     _plan_objects(component, records, sizes, tensors, storage, planner)
     metadata = Metadata(tensors, planner_data=planner, storage_data=storage)
     return _Plan(offsets, records, sizes, metadata)
+
+
+def _named_index(table):
+    named = {}
+    for item in table.named_d_tensors:
+        named.setdefault(item.global_tensor_id, item)
+    return named
+
+
+def _local_plan(component, table, index, paths, named=None):
+    offsets, records, sizes = {}, {}, {}
+    named = _named_index(table) if named is None else named
+    for path in sorted(paths):
+        for slot in index.files[path].slots:
+            _plan_chunk(
+                component,
+                named[slot.pos.tensor_id],
+                slot.pos,
+                path,
+                slot,
+                offsets,
+                records,
+                sizes,
+                None,
+            )
+    return _Plan(offsets, records, sizes, None)
+
+
+_NATIVE_METADATA_TYPES = frozenset(
+    (
+        Metadata,
+        MetadataIndex,
+        TensorStorageMetadata,
+        ChunkStorageMetadata,
+        TensorProperties,
+        BytesStorageMetadata,
+        _StorageInfo,
+    )
+)
+
+
+@lru_cache(maxsize=None)
+def _metadata_fields(kind):
+    return tuple(field.name for field in dataclass_fields(kind) if field.init)
 
 
 def _canonical_metadata(value, strings):
@@ -256,19 +374,41 @@ def _canonical_metadata(value, strings):
     constructors often share. Pickle otherwise records those identities, making
     an unchanged checkpoint's metadata differ after load and save.
     """
-    if type(value) is str:
+    kind = type(value)
+    if kind is str:
         return strings.setdefault(value, value)
+    if value is None or kind in (int, float, bool):
+        return value
+    if kind is ChunkStorageMetadata:
+        return ChunkStorageMetadata(torch.Size(value.offsets), torch.Size(value.sizes))
+    if kind is MetadataIndex:
+        return MetadataIndex(
+            _canonical_metadata(value.fqn, strings),
+            _canonical_metadata(value.offset, strings),
+            _canonical_metadata(value.index, strings),
+        )
+    if kind is torch.Size:
+        return torch.Size(value)
     if isinstance(value, dict):
         return {
             _canonical_metadata(key, strings): _canonical_metadata(item, strings)
             for key, item in sorted(value.items(), key=lambda pair: repr(pair[0]))
         }
-    if type(value) is torch.Size:
-        return torch.Size(value)
     if isinstance(value, tuple):
         return tuple(_canonical_metadata(item, strings) for item in value)
     if isinstance(value, list):
         return [_canonical_metadata(item, strings) for item in value]
+    if kind in _NATIVE_METADATA_TYPES:
+        # These native classes have no InitVars or non-init constructor state.
+        # Build the same fresh canonical graph without per-record dataclass
+        # inspection and replace validation. Do not memoize objects: pickle's
+        # sharing and dictionary order are part of the unchanged v1 bytes.
+        return kind(
+            **{
+                name: _canonical_metadata(getattr(value, name), strings)
+                for name in _metadata_fields(kind)
+            }
+        )
     if is_dataclass(value) and not isinstance(value, type):
         return replace(
             value,
@@ -286,53 +426,98 @@ def _metadata_bytes(metadata):
 
 
 def _plan_tensor(
-    component, named, index, offsets, records, sizes, tensors, storage, planner
+    component,
+    named,
+    slots,
+    offsets,
+    records,
+    sizes,
+    tensors,
+    storage,
+    planner,
+    storage_keys,
+    paths,
 ):
     tensor_id = named.global_tensor_id
     meta = global_tensor_meta_of(named)
     chunks = []
-    for pos, (path, slot) in index.slots.items():
-        if pos.tensor_id == tensor_id:
-            chunks.append(
-                _plan_chunk(
-                    component, named, pos, path, slot, offsets, records, sizes, storage
-                )
+    for pos, path, slot in slots:
+        chunks.append(
+            _plan_chunk(
+                component,
+                named,
+                pos,
+                path,
+                slot,
+                offsets,
+                records,
+                sizes,
+                storage,
+                storage_keys=storage_keys,
+                keep_record=path in paths,
             )
+        )
     properties = TensorProperties(dtype=_DTYPES[meta.dtype])
     tensors[tensor_id] = TensorStorageMetadata(
         properties, torch.Size(_logical_shape(component, named)), chunks
     )
     planner[tensor_id] = _planner_path(component, tensor_id)
-    _plan_aliases(named, tensors, storage, planner)
+    _plan_aliases(named, tensors, storage, planner, storage_keys)
 
 
-def _plan_chunk(component, named, pos, path, slot, offsets, records, sizes, storage):
+def _chunk_envelope(component, named, pos, slot):
     chunk_offset, chunk_shape = _slot_geometry(component, named, pos.rank)
     meta = global_tensor_meta_of(named)
     length, pieces, raw_offset, nbytes = _envelope(chunk_shape, _DTYPES[meta.dtype])
     if nbytes != slot.nbytes:
         raise ValueError(f"{pos.tensor_id}: DCP envelope payload size mismatch")
-    start = sizes.get(path, 0)
-    records.setdefault(path, []).extend(
-        (start + offset, data) for offset, data in pieces
+    return chunk_offset, chunk_shape, length, pieces, raw_offset
+
+
+def _plan_chunk(
+    component,
+    named,
+    pos,
+    path,
+    slot,
+    offsets,
+    records,
+    sizes,
+    storage,
+    *,
+    storage_keys=None,
+    keep_record=True,
+):
+    chunk_offset, chunk_shape, length, pieces, raw_offset = _chunk_envelope(
+        component, named, pos, slot
     )
+    start = sizes.get(path, 0)
+    if keep_record:
+        records.setdefault(path, []).extend(
+            (start + offset, data) for offset, data in pieces
+        )
+        offsets[pos] = start + raw_offset
     sizes[path] = start + length
-    offsets[pos] = start + raw_offset
+    if storage is None:
+        return None
     index = MetadataIndex(pos.tensor_id, torch.Size(chunk_offset))
     storage[index] = _StorageInfo(path, start, length)
+    if storage_keys is not None:
+        storage_keys[pos.tensor_id][index] = None
     return ChunkStorageMetadata(torch.Size(chunk_offset), torch.Size(chunk_shape))
 
 
-def _plan_aliases(named, tensors, storage, planner):
+def _plan_aliases(named, tensors, storage, planner, storage_keys):
     for alias in named.alias:
         tensors[alias] = tensors[named.global_tensor_id]
         planner[alias] = (alias,)
         copies = [
-            (MetadataIndex(alias, index.offset), value)
-            for index, value in storage.items()
-            if index.fqn == named.global_tensor_id
+            (MetadataIndex(alias, index.offset), storage[index])
+            for index in storage_keys[named.global_tensor_id]
         ]
         storage.update(copies)
+        for index, _ in copies:
+            storage_keys[alias][index] = None
 
 
 def _plan_objects(component, records, sizes, tensors, storage, planner):
@@ -392,7 +577,18 @@ class _SaveSession(_Session, StorageSaveSession):
         if self.rank == 0:
             (Path(self.root) / ".metadata").unlink(missing_ok=True)
         self.coordinator = coordinator
-        self.plan = _plan(component, self.table, self.layout, self.index)
+        self.component = component
+        self._named = {}
+        self._record_starts = {}
+        self.plan = _plan(
+            component,
+            self.table,
+            self.layout,
+            self.index,
+            rank=self.rank,
+            coordinator=coordinator,
+            named=self._named,
+        )
         self.offsets = self.plan.offsets
         self._create_records()
 
@@ -400,10 +596,39 @@ class _SaveSession(_Session, StorageSaveSession):
         return os.path.join(self.root, relative + ".tmp")
 
     def my_files(self):
-        paths = set(super().my_files())
-        if self.rank == 0 and "__0_0.distcp" in self.plan.sizes:
-            paths.add("__0_0.distcp")
-        return sorted(paths)
+        return sorted(self.plan.records)
+
+    @catch
+    def get_file_offset(self, pos):
+        if pos not in self.offsets:
+            hit = self.index.slots.get(pos)
+            if hit is None:
+                raise invalid(
+                    "file_offset", f"{pos.tensor_id}:{pos.rank}: DCP payload is absent"
+                )
+            path, slot = hit
+            file = self.index.files[path]
+            order = bisect_right(file.starts, slot.contiguous_payload_offset) - 1
+            starts = self._record_starts.setdefault(path, [0])
+            # A compute writer can target another logical rank's file (HSDP
+            # and TP). Build compact prefixes only for a file actually touched;
+            # retain offsets only for requested slots, with no remote records.
+            while len(starts) <= order:
+                previous = file.slots[len(starts) - 1]
+                _, _, length, _, _ = _chunk_envelope(
+                    self.component,
+                    self._named[previous.pos.tensor_id],
+                    previous.pos,
+                    previous,
+                )
+                starts.append(starts[-1] + length)
+            _, _, length, _, raw_offset = _chunk_envelope(
+                self.component, self._named[pos.tensor_id], pos, slot
+            )
+            if len(starts) == order + 1:
+                starts.append(starts[-1] + length)
+            self.offsets[pos] = starts[order] + raw_offset
+        return self.offsets[pos]
 
     def _create_records(self):
         for path in self.my_files():

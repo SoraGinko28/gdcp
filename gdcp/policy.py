@@ -54,16 +54,20 @@ def _stored_tensor(named, order, world_size):
     return NamedDTensor(named.global_tensor_id, stored, named.alias)
 
 
+def _storage_table(component, world_size):
+    if world_size < 1:
+        raise ValueError("world_size must be positive")
+    return DTensorTable(
+        [
+            _stored_tensor(named, order, world_size)
+            for order, named in enumerate(component.table.named_d_tensors)
+        ]
+    )
+
+
 class PerRankPolicy:
     def plan(self, component, world_size):
-        if world_size < 1:
-            raise ValueError("world_size must be positive")
-        table = DTensorTable(
-            [
-                _stored_tensor(named, order, world_size)
-                for order, named in enumerate(component.table.named_d_tensors)
-            ]
-        )
+        table = _storage_table(component, world_size)
         layout = build_layout(
             table,
             world_size,
